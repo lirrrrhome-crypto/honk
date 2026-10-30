@@ -429,6 +429,15 @@ fn config_validation_error(
     )
 }
 
+/// A subscription node removed by [`Config::drop_invalid_subscription_detours`].
+#[derive(Debug, Clone)]
+pub struct DroppedDetourNode {
+    pub name: String,
+    /// The detour validation code that caused the drop.
+    pub reason: &'static str,
+    pub diagnostic: crate::diagnostic::DetailedDiagnostic,
+}
+
 impl Config {
     /// The built-in `direct` node name (usable as a group member without
     /// being declared in the config).
@@ -1225,6 +1234,68 @@ impl Config {
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         self.validate_detailed()
             .map_err(DetailedConfigError::into_legacy)
+    }
+
+    /// Drop nodes of `subscription_id` whose detour is invalid (names
+    /// itself, forms a cycle, or names an unknown target), one at a time
+    /// until the detour graph validates, and return one warning per dropped
+    /// node. Errors on hand-written (non-subscription) nodes or other
+    /// detour errors are returned unchanged, and so is the error that would
+    /// drop the subscription's last node: a subscription whose nodes are
+    /// all invalid is rejected as a whole.
+    pub fn drop_invalid_subscription_detours(
+        &mut self,
+        subscription_id: uuid::Uuid,
+    ) -> Result<Vec<DroppedDetourNode>, DetailedConfigError> {
+        const DROPPABLE: [&str; 3] = [
+            "detour-cycle",
+            "unknown-detour-target",
+            "ambiguous-detour-target",
+        ];
+        let source = DiagnosticSources::new(None).root();
+        let mut dropped = Vec::new();
+        loop {
+            let Err(error) = self.validate_detours_detailed(&source) else {
+                return Ok(dropped);
+            };
+            let Some(index) = error
+                .diagnostic
+                .entry_index
+                .and_then(|ordinal| ordinal.checked_sub(1))
+            else {
+                return Err(error);
+            };
+            let owned = self
+                .nodes
+                .get(index)
+                .is_some_and(|node| node.subscription_id == Some(subscription_id));
+            let remaining = self
+                .nodes
+                .iter()
+                .filter(|node| node.subscription_id == Some(subscription_id))
+                .count();
+            if !DROPPABLE.contains(&error.diagnostic.code) || !owned || remaining <= 1 {
+                return Err(error);
+            }
+            let node = self.nodes.remove(index);
+            for group in &mut self.groups {
+                group.nodes.retain(|id| *id != node.id);
+            }
+            let mut warning = crate::diagnostic::DetailedDiagnostic::warning(
+                "dropped-invalid-detour",
+                source.clone(),
+                SettingPath::new("nodes").index(index + 1).field("detour"),
+                crate::diagnostic::SafeValue::Ordinal(index + 1),
+                "subscription node dropped: its detour names itself, forms a cycle, \
+                 or names no unique node or group",
+            );
+            warning.entry_index = Some(index + 1);
+            dropped.push(DroppedDetourNode {
+                name: node.name,
+                reason: error.diagnostic.code,
+                diagnostic: warning,
+            });
+        }
     }
 
     /// Validate operator configuration while retaining typed diagnostics.

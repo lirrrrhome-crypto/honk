@@ -701,6 +701,8 @@ Validation rejects:
 | `unsupported-detour-protocol` | The chained node is not TCP-carried (see below) |
 | `invalid-detour` | Builtin `direct`/`block` cannot carry a detour |
 
+**Invalid detours in subscriptions.** A subscription node whose detour names itself, forms a cycle, or names no unique target (`detour-cycle`, `unknown-detour-target`, `ambiguous-detour-target`) is dropped alone (same-subscription nodes fronted by it are dropped in turn), with one `dropped-invalid-detour` warning diagnostic per dropped node; the rest load normally. If every node of the subscription is invalid, the update is still rejected. The same errors in hand-written configuration still fail validation.
+
 Supported chained (landing) protocols: `socks5`, `shadowsocks`, `trojan`, `vmess`, and `vless` over a direct TCP path (no XHTTP, H2 or shared-carrier mux). Any node or group can be the front.
 
 Limitations (MVP):

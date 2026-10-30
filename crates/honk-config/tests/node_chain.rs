@@ -298,3 +298,65 @@ fn detour_names_prefer_the_own_subscription_then_must_be_globally_unique() {
     }
     assert_eq!(code(&config), Some("ambiguous-detour-target"));
 }
+
+fn with_subscription(config: &mut Config, id: uuid::Uuid, names: &[&str]) {
+    for n in &mut config.nodes {
+        if names.contains(&n.name.as_str()) {
+            n.subscription_id = Some(id);
+            n.id = n.derive_id();
+        }
+    }
+}
+
+#[test]
+fn subscription_nodes_with_bad_detours_are_dropped_with_warnings() {
+    let sub = uuid::Uuid::from_u128(7);
+    let mut config = parse(&format!(
+        "ok: '{FRONT}'\n chained: '{MID}?dialer-proxy=ok'\n \
+         selfref: 'socks5://10.0.0.5:1080?dialer-proxy=selfref'\n \
+         ghost: 'socks5://10.0.0.6:1080?dialer-proxy=nowhere'\n \
+         c1: 'socks5://10.0.0.7:1080?dialer-proxy=c2'\n c2: 'socks5://10.0.0.8:1080?dialer-proxy=c1'"
+    ));
+    with_subscription(
+        &mut config,
+        sub,
+        &["ok", "chained", "selfref", "ghost", "c1", "c2"],
+    );
+    let dropped = config.drop_invalid_subscription_detours(sub).unwrap();
+    let mut names: Vec<_> = dropped.iter().map(|d| d.name.as_str()).collect();
+    names.sort();
+    // A cycle member is dropped, which leaves the other naming a missing
+    // node, so it is dropped too.
+    assert_eq!(names, ["c1", "c2", "ghost", "selfref"]);
+    assert!(
+        dropped
+            .iter()
+            .all(|d| d.diagnostic.code == "dropped-invalid-detour"
+                && d.diagnostic.severity == honk_config::diagnostic::Severity::Warning)
+    );
+    let kept: Vec<_> = config.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(kept.contains(&"ok") && kept.contains(&"chained"));
+    assert_eq!(code(&config), None);
+}
+
+#[test]
+fn all_invalid_subscription_or_hand_written_bad_detour_still_fails() {
+    let sub = uuid::Uuid::from_u128(8);
+    let mut config = parse(
+        "a: 'socks5://10.0.0.5:1080?dialer-proxy=nowhere'\n b: 'socks5://10.0.0.6:1080?dialer-proxy=b'",
+    );
+    with_subscription(&mut config, sub, &["a", "b"]);
+    let error = config.drop_invalid_subscription_detours(sub).unwrap_err();
+    assert!(matches!(
+        error.diagnostic.code,
+        "unknown-detour-target" | "detour-cycle"
+    ));
+    // A hand-written node with a bad detour is never dropped.
+    let mut config = parse(&format!(
+        "mine: 'socks5://10.0.0.5:1080?dialer-proxy=nowhere'\n s1: '{FRONT}'\n s2: '{MID}'"
+    ));
+    with_subscription(&mut config, sub, &["s1", "s2"]);
+    let error = config.drop_invalid_subscription_detours(sub).unwrap_err();
+    assert_eq!(error.diagnostic.code, "unknown-detour-target");
+    assert_eq!(config.nodes.len(), 3);
+}

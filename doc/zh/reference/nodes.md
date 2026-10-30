@@ -698,6 +698,8 @@ group {
 | `unsupported-detour-protocol` | 被链节点不是基于 TCP 的协议（见下文） |
 | `invalid-detour` | 内置 `direct`/`block` 不能设置 detour |
 
+**订阅中的无效 detour。** 来自订阅的节点若 detour 指向自身、成环、或找不到唯一的目标（`detour-cycle`、`unknown-detour-target`、`ambiguous-detour-target`），只丢弃该节点（依赖它作前置的同订阅节点随之被丢弃），每个被丢弃的节点记录一条 `dropped-invalid-detour` 警告诊断，其余节点照常加载。若订阅的全部节点都无效，则整次订阅更新仍被拒绝。手写配置中的同类错误仍然直接报错。
+
 支持作为落地（被链）节点的协议：`socks5`、`shadowsocks`、`trojan`、`vmess`，以及直连 TCP 路径的 `vless`（不含 XHTTP、H2 或共享载体 mux）。任何节点或分组都可以作为前置。
 
 限制（MVP）：
