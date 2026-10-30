@@ -29,6 +29,9 @@ mod aead2022;
 mod stream;
 
 use async_trait::async_trait;
+
+use super::datagram_pipe::DatagramPipe;
+use super::detour::UdpCarrier;
 use hkdf::Hkdf;
 use honk_config::node::Node;
 use rand::Rng;
@@ -455,6 +458,20 @@ impl SharedSourceOutbound for ShadowsocksHandler {
             Self::udp_transport(&runtime.node, target, target_domain, connect_timeout).await?;
         Ok(PreparedUdpTransport::ready(Arc::new(transport)))
     }
+
+    async fn prepare_shared_source_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let transport =
+            Self::chained_udp_transport(node, carrier, target, target_domain, connect_timeout)
+                .await?;
+        Ok(PreparedUdpTransport::ready(Arc::new(transport)))
+    }
 }
 
 #[async_trait]
@@ -470,6 +487,20 @@ impl PacketOutbound for ShadowsocksHandler {
             Self::udp_transport(node, target, target_domain, connect_timeout).await?,
         ))
     }
+
+    async fn dial_udp_transport_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Ok(Arc::new(
+            Self::chained_udp_transport(node, carrier, target, target_domain, connect_timeout)
+                .await?,
+        ))
+    }
 }
 
 #[async_trait]
@@ -482,19 +513,6 @@ impl ShadowsocksHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<SsUdpTransport> {
-        let config = node.shadowsocks().unwrap();
-        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let password = config.password.as_deref().unwrap_or("");
-        let socks = addr::encode_address(target, target_domain)?;
-
-        let crypto = if is_2022_method(method) {
-            SsUdpCrypto::V2022(Box::new(Ss2022UdpSession::new(Ss2022Method::new(
-                method, password,
-            )?)?))
-        } else {
-            SsUdpCrypto::Legacy(LegacyUdpCrypto::new(method, password)?)
-        };
-
         // Resolve the server address up front: the session socket is
         // connected, which also pins the reply peer.
         let lookup = format!("{}:{}", node.host(), node.port);
@@ -521,15 +539,65 @@ impl ShadowsocksHandler {
         };
         let outbound = crate::util::udp_marked_bind(bind_addr).await?;
         outbound.connect(server_addr).await?;
+        Self::udp_transport_over(
+            node,
+            DatagramPipe::Socket(outbound),
+            server_addr,
+            target,
+            target_domain,
+        )
+    }
+
+    /// A chained node's session: the same framing, sent through the front's
+    /// UDP relay addressed to the server (never from this host directly).
+    async fn chained_udp_transport(
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<SsUdpTransport> {
+        let (server, server_domain) = carrier.server().await?;
+        let pipe = carrier
+            .datagrams(server, server_domain.as_deref(), connect_timeout)
+            .await?;
+        Self::udp_transport_over(node, pipe, server, target, target_domain)
+    }
+
+    fn udp_transport_over(
+        node: &Node,
+        pipe: DatagramPipe,
+        server_addr: SocketAddr,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> anyhow::Result<SsUdpTransport> {
+        let config = node.shadowsocks().unwrap();
+        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let password = config.password.as_deref().unwrap_or("");
+        let socks = addr::encode_address(target, target_domain)?;
+
+        let crypto = if is_2022_method(method) {
+            SsUdpCrypto::V2022(Box::new(Ss2022UdpSession::new(Ss2022Method::new(
+                method, password,
+            )?)?))
+        } else {
+            SsUdpCrypto::Legacy(LegacyUdpCrypto::new(method, password)?)
+        };
         crate::runtime::flow_observation::milestone(
             crate::runtime::flow_observation::Milestone::TransportReady,
         );
         debug!(
-            "Shadowsocks UDP: session to {} for target {}",
-            server_addr, target
+            "Shadowsocks UDP: session to {} for target {}{}",
+            server_addr,
+            target,
+            if pipe.is_relayed() {
+                " (via front)"
+            } else {
+                ""
+            }
         );
         Ok(SsUdpTransport {
-            socket: outbound,
+            socket: pipe,
             crypto: tokio::sync::Mutex::new(crypto),
             recv_buf: tokio::sync::Mutex::new(None),
             socks,
@@ -547,7 +615,7 @@ impl ShadowsocksHandler {
 /// shared, and the outer socket stays pinned to the server while the
 /// authenticated inner address names the real remote peer.
 struct SsUdpTransport {
-    socket: tokio::net::UdpSocket,
+    socket: DatagramPipe,
     crypto: tokio::sync::Mutex<SsUdpCrypto>,
     recv_buf: tokio::sync::Mutex<Option<Vec<u8>>>,
     /// Pre-encoded address of the default `target`.

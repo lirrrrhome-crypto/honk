@@ -666,7 +666,8 @@ async fn detour_dials_the_landing_node_through_its_front() {
     .unwrap();
     config.validate_detailed().unwrap();
     let land = config.nodes.iter().find(|n| n.name == "land").unwrap();
-    assert!(!(crate::descriptor::descriptor(land.protocol()).supports_udp)(land));
+    // UDP rides the front's relay (checked at dial time).
+    assert!((crate::descriptor::descriptor(land.protocol()).supports_udp)(land));
     assert!(!(crate::descriptor::descriptor(land.protocol()).pool_bare_tcp)(land));
 
     let generation =
@@ -716,10 +717,10 @@ async fn detour_dials_the_landing_node_through_its_front() {
     );
 }
 
-/// UDP through a chained node is refused on every entry point instead of
-/// leaving the landing server directly (which would bypass the front).
+/// UDP through a chained node whose front is unreachable fails on every
+/// entry point instead of leaving for the landing server directly.
 #[tokio::test]
-async fn detour_node_refuses_udp_on_every_path() {
+async fn detour_node_udp_fails_closed_on_every_path() {
     let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
         "node {\n front: 'socks5://127.0.0.1:9'\n land: 'ss://YWVzLTEyOC1nY206cHc@127.0.0.1:9?dialer-proxy=front'\n}\n",
         &mut Vec::new(),
@@ -737,7 +738,7 @@ async fn detour_node_refuses_udp_on_every_path() {
         .await
         .map(|_| ())
         .expect_err("node-based UDP dial must fail");
-    assert!(legacy.to_string().contains("UDP not supported"), "{legacy}");
+    assert!(legacy.to_string().contains("detour"), "{legacy}");
     let runtime = registry
         .dial_udp_transport_runtime(Arc::clone(&generation), land.id, target, None, timeout)
         .await

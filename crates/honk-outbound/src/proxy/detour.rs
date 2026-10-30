@@ -12,9 +12,12 @@
 //!
 //! UDP: a landing that frames UDP inside its own TCP stream (Trojan) carries
 //! it over the same front chain, so any TCP-capable front (node or group)
-//! works. Native-UDP landings (Shadowsocks, SOCKS5 UDP ASSOCIATE) would need
-//! a UDP relay from the front and are refused with a clear error, never sent
-//! directly (see `descriptor::chained_udp_supported`). Detour nodes never
+//! works. Native-UDP landings (Shadowsocks, SOCKS5 UDP ASSOCIATE) send their
+//! framed datagrams through a [`super::datagram_pipe::DatagramPipe`] that is
+//! the front's own UDP relay (SOCKS5 UDP ASSOCIATE, Shadowsocks UDP, Trojan
+//! UDP-over-TCP, or a chained front recursively) addressed to the landing's
+//! server; a front without a UDP path is refused with a clear error, never
+//! bypassed (see [`FrontCarrier`]). Detour nodes never
 //! pool or warm (see `descriptor::unchained`); configuration validation rejects UDP/QUIC-native
 //! protocols, unknown or ambiguous fronts and cycles, and the dial path
 //! re-checks depth as a guard against cycles introduced by dynamic group
@@ -29,6 +32,7 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use tokio::net::{TcpListener, TcpStream};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 
 use super::{DirectMark, ProxyStream, TcpOutbound};
@@ -389,33 +393,249 @@ pub(crate) fn dial_front_tcp<'a>(
 /// Why `node` (which carries a detour) cannot carry UDP through its front.
 pub(crate) fn chained_udp_refusal(node: &Node) -> String {
     format!(
-        "UDP not supported through detour for node {:?}: protocol {} needs native UDP \
-         to its server, which the front chain cannot relay (only UDP-over-TCP \
-         landings such as trojan are chained); refusing instead of sending direct",
+        "UDP not supported through detour for node {:?}: protocol {} has no chained \
+         UDP path (only trojan, shadowsocks and socks5 landings carry UDP through a \
+         front); refusing instead of sending direct",
         node.name,
         node.protocol().as_str()
     )
 }
 
-/// Wraps a capability that has no chained implementation (UDP, shared
-/// sources, warm, raw reachability) so a node carrying a detour is refused
-/// instead of being contacted directly from this host.
-pub(crate) struct DetourGuard<T: ?Sized>(pub(crate) Arc<T>, pub(crate) TcpTable);
+/// Context of a failed chained UDP dial: the front path failed and nothing
+/// was sent direct.
+fn chained_udp_failure(node: &Node) -> String {
+    format!(
+        "UDP through detour for node {:?} failed (front path only; nothing sent direct)",
+        node.name
+    )
+}
+
+/// Why `front` cannot relay the native UDP of the chained `landing`.
+fn front_udp_refusal(front: &Node, landing: &Node) -> String {
+    format!(
+        "UDP not supported through detour for node {:?}: front {:?} (protocol {}) \
+         cannot relay UDP; refusing instead of sending direct",
+        landing.name,
+        front.name,
+        front.protocol().as_str()
+    )
+}
+
+/// Whether an unchained `front` may relay a landing's datagrams. VLESS UDP is
+/// deliberately not used as a chain carrier.
+fn front_relays_udp(front: &Node) -> bool {
+    front.protocol() != NodeProtocol::VLess
+        && (crate::descriptor::descriptor(front.protocol()).supports_udp)(front)
+}
+
+/// Raw (unwrapped) packet handlers by protocol, the UDP counterpart of
+/// [`TcpTable`].
+pub(crate) type PacketTable =
+    Arc<parking_lot::RwLock<Vec<(NodeProtocol, Arc<dyn super::PacketOutbound>)>>>;
+
+fn inner_packet(
+    table: &PacketTable,
+    node: &Node,
+) -> anyhow::Result<Arc<dyn super::PacketOutbound>> {
+    table
+        .read()
+        .iter()
+        .find(|(candidate, _)| *candidate == node.protocol())
+        .map(|(_, handler)| Arc::clone(handler))
+        .ok_or_else(|| anyhow::anyhow!("no UDP handler for protocol {}", node.protocol().as_str()))
+}
+
+/// Everything a chained landing may use to reach its server: a stream through
+/// the front chain (UDP-over-TCP landings, SOCKS5 control channels) and the
+/// front's datagram relay (native-UDP landings). Neither ever connects to the
+/// server from this host.
+#[async_trait]
+pub trait UdpCarrier: Send + Sync {
+    /// A connected stream to the landing's server through the front chain.
+    async fn stream(&self, connect_timeout: Duration) -> anyhow::Result<TcpStream>;
+    /// The landing's server as the front's target (domain kept remote unless
+    /// the front is direct).
+    async fn server(&self) -> anyhow::Result<(SocketAddr, Option<String>)>;
+    /// A datagram pipe to `server` relayed by the front's UDP path.
+    async fn datagrams(
+        &self,
+        server: SocketAddr,
+        server_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::datagram_pipe::DatagramPipe>;
+}
+
+/// The [`UdpCarrier`] of one chained node, resolving its front at use time
+/// (a group front yields its current selection; nested fronts recurse).
+pub(crate) struct FrontCarrier {
+    tcp: TcpTable,
+    packet: PacketTable,
+    generation: Option<Arc<OutboundRuntimeRegistry>>,
+    node: Node,
+    depth: usize,
+}
+
+impl FrontCarrier {
+    pub(crate) fn new(
+        tcp: TcpTable,
+        packet: PacketTable,
+        generation: Option<Arc<OutboundRuntimeRegistry>>,
+        node: Node,
+        depth: usize,
+    ) -> Self {
+        Self {
+            tcp,
+            packet,
+            generation,
+            node,
+            depth,
+        }
+    }
+
+    fn front(&self) -> anyhow::Result<Node> {
+        let name = self
+            .node
+            .detour
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("node {:?} has no detour", self.node.name))?;
+        anyhow::ensure!(
+            self.depth < MAX_DETOUR_DEPTH,
+            "detour chain exceeds {MAX_DETOUR_DEPTH} hops (cycle?)"
+        );
+        let front = resolve_front(name, self.generation.as_deref())?;
+        anyhow::ensure!(front.id != self.node.id, "node detour resolves to itself");
+        Ok(front)
+    }
+
+    async fn front_transport(
+        &self,
+        front: Node,
+        server: SocketAddr,
+        server_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
+        if front.detour.is_some() {
+            anyhow::ensure!(
+                crate::descriptor::chained_udp_supported(&front),
+                front_udp_refusal(&front, &self.node)
+            );
+            let handler = inner_packet(&self.packet, &front)?;
+            let carrier = FrontCarrier::new(
+                Arc::clone(&self.tcp),
+                Arc::clone(&self.packet),
+                self.generation.clone(),
+                front.clone(),
+                self.depth + 1,
+            );
+            return handler
+                .dial_udp_transport_chained(
+                    &front,
+                    &carrier,
+                    server,
+                    server_domain,
+                    connect_timeout,
+                )
+                .await;
+        }
+        anyhow::ensure!(
+            front_relays_udp(&front),
+            front_udp_refusal(&front, &self.node)
+        );
+        let handler = inner_packet(&self.packet, &front)?;
+        match self
+            .generation
+            .as_ref()
+            .and_then(|generation| Some((generation, generation.get(&front.id)?)))
+        {
+            Some((generation, runtime)) => {
+                anyhow::ensure!(
+                    !generation.is_shutdown(),
+                    "outbound runtime generation is shut down"
+                );
+                generation
+                    .scope_dials(handler.dial_udp_transport_runtime(
+                        runtime,
+                        server,
+                        server_domain,
+                        connect_timeout,
+                    ))
+                    .await
+            }
+            None => {
+                handler
+                    .dial_udp_transport(&front, server, server_domain, connect_timeout)
+                    .await
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl UdpCarrier for FrontCarrier {
+    async fn stream(&self, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
+        dial_front_tcp(
+            &self.tcp,
+            self.generation.clone(),
+            &self.node,
+            connect_timeout,
+            self.depth,
+        )
+        .await
+    }
+
+    async fn server(&self) -> anyhow::Result<(SocketAddr, Option<String>)> {
+        let front = self.front()?;
+        server_target(&self.node, &front).await
+    }
+
+    async fn datagrams(
+        &self,
+        server: SocketAddr,
+        server_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::datagram_pipe::DatagramPipe> {
+        let front = self.front()?;
+        tracing::debug!(
+            "UDP of chained node {} to {} via front {}",
+            self.node.name,
+            server_domain.unwrap_or(&server.to_string()),
+            front.name
+        );
+        let transport = self
+            .front_transport(front, server, server_domain, connect_timeout)
+            .await?;
+        Ok(super::datagram_pipe::DatagramPipe::relay(
+            transport,
+            server,
+            server_domain,
+        ))
+    }
+}
+
+/// Wraps a capability that has no chained implementation (shared sources,
+/// warm, raw reachability) or routes it through a [`FrontCarrier`] (UDP), so
+/// a node carrying a detour is never contacted directly from this host.
+pub(crate) struct DetourGuard<T: ?Sized>(
+    pub(crate) Arc<T>,
+    pub(crate) TcpTable,
+    pub(crate) PacketTable,
+);
 
 impl<T: ?Sized> DetourGuard<T> {
-    /// Front chain to a chained UDP-over-TCP landing's server, or a clear
-    /// refusal. Never falls back to a direct server connection.
-    async fn chained_udp_carrier(
-        &self,
-        node: &Node,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<TcpStream> {
+    /// The front carrier of a chained UDP landing, or a clear refusal.
+    fn chained_udp_carrier(&self, node: &Node) -> anyhow::Result<FrontCarrier> {
         anyhow::ensure!(
             crate::descriptor::chained_udp_supported(node),
             chained_udp_refusal(node)
         );
         tracing::debug!("UDP via chained node {}", node.name);
-        dial_front_tcp(&self.1, caller_generation(), node, connect_timeout, 0).await
+        Ok(FrontCarrier::new(
+            Arc::clone(&self.1),
+            Arc::clone(&self.2),
+            caller_generation(),
+            node.clone(),
+            0,
+        ))
     }
 }
 
@@ -429,11 +649,12 @@ impl super::PacketOutbound for DetourGuard<dyn super::PacketOutbound> {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
         if node.detour.is_some() {
-            let tcp = self.chained_udp_carrier(node, connect_timeout).await?;
+            let carrier = self.chained_udp_carrier(node)?;
             return self
                 .0
-                .dial_udp_transport_with_tcp(node, tcp, target, target_domain, connect_timeout)
-                .await;
+                .dial_udp_transport_chained(node, &carrier, target, target_domain, connect_timeout)
+                .await
+                .with_context(|| chained_udp_failure(node));
         }
         self.0
             .dial_udp_transport(node, target, target_domain, connect_timeout)
@@ -466,10 +687,11 @@ impl super::PacketOutbound for DetourGuard<dyn super::PacketOutbound> {
         mark: DirectMark,
     ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
         // A chained node is never a direct route, so it carries no mark.
-        anyhow::ensure!(
-            runtime.node.detour.is_none(),
-            chained_udp_refusal(&runtime.node)
-        );
+        if runtime.node.detour.is_some() {
+            return self
+                .dial_udp_transport(&runtime.node, target, target_domain, connect_timeout)
+                .await;
+        }
         self.0
             .dial_udp_transport_runtime_marked(
                 runtime,
@@ -513,6 +735,19 @@ impl super::PacketOutbound for DetourGuard<dyn super::PacketOutbound> {
             .dial_udp_transport_with_tcp(node, tcp, target, target_domain, connect_timeout)
             .await
     }
+
+    async fn dial_udp_transport_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
+        self.0
+            .dial_udp_transport_chained(node, carrier, target, target_domain, connect_timeout)
+            .await
+    }
 }
 
 #[async_trait]
@@ -526,19 +761,18 @@ impl super::SharedSourceOutbound for DetourGuard<dyn super::SharedSourceOutbound
         speculative: bool,
     ) -> anyhow::Result<super::PreparedUdpTransport<dyn super::MultiTargetTransport>> {
         if runtime.node.detour.is_some() {
-            let tcp = self
-                .chained_udp_carrier(&runtime.node, connect_timeout)
-                .await?;
+            let carrier = self.chained_udp_carrier(&runtime.node)?;
             return self
                 .0
-                .prepare_shared_source_with_tcp(
+                .prepare_shared_source_chained(
                     &runtime.node,
-                    tcp,
+                    &carrier,
                     target,
                     target_domain,
                     connect_timeout,
                 )
-                .await;
+                .await
+                .with_context(|| chained_udp_failure(&runtime.node));
         }
         self.0
             .prepare_shared_source(runtime, target, target_domain, connect_timeout, speculative)
@@ -555,6 +789,18 @@ impl super::SharedSourceOutbound for DetourGuard<dyn super::SharedSourceOutbound
     ) -> anyhow::Result<super::PreparedUdpTransport<dyn super::MultiTargetTransport>> {
         self.0
             .prepare_shared_source_with_tcp(node, tcp, target, target_domain, connect_timeout)
+            .await
+    }
+    async fn prepare_shared_source_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::PreparedUdpTransport<dyn super::MultiTargetTransport>> {
+        self.0
+            .prepare_shared_source_chained(node, carrier, target, target_domain, connect_timeout)
             .await
     }
 }

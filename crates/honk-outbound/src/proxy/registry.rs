@@ -102,6 +102,7 @@ impl ProtocolEntry {
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
     tcp_table: super::detour::TcpTable,
+    packet_table: super::detour::PacketTable,
 }
 
 impl ProxyRegistry {
@@ -109,6 +110,7 @@ impl ProxyRegistry {
         Self {
             entries: Vec::new(),
             tcp_table: Default::default(),
+            packet_table: Default::default(),
         }
     }
 
@@ -215,18 +217,38 @@ impl ProxyRegistry {
             table: Arc::clone(&self.tcp_table),
         });
         use super::detour::DetourGuard;
+        if let Some(packet) = &entry.packet {
+            self.packet_table
+                .write()
+                .push((entry.descriptor.protocol, Arc::clone(packet)));
+        }
         entry.packet = entry.packet.take().map(|inner| {
-            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table))) as Arc<dyn PacketOutbound>
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn PacketOutbound>
         });
         entry.shared = entry.shared.take().map(|inner| {
-            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table)))
-                as Arc<dyn SharedSourceOutbound>
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn SharedSourceOutbound>
         });
         entry.warmable = entry.warmable.take().map(|inner| {
-            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table))) as Arc<dyn WarmableOutbound>
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn WarmableOutbound>
         });
         entry.probeable = entry.probeable.take().map(|inner| {
-            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table))) as Arc<dyn ProbeableOutbound>
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn ProbeableOutbound>
         });
         self.entries.push(entry);
     }

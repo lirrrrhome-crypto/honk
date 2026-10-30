@@ -41,15 +41,23 @@ fn network_lists_udp(node: &Node) -> bool {
     })
 }
 
-/// Whether a node carrying a detour can carry UDP: only landings that frame
-/// UDP inside their own TCP stream (Trojan UDP over TLS/TCP) ride the front's
-/// TCP chain. Native-UDP landings (Shadowsocks, SOCKS5 UDP ASSOCIATE) would
-/// need a UDP relay from the front and are refused, never sent directly.
+/// Whether a node carrying a detour can carry UDP. Trojan frames UDP inside
+/// its own stream and rides the front's TCP chain; Shadowsocks and SOCKS5
+/// send their native datagrams through the front's UDP relay (refused at
+/// dial time when the front has none). Nothing is ever sent directly.
 pub fn chained_udp_supported(node: &Node) -> bool {
     node.detour.is_some()
         && node.supports_detour()
-        && node.protocol() == NodeProtocol::Trojan
-        && network_lists_udp(node)
+        && match node.protocol() {
+            NodeProtocol::Trojan => network_lists_udp(node),
+            NodeProtocol::SS | NodeProtocol::Socks5 => true,
+            _ => false,
+        }
+}
+
+/// Native UDP when unchained, the front's UDP relay when chained.
+fn native_or_chained_udp(node: &Node) -> bool {
+    unchained(node) || chained_udp_supported(node)
 }
 
 fn trojan_supports_udp(node: &Node) -> bool {
@@ -133,7 +141,7 @@ fn trojan_pool_ready_streams(node: &Node) -> bool {
 static DESCRIPTORS: &[ProtocolDescriptor] = &[
     ProtocolDescriptor {
         protocol: NodeProtocol::SS,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: always,
         supports_warm: no_warm,
@@ -173,7 +181,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     // stream is safe to pool and reuse directly.
     ProtocolDescriptor {
         protocol: NodeProtocol::Socks5,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: always,
         pool_bare_tcp: always,
         supports_warm: no_warm,

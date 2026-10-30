@@ -366,7 +366,7 @@ async fn handler_level_dials_of_a_chained_node_use_the_front() {
         .dial_udp_transport_runtime(Arc::clone(&runtime), f.http, None, timeout)
         .await
         .map(|_| ())
-        .expect_err("UDP must not leave directly");
+        .expect_err("UDP must not leave directly (front has no UDP relay)");
     assert!(udp.to_string().contains("detour"), "{udp}");
     assert!(
         !entry
@@ -745,15 +745,15 @@ async fn udp_over_tcp_landing_rides_the_front_chain() {
         assert!(upstream.contains(peer), "direct connection from {peer}");
     }
 
-    // Native-UDP landing behind a TCP-only chain: clear refusal.
+    // Native-UDP landing behind a front with no UDP relay: fails closed.
     let ss = f.generation.get(&f.ss_id).unwrap();
     let err = f
         .registry
         .dial_udp_transport_runtime(Arc::clone(&f.generation), f.ss_id, target, None, timeout)
         .await
         .map(|_| ())
-        .expect_err("ss UDP cannot be chained");
-    assert!(err.to_string().contains("native UDP"), "{err}");
+        .expect_err("ss UDP needs a front UDP relay");
+    assert!(err.to_string().contains("detour"), "{err}");
     let err = f
         .registry
         .find(ss.node.protocol())
@@ -764,8 +764,8 @@ async fn udp_over_tcp_landing_rides_the_front_chain() {
         .dial_udp_transport(&ss.node, target, None, timeout)
         .await
         .map(|_| ())
-        .expect_err("ss UDP cannot be chained");
-    assert!(err.to_string().contains("native UDP"), "{err}");
+        .expect_err("ss UDP needs a front UDP relay");
+    assert!(err.to_string().contains("detour"), "{err}");
 
     // Front down: UDP fails, nothing reaches the landing server.
     f.front_up.store(false, Ordering::SeqCst);
@@ -786,4 +786,483 @@ async fn udp_over_tcp_landing_rides_the_front_chain() {
             .is_err()
     );
     assert_eq!(f.land.peers.lock().len(), before);
+}
+
+// ---------------------------------------------------------------------------
+// Native UDP landings (Shadowsocks, SOCKS5) over a front's UDP relay.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct UdpLog {
+    /// UDP targets this relay forwarded to (as named by the client).
+    udp_targets: Mutex<Vec<SocketAddr>>,
+    /// Local addresses of this relay's upstream UDP sockets.
+    udp_locals: Mutex<Vec<SocketAddr>>,
+    /// Every client address a datagram arrived from.
+    udp_peers: Mutex<Vec<SocketAddr>>,
+    /// TCP CONNECT targets.
+    tcp_targets: Mutex<Vec<SocketAddr>>,
+}
+
+/// Maps a published alias onto the real loopback address. An alias with
+/// port 0 is a wildcard for its IP and keeps the port (relay ports are only
+/// known per association). Exact entries win over wildcards.
+fn alias_of(aliases: &[(SocketAddr, SocketAddr)], addr: SocketAddr) -> SocketAddr {
+    if let Some((_, to)) = aliases.iter().find(|(from, _)| *from == addr) {
+        return *to;
+    }
+    aliases
+        .iter()
+        .find(|(from, _)| from.port() == 0 && from.ip() == addr.ip())
+        .map_or(addr, |(_, to)| SocketAddr::new(to.ip(), addr.port()))
+}
+fn unalias(aliases: &[(SocketAddr, SocketAddr)], addr: SocketAddr) -> SocketAddr {
+    if let Some((from, _)) = aliases.iter().find(|(_, to)| *to == addr) {
+        return *from;
+    }
+    aliases
+        .iter()
+        .find(|(_, to)| to.port() == 0 && to.ip() == addr.ip())
+        .map_or(addr, |(from, _)| SocketAddr::new(from.ip(), addr.port()))
+}
+/// SOCKS5 UDP request/reply header + payload (RFC 1928 section 7).
+fn socks_udp_frame(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0, 0, 0];
+    match addr {
+        SocketAddr::V4(v4) => {
+            frame.push(1);
+            frame.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            frame.push(4);
+            frame.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    frame.extend_from_slice(&addr.port().to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+fn parse_socks_udp_frame(frame: &[u8]) -> Option<(SocketAddr, &[u8])> {
+    if frame.len() < 4 || frame[2] != 0 {
+        return None;
+    }
+    let (ip, rest): (std::net::IpAddr, &[u8]) = match frame[3] {
+        1 if frame.len() >= 10 => {
+            let raw: [u8; 4] = frame[4..8].try_into().ok()?;
+            (raw.into(), &frame[8..])
+        }
+        4 if frame.len() >= 22 => {
+            let raw: [u8; 16] = frame[4..20].try_into().ok()?;
+            (raw.into(), &frame[20..])
+        }
+        3 => {
+            let len = *frame.get(4)? as usize;
+            let host = std::str::from_utf8(frame.get(5..5 + len)?).ok()?;
+            (host.parse().ok()?, frame.get(5 + len..)?)
+        }
+        _ => return None,
+    };
+    let port = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]);
+    Some((SocketAddr::new(ip, port), &rest[2..]))
+}
+async fn socks_udp_server(
+    up: Arc<AtomicBool>,
+    aliases: Vec<(SocketAddr, SocketAddr)>,
+    log: Arc<UdpLog>,
+) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let aliases = Arc::new(aliases);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            if !up.load(Ordering::SeqCst) {
+                drop(client);
+                continue;
+            }
+            let (log, aliases) = (Arc::clone(&log), Arc::clone(&aliases));
+            tokio::spawn(async move {
+                let mut head = [0u8; 2];
+                client.read_exact(&mut head).await.ok()?;
+                let mut methods = vec![0u8; head[1] as usize];
+                client.read_exact(&mut methods).await.ok()?;
+                client.write_all(&[5, 0]).await.ok()?;
+                let mut req = [0u8; 4];
+                client.read_exact(&mut req).await.ok()?;
+                let target = match req[3] {
+                    1 => {
+                        let mut raw = [0u8; 6];
+                        client.read_exact(&mut raw).await.ok()?;
+                        SocketAddr::from((
+                            [raw[0], raw[1], raw[2], raw[3]],
+                            u16::from_be_bytes([raw[4], raw[5]]),
+                        ))
+                    }
+                    3 => {
+                        let mut len = [0u8; 1];
+                        client.read_exact(&mut len).await.ok()?;
+                        let mut raw = vec![0u8; len[0] as usize + 2];
+                        client.read_exact(&mut raw).await.ok()?;
+                        let (host, port) = raw.split_at(len[0] as usize);
+                        let ip: std::net::IpAddr = std::str::from_utf8(host).ok()?.parse().ok()?;
+                        SocketAddr::new(ip, u16::from_be_bytes([port[0], port[1]]))
+                    }
+                    _ => return None,
+                };
+                if req[1] == 1 {
+                    log.tcp_targets.lock().push(target);
+                    let mut upstream = tokio::net::TcpStream::connect(alias_of(&aliases, target))
+                        .await
+                        .ok()?;
+                    client
+                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .ok()?;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    return Some(());
+                }
+                // UDP ASSOCIATE.
+                let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?;
+                let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?;
+                log.udp_locals.lock().push(upstream.local_addr().ok()?);
+                let port = relay.local_addr().ok()?.port().to_be_bytes();
+                client
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, port[0], port[1]])
+                    .await
+                    .ok()?;
+                let mut client_peer = None;
+                let (mut a, mut b) = ([0u8; 2048], [0u8; 2048]);
+                let mut probe = [0u8; 1];
+                loop {
+                    tokio::select! {
+                        got = relay.recv_from(&mut a) => {
+                            let (n, peer) = got.ok()?;
+                            log.udp_peers.lock().push(peer);
+                            client_peer = Some(peer);
+                            let Some((target, payload)) = parse_socks_udp_frame(&a[..n]) else {
+                                continue;
+                            };
+                            log.udp_targets.lock().push(target);
+                            let _ = upstream.send_to(payload, alias_of(&aliases, target)).await;
+                        }
+                        got = upstream.recv_from(&mut b) => {
+                            let (n, source) = got.ok()?;
+                            if let Some(peer) = client_peer {
+                                let frame = socks_udp_frame(unalias(&aliases, source), &b[..n]);
+                                let _ = relay.send_to(&frame, peer).await;
+                            }
+                        }
+                        read = client.read(&mut probe) => {
+                            if matches!(read, Ok(0) | Err(_)) {
+                                return Some(());
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Shadowsocks (aes-128-gcm, password `pw`) UDP server that echoes every
+/// payload back from its requested target; logs client addresses.
+async fn ss_udp_echo(log: Arc<UdpLog>) -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let crypto = crate::proxy::shadowsocks::LegacyUdpCrypto::new("aes-128-gcm", "pw").unwrap();
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            log.udp_peers.lock().push(peer);
+            let Ok(datagram) = crypto.open(&buf[..n]) else {
+                continue;
+            };
+            let crate::proxy::addr::SocksAddr::V4(target) = datagram.peer else {
+                continue;
+            };
+            log.udp_targets.lock().push(SocketAddr::V4(target));
+            let socks = crate::proxy::addr::encode_address(SocketAddr::V4(target), None).unwrap();
+            let reply = crypto.seal(&socks, datagram.payload()).unwrap();
+            let _ = socket.send_to(&reply, peer).await;
+        }
+    });
+    addr
+}
+
+/// Plain UDP echo server.
+async fn udp_echo() -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&buf[..n], peer).await;
+        }
+    });
+    addr
+}
+
+fn install_generation(config: &honk_config::config::Config) -> Arc<OutboundRuntimeRegistry> {
+    let generation = Arc::new(OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+    let cell = Arc::new(parking_lot::RwLock::new(Arc::clone(&generation)));
+    super::install_runtime_registry(&cell);
+    std::mem::forget(cell);
+    generation
+}
+
+fn node_id(config: &honk_config::config::Config, name: &str) -> Uuid {
+    config.nodes.iter().find(|n| n.name == name).unwrap().id
+}
+
+/// Shadowsocks and SOCKS5 landings send their native datagrams through the
+/// front's UDP relay (per-flow and shared-source), a landing that is itself
+/// chained can serve as a UDP front (nested), and the landing servers only
+/// ever see the fronts' relay sockets.
+#[tokio::test]
+async fn native_udp_landings_ride_the_front_udp_relay() {
+    let _serial = SERIAL.lock().await;
+    let ss_log = Arc::new(UdpLog::default());
+    let ss_real = ss_udp_echo(Arc::clone(&ss_log)).await;
+    let ss_alias = SocketAddr::from(([192, 0, 2, 1], ss_real.port()));
+    let echo = udp_echo().await;
+    // The nested landing uses a second alias of the same server so the two
+    // ss nodes keep distinct ids.
+    let ss_alias2 = SocketAddr::from(([192, 0, 2, 3], ss_real.port()));
+
+    // B: SOCKS5 landing (published under an alias, reachable via A only)
+    // that also relays to the ss landing for the nested chain.
+    let b_log = Arc::new(UdpLog::default());
+    let b_real = socks_udp_server(
+        Arc::new(AtomicBool::new(true)),
+        vec![(ss_alias2, ss_real)],
+        Arc::clone(&b_log),
+    )
+    .await;
+    let b_alias = SocketAddr::from(([192, 0, 2, 2], b_real.port()));
+    let a_log = Arc::new(UdpLog::default());
+    let a_addr = socks_udp_server(
+        Arc::new(AtomicBool::new(true)),
+        vec![
+            (ss_alias, ss_real),
+            (b_alias, b_real),
+            (
+                SocketAddr::new(b_alias.ip(), 0),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+            ),
+        ],
+        Arc::clone(&a_log),
+    )
+    .await;
+    // B's UDP relay port is only known per association: A maps any port on
+    // B's alias IP to loopback.
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n na: 'socks5://{a_addr}'\n nss: 'ss://YWVzLTEyOC1nY206cHc=@{ss_alias}?detour=na'\n\
+             nsk: 'socks5://{b_alias}?detour=na'\n nnest: 'ss://YWVzLTEyOC1nY206cHc=@{ss_alias2}?detour=nsk'\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let timeout = Duration::from_secs(3);
+    let target: SocketAddr = "198.51.100.7:53".parse().unwrap();
+
+    // ss landing via a SOCKS5 front: per-flow and shared-source.
+    let nss = generation.get(&node_id(&config, "nss")).unwrap();
+    assert!(nss.udp_capable, "chained ss is UDP-capable");
+    let flow = registry
+        .dial_udp_transport_runtime(Arc::clone(&generation), nss.node.id, target, None, timeout)
+        .await
+        .expect("ss UDP via socks5 front");
+    udp_echo_once(flow.as_ref(), target).await;
+    let shared = registry
+        .find(nss.node.protocol())
+        .unwrap()
+        .shared
+        .as_ref()
+        .unwrap()
+        .prepare_shared_source(Arc::clone(&nss), target, None, timeout, false)
+        .await
+        .expect("ss shared-source UDP via front")
+        .commit()
+        .await
+        .unwrap();
+    udp_echo_once(shared.as_ref(), target).await;
+    assert!(a_log.udp_targets.lock().contains(&ss_alias));
+    assert!(ss_log.udp_targets.lock().contains(&target));
+
+    // SOCKS5 landing via a SOCKS5 front: control over A's TCP, datagrams over
+    // A's UDP to B's relay (unspecified BND mapped onto B's alias).
+    let nsk = generation.get(&node_id(&config, "nsk")).unwrap();
+    let flow = registry
+        .dial_udp_transport_runtime(Arc::clone(&generation), nsk.node.id, echo, None, timeout)
+        .await
+        .expect("socks5 UDP via socks5 front");
+    udp_echo_once(flow.as_ref(), echo).await;
+    assert!(a_log.tcp_targets.lock().contains(&b_alias));
+    assert!(b_log.udp_targets.lock().contains(&echo));
+
+    // Nested: ss over (socks5 landing over socks5 front).
+    let before = b_log.udp_targets.lock().len();
+    let nnest = generation.get(&node_id(&config, "nnest")).unwrap();
+    let flow = registry
+        .dial_udp_transport_runtime(
+            Arc::clone(&generation),
+            nnest.node.id,
+            target,
+            None,
+            timeout,
+        )
+        .await
+        .expect("ss UDP via nested chain");
+    udp_echo_once(flow.as_ref(), target).await;
+    assert!(b_log.udp_targets.lock()[before..].contains(&ss_alias2));
+
+    // Landing servers only saw their fronts' relay sockets.
+    let a_locals = a_log.udp_locals.lock().clone();
+    let b_locals = b_log.udp_locals.lock().clone();
+    for peer in ss_log.udp_peers.lock().iter() {
+        assert!(
+            a_locals.contains(peer) || b_locals.contains(peer),
+            "direct ss datagram from {peer}"
+        );
+    }
+    for peer in b_log.udp_peers.lock().iter() {
+        assert!(a_locals.contains(peer), "direct socks datagram from {peer}");
+    }
+}
+
+/// Front down, a front without a UDP relay, or a VLESS front: a clear error,
+/// and nothing reaches the landing server directly.
+#[tokio::test]
+async fn native_udp_landing_fails_closed() {
+    let _serial = SERIAL.lock().await;
+    let ss_log = Arc::new(UdpLog::default());
+    let ss_real = ss_udp_echo(Arc::clone(&ss_log)).await;
+    let up = Arc::new(AtomicBool::new(false));
+    let a_addr = socks_udp_server(Arc::clone(&up), vec![], Arc::new(UdpLog::default())).await;
+    let tcp_only = socks_server(
+        Arc::new(AtomicBool::new(true)),
+        None,
+        Arc::new(Log::default()),
+    )
+    .await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n fa: 'socks5://{a_addr}'\n ft: 'socks5://{tcp_only}'\n\
+             fv: 'vless://{}@127.0.0.1:9?encryption=none'\n\
+             ldown: 'ss://YWVzLTEyOC1nY206cHc=@{ss_real}?detour=fa'\n\
+             ltcp: 'ss://YWVzLTEyOC1nY206cHcy@{ss_real}?detour=ft'\n\
+             lv: 'ss://YWVzLTEyOC1nY206cHcz@{ss_real}?detour=fv'\n}}\n",
+            Uuid::nil()
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let timeout = Duration::from_millis(800);
+    let target: SocketAddr = "198.51.100.7:53".parse().unwrap();
+    for (name, expect) in [
+        ("ldown", "detour"),
+        ("ltcp", "detour"),
+        ("lv", "cannot relay UDP"),
+    ] {
+        let err = registry
+            .dial_udp_transport_runtime(
+                Arc::clone(&generation),
+                node_id(&config, name),
+                target,
+                None,
+                timeout,
+            )
+            .await
+            .map(|_| ())
+            .expect_err("chained UDP must fail closed");
+        assert!(format!("{err:#}").contains(expect), "{name}: {err:#}");
+    }
+    assert!(
+        ss_log.udp_peers.lock().is_empty(),
+        "nothing reached ss directly"
+    );
+}
+
+/// A group front: each new UDP session uses the group's selection at dial
+/// time; an open session keeps its relay.
+#[tokio::test]
+async fn native_udp_group_front_follows_the_selection() {
+    let _serial = SERIAL.lock().await;
+    let ss_log = Arc::new(UdpLog::default());
+    let ss_real = ss_udp_echo(Arc::clone(&ss_log)).await;
+    let ss_alias = SocketAddr::from(([192, 0, 2, 1], ss_real.port()));
+    let (l1, l2) = (Arc::new(UdpLog::default()), Arc::new(UdpLog::default()));
+    let up = || Arc::new(AtomicBool::new(true));
+    let g1 = socks_udp_server(up(), vec![(ss_alias, ss_real)], Arc::clone(&l1)).await;
+    let g2 = socks_udp_server(up(), vec![(ss_alias, ss_real)], Arc::clone(&l2)).await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n ug1: 'socks5://{g1}'\n ug2: 'socks5://{g2}'\n\
+             ugl: 'ss://YWVzLTEyOC1nY206cHc=@{ss_alias}?detour=ugroup'\n}}\n\
+             group {{\n ugroup {{\n filter: name(ug1, ug2)\n policy: selector\n }}\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let manager = Arc::new(crate::group::GroupManager::new(
+        &config.groups,
+        &config.nodes,
+    ));
+    super::install_group_manager(Arc::new(parking_lot::RwLock::new(Arc::clone(&manager))));
+    let select = |member: &str| {
+        manager
+            .set_selector_choice("ugroup", member, crate::group::SelectorNetworks::Both)
+            .unwrap();
+    };
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let land = node_id(&config, "ugl");
+    let timeout = Duration::from_secs(3);
+    let target: SocketAddr = "198.51.100.7:53".parse().unwrap();
+
+    select("ug1");
+    let held = registry
+        .dial_udp_transport_runtime(Arc::clone(&generation), land, target, None, timeout)
+        .await
+        .expect("UDP via ug1");
+    udp_echo_once(held.as_ref(), target).await;
+    assert_eq!(l1.udp_targets.lock().len(), 1);
+    assert!(l2.udp_targets.lock().is_empty());
+
+    select("ug2");
+    let fresh = registry
+        .dial_udp_transport_runtime(Arc::clone(&generation), land, target, None, timeout)
+        .await
+        .expect("UDP via ug2");
+    udp_echo_once(fresh.as_ref(), target).await;
+    assert_eq!(l2.udp_targets.lock().len(), 1);
+    // The session opened before the switch keeps using ug1.
+    udp_echo_once(held.as_ref(), target).await;
+    assert_eq!(l1.udp_targets.lock().len(), 2);
+    assert_eq!(l2.udp_targets.lock().len(), 1);
+
+    let relays: Vec<_> = l1
+        .udp_locals
+        .lock()
+        .iter()
+        .chain(l2.udp_locals.lock().iter())
+        .copied()
+        .collect();
+    for peer in ss_log.udp_peers.lock().iter() {
+        assert!(relays.contains(peer), "direct datagram from {peer}");
+    }
 }

@@ -1,6 +1,9 @@
 //! SOCKS5 (RFC 1928) with no-auth and user/pass (RFC 1929) authentication.
 
 use async_trait::async_trait;
+
+use super::datagram_pipe::DatagramPipe;
+use super::detour::UdpCarrier;
 use honk_config::node::Node;
 use std::io;
 use std::net::SocketAddr;
@@ -236,6 +239,39 @@ impl Socks5Handler {
         username: Option<&str>,
         password: Option<&str>,
     ) -> anyhow::Result<SocketAddr> {
+        let relay_addr = match Self::udp_associate_reply(stream, username, password).await? {
+            RelayName::Addr(addr) => addr,
+            RelayName::Domain(domain, port) => {
+                let resolution = crate::bootstrap::resolve(&domain);
+                let (resolution, selection) =
+                    crate::runtime::flow_observation::observe_resolution(resolution).await;
+                let ip = resolution?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty"))?;
+                if let Some(selection) = selection {
+                    selection.selected_ip(ip);
+                }
+                SocketAddr::new(ip, port)
+            }
+        };
+        let relay_addr = if relay_addr.ip().is_unspecified() {
+            SocketAddr::new(stream.peer_addr()?.ip(), relay_addr.port())
+        } else {
+            relay_addr
+        };
+
+        debug!("SOCKS5 UDP ASSOCIATE: relay address {}", relay_addr);
+        Ok(relay_addr)
+    }
+
+    /// The raw ASSOCIATE reply: BND as sent, a domain left unresolved and an
+    /// unspecified address left for the caller to map onto the server.
+    async fn udp_associate_reply(
+        stream: &mut tokio::net::TcpStream,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> anyhow::Result<RelayName> {
         // The TCP path bounds the same exchange at `handshake`; without a
         // deadline here a peer that accepts the connection and then goes
         // silent leaves this await pending, and the caller only bounds the
@@ -334,31 +370,14 @@ impl Socks5Handler {
                         domain_and_port[domain_len + 1],
                     ]);
                     let domain = std::str::from_utf8(&domain_and_port[..domain_len])?;
-                    let resolution = crate::bootstrap::resolve(domain);
-                    let (resolution, selection) =
-                        crate::runtime::flow_observation::observe_resolution(resolution).await;
-                    let ip = resolution?.into_iter().next().ok_or_else(|| {
-                        anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty")
-                    })?;
-                    if let Some(selection) = selection {
-                        selection.selected_ip(ip);
-                    }
-                    SocketAddr::new(ip, port)
+                    return Ok(RelayName::Domain(domain.to_owned(), port));
                 }
                 a => anyhow::bail!("SOCKS5 UDP: unknown address type 0x{:02x}", a),
             };
-            Ok::<_, anyhow::Error>(relay_addr)
+            Ok::<_, anyhow::Error>(RelayName::Addr(relay_addr))
         })
         .await
         .map_err(|_| anyhow::anyhow!("SOCKS5 UDP: associate timed out"))??;
-
-        let relay_addr = if relay_addr.ip().is_unspecified() {
-            SocketAddr::new(stream.peer_addr()?.ip(), relay_addr.port())
-        } else {
-            relay_addr
-        };
-
-        debug!("SOCKS5 UDP ASSOCIATE: relay address {}", relay_addr);
         Ok(relay_addr)
     }
 
@@ -402,13 +421,72 @@ impl Socks5Handler {
         let (socket, relay_addr, control) = Self::udp_association(node, connect_timeout).await?;
         socket.connect(relay_addr).await?;
         Ok(Socks5UdpTransport {
-            socket,
+            socket: DatagramPipe::Socket(socket),
+            relay: relay_addr,
             control: tokio::sync::Mutex::new(control),
             recv_buf: tokio::sync::Mutex::new(vec![0u8; u16::MAX as usize]),
             target_addr: target,
             target_domain: target_domain.map(Box::from),
         })
     }
+
+    /// A chained node's association: the control channel rides the front's
+    /// TCP chain and the datagrams ride the front's UDP relay, both addressed
+    /// to the server as the landing names it (nothing leaves directly).
+    async fn open_chained_udp(
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Socks5UdpTransport> {
+        if target_domain.is_some_and(|domain| domain.len() > usize::from(u8::MAX)) {
+            anyhow::bail!("SOCKS5 UDP domain exceeds 255 bytes");
+        }
+        let mut control = carrier.stream(connect_timeout).await?;
+        let config = node.socks5().unwrap();
+        let reply = Self::udp_associate_reply(
+            &mut control,
+            config.username.as_deref(),
+            config.password.as_deref(),
+        )
+        .await?;
+        let (server, server_domain) = carrier.server().await?;
+        // The control peer is the local bridge, so an unspecified BND maps
+        // onto the server as named; a domain relay stays for the front.
+        let (relay, relay_domain) = match reply {
+            RelayName::Addr(addr) if addr.ip().is_unspecified() => {
+                (SocketAddr::new(server.ip(), addr.port()), server_domain)
+            }
+            RelayName::Addr(addr) => (addr, None),
+            RelayName::Domain(domain, port) => (SocketAddr::new(server.ip(), port), Some(domain)),
+        };
+        debug!(
+            "SOCKS5 UDP ASSOCIATE (via front): relay {}{}",
+            relay,
+            relay_domain
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
+        );
+        let socket = carrier
+            .datagrams(relay, relay_domain.as_deref(), connect_timeout)
+            .await?;
+        Ok(Socks5UdpTransport {
+            socket,
+            relay,
+            control: tokio::sync::Mutex::new(control),
+            recv_buf: tokio::sync::Mutex::new(vec![0u8; u16::MAX as usize]),
+            target_addr: target,
+            target_domain: target_domain.map(Box::from),
+        })
+    }
+}
+
+/// BND of an ASSOCIATE reply as the server sent it.
+enum RelayName {
+    Addr(SocketAddr),
+    Domain(String, u16),
 }
 
 /// Source of one inbound datagram as named by its RFC 1928 header.
@@ -421,7 +499,9 @@ enum WireSource<'a> {
 /// carries every destination of a client source.
 #[derive(Debug)]
 struct Socks5UdpTransport {
-    socket: UdpSocket,
+    socket: DatagramPipe,
+    /// The relay datagrams are addressed to (reported for reuse).
+    relay: SocketAddr,
     control: tokio::sync::Mutex<TcpStream>,
     /// Reused connected-UDP receive scratch; never reallocated per packet.
     recv_buf: tokio::sync::Mutex<Vec<u8>>,
@@ -630,7 +710,7 @@ impl MultiTargetTransport for Socks5UdpTransport {
     }
 
     fn carrier_addr(&self) -> Option<SocketAddr> {
-        self.socket.peer_addr().ok()
+        Some(self.relay)
     }
 }
 
@@ -700,6 +780,19 @@ impl SharedSourceOutbound for Socks5Handler {
         .await?;
         Ok(PreparedUdpTransport::ready(Arc::new(transport)))
     }
+
+    async fn prepare_shared_source_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let transport =
+            Self::open_chained_udp(node, carrier, target, target_domain, connect_timeout).await?;
+        Ok(PreparedUdpTransport::ready(Arc::new(transport)))
+    }
 }
 
 #[async_trait]
@@ -712,6 +805,22 @@ impl PacketOutbound for Socks5Handler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let transport = Self::open_udp(node, target, target_domain, connect_timeout).await?;
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
+        Ok(Arc::new(transport))
+    }
+
+    async fn dial_udp_transport_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let transport =
+            Self::open_chained_udp(node, carrier, target, target_domain, connect_timeout).await?;
         crate::runtime::flow_observation::milestone(
             crate::runtime::flow_observation::Milestone::TransportReady,
         );

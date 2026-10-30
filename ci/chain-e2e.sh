@@ -7,8 +7,9 @@
 # once A is back. Finally B's front becomes a selector group of A1/A2:
 # the selected member carries each new connection, a switch moves new
 # connections only, and a down selected member fails closed. Last, UDP
-# rides a trojan landing through A and through the group, an ss landing is
-# refused for UDP, and UDP fails closed with A down.
+# rides a trojan landing through A and through the group; ss/socks5
+# landings carry native UDP over socks5, ss, trojan, nested and group fronts,
+# a vless front is refused for UDP, and UDP fails closed with A down.
 #
 # Usage: ci/chain-e2e.sh [workdir]   (Linux x86_64; needs curl, python3)
 set -euo pipefail
@@ -152,8 +153,7 @@ echo "PASS: selected group front down -> dial fails, no bypass"
 # UDP through the chain. T is a trojan landing (UDP framed inside its TCP
 # stream, so the front only has to carry TCP); its front is A, then the
 # selector group. A UDP echo server stands in for DNS/QUIC; the 1350-byte
-# datagram is QUIC Initial sized. B (shadowsocks) needs native UDP to its
-# server, which the front cannot relay, so it must be refused, never direct.
+# datagram is QUIC Initial sized.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
   -subj /CN=localhost -keyout t.key -out t.crt 2>/dev/null
 cat > t.json <<JSON
@@ -218,13 +218,72 @@ for pick in A1 A2; do
   echo "PASS: UDP via group front $pick -> T"
 done
 
-: > b.log
-if "$PROBE" udp.dae B 127.0.0.4:15353 --udp 2> udp_ss.err; then
-  echo "FAIL: native-UDP landing B accepted UDP through a front" >&2; exit 1
-fi
-grep -q 'native UDP' udp_ss.err || { cat udp_ss.err >&2; echo "FAIL: unclear refusal" >&2; exit 1; }
-if grep -q 'packet' b.log; then echo "FAIL: B got UDP directly" >&2; exit 1; fi
-echo "PASS: ss landing UDP through a front -> clear refusal, nothing sent"
+# Native-UDP landings: B (shadowsocks) and S (socks5) send their own UDP
+# datagrams through the front's UDP relay (socks5 UDP ASSOCIATE, ss UDP,
+# trojan UDP-over-TCP, nested chains, groups). A vless front cannot relay
+# UDP and must be refused; nothing is ever sent direct.
+cat > s.json <<JSON
+{"log":{"level":"debug","output":"$WORK/s.log"},
+ "inbounds":[{"type":"socks","tag":"S-socks","listen":"127.0.0.7","listen_port":21082}],
+ "outbounds":[{"type":"direct","tag":"S-direct"}]}
+JSON
+cat > v.json <<JSON
+{"log":{"level":"debug","output":"$WORK/v.log"},
+ "inbounds":[{"type":"vless","tag":"V-vless","listen":"127.0.0.8","listen_port":24444,
+   "users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}],
+ "outbounds":[{"type":"direct","tag":"V-direct"}]}
+JSON
+: > s.log; : > v.log
+./sing-box run -c s.json > s.out 2>&1 & pids+=($!)
+./sing-box run -c v.json > v.out 2>&1 & pids+=($!)
+sleep 1
+SS='ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388'
+nudp() { local name=$1; shift; printf 'node {\n' > "$name.dae"; printf '    %s\n' "$@" >> "$name.dae"; printf '}\n' >> "$name.dae"; }
+nudp ba "A1: 'socks5://127.0.0.2:21080'" "B: '$SS?dialer-proxy=A1#B'"
+nudp sb "B0: '$SS#B0'" "S: 'socks5://127.0.0.7:21082?dialer-proxy=B0#S'"
+nudp bt "T: 'trojan://chainpw@127.0.0.6:24443?sni=localhost&allowInsecure=1#T'" "B: '$SS?dialer-proxy=T#B'"
+nudp bn "A1: 'socks5://127.0.0.2:21080'" "S: 'socks5://127.0.0.7:21082?dialer-proxy=A1#S'" "B: '$SS?dialer-proxy=S#B'"
+nudp bv "V: 'vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.8:24444?type=tcp&security=none#V'" "B: '$SS?dialer-proxy=V#B'"
+nudp bg "A1: 'socks5://127.0.0.2:21080'" "A2: 'socks5://127.0.0.5:21081'" "B: '$SS?dialer-proxy=fronts#B'"
+printf 'group {\n    fronts {\n        filter: name(A1, A2)\n        policy: selector\n    }\n}\n' >> bg.dae
+pkt() { grep -q "$1.*inbound packet connection to $2" "$3" || { echo "FAIL: no $1 packet hop to $2" >&2; exit 1; }; }
+nopkt() { if grep -q "$1.*packet" "$2"; then echo "FAIL: $1 saw UDP it must not" >&2; exit 1; fi; }
+echo_ok() { [ "$(grep -c 'udp echo: Ok' udp.out)" = "$1" ] || { echo "FAIL: udp echo count" >&2; exit 1; }; }
+E=127.0.0.4:15353
+clr() { : > a.log; : > a2.log; : > b.log; : > s.log; : > t.log; : > v.log; }
+
+clr; "$PROBE" ba.dae B $E --udp 32 1350 | tee udp.out; echo_ok 2
+pkt A-socks 127.0.0.3:28388 a.log; pkt B-ss $E b.log
+echo "PASS: ss landing UDP (32B + 1350B) via socks5 front A"
+clr; "$PROBE" sb.dae S $E --udp 64 | tee udp.out; echo_ok 1
+pkt B-ss 127.0.0.7 b.log; pkt S-socks $E s.log
+echo "PASS: socks5 landing UDP via ss front B0"
+clr; "$PROBE" bt.dae B $E --udp 64 1350 | tee udp.out; echo_ok 2
+pkt T-trojan 127.0.0.3:28388 t.log; pkt B-ss $E b.log
+echo "PASS: ss landing UDP via trojan front T (UDP-over-TCP)"
+clr; "$PROBE" bn.dae B $E --udp 64 | tee udp.out; echo_ok 1
+pkt A-socks 127.0.0.7 a.log; pkt S-socks 127.0.0.3:28388 s.log; pkt B-ss $E b.log
+echo "PASS: nested UDP A -> S -> B"
+for pick in A1 A2; do
+  clr; CHAIN_SELECT=fronts=$pick "$PROBE" bg.dae B $E --udp 64 | tee udp.out; echo_ok 1
+  if [ $pick = A1 ]; then pkt A-socks 127.0.0.3 a.log; nopkt A2-socks a2.log
+  else pkt A2-socks 127.0.0.3 a2.log; nopkt A-socks a.log; fi
+  pkt B-ss $E b.log
+  echo "PASS: ss landing UDP via group front $pick"
+done
+clr
+if "$PROBE" bv.dae B $E --udp 2> udp_v.err; then echo "FAIL: vless front relayed UDP" >&2; exit 1; fi
+grep -q 'cannot relay UDP' udp_v.err || { cat udp_v.err >&2; echo "FAIL: unclear vless refusal" >&2; exit 1; }
+nopkt B-ss b.log
+echo "PASS: vless front -> clear UDP refusal, nothing sent"
+kill "$a_pid"; wait "$a_pid" 2>/dev/null || true
+clr
+if "$PROBE" ba.dae B $E --udp 2> udp_down.err; then echo "FAIL: ss UDP with front down" >&2; exit 1; fi
+grep -q detour udp_down.err || { cat udp_down.err >&2; echo "FAIL: unclear front-down error" >&2; exit 1; }
+nopkt B-ss b.log
+echo "PASS: front down -> ss landing UDP fails closed"
+./sing-box run -c a.json > a.out 2>&1 & a_pid=$!; pids+=("$a_pid")
+sleep 1
 
 kill "$a_pid"; wait "$a_pid" 2>/dev/null || true
 : > t.log

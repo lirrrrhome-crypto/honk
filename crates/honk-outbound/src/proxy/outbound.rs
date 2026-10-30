@@ -148,6 +148,23 @@ pub trait PacketOutbound: Send + Sync {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         anyhow::bail!(super::detour::chained_udp_refusal(node))
     }
+
+    /// Open a UDP transport for a chained `node` over `carrier`, which
+    /// reaches the node's server only through its front chain. The default
+    /// frames UDP in a front-carried stream ([`Self::dial_udp_transport_with_tcp`]);
+    /// native-UDP landings override it to use the front's datagram relay.
+    async fn dial_udp_transport_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn super::detour::UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let tcp = carrier.stream(connect_timeout).await?;
+        self.dial_udp_transport_with_tcp(node, tcp, target, target_domain, connect_timeout)
+            .await
+    }
 }
 
 /// One association carrying every destination of a client source (the core
@@ -176,6 +193,20 @@ pub trait SharedSourceOutbound: Send + Sync {
         _connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
         anyhow::bail!(super::detour::chained_udp_refusal(node))
+    }
+
+    /// Shared-source counterpart of [`PacketOutbound::dial_udp_transport_chained`].
+    async fn prepare_shared_source_chained(
+        &self,
+        node: &Node,
+        carrier: &dyn super::detour::UdpCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let tcp = carrier.stream(connect_timeout).await?;
+        self.prepare_shared_source_with_tcp(node, tcp, target, target_domain, connect_timeout)
+            .await
     }
 }
 
