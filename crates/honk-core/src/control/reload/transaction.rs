@@ -91,6 +91,7 @@ impl ControlPlane {
         diagnostics: crate::config_diagnostics::DiagnosticBuckets,
         drain: &DrainTracker,
     ) -> ReloadOutcome {
+        crate::apply_nfqueue_startup_downgrade(&mut new_config);
         let _reload = self.reload_lock.lock().await;
         // The previous subnet only lets ECS log a change rather than every re-resolution.
         new_config.dns.resolved_client_subnet = self.config.read().await.dns.resolved_client_subnet;
@@ -135,6 +136,7 @@ impl ControlPlane {
         {
             return Ok(ReloadOutcome::Rejected);
         }
+        crate::apply_nfqueue_startup_downgrade(&mut new_config);
         let current_guard = self.config.read().await;
         let current = Arc::clone(&current_guard);
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
