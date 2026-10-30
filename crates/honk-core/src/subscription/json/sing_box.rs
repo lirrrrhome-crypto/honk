@@ -39,12 +39,17 @@ pub(super) fn normalize(value: Value) -> NodeResult {
     if protocol == NodeProtocol::VLess && source.contains_key("vless_mode") {
         return Err("VLESS vless_mode was removed");
     }
-    if source.remove("detour").is_some_and(|value| active(&value)) {
-        return Err("sing-box detour chaining is unsupported");
-    }
+    let detour = source.remove("detour").filter(active);
 
     let mut proxy = Mapping::new();
     put(&mut proxy, "type", Value::String(protocol.as_str().into()));
+    if let Some(detour) = detour {
+        let Value::String(detour) = detour else {
+            return Err("sing-box detour must be a string");
+        };
+        // The outbound tag this one dials through; tags become node names.
+        put(&mut proxy, "dialer-proxy", Value::String(detour));
+    }
     move_strings(
         &mut source,
         &mut proxy,

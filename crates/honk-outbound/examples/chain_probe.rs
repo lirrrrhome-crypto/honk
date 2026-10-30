@@ -13,6 +13,8 @@
 //!        <second>, open another, then fetch <path> over both)
 //! `CHAIN_SELECT=<group>=<member>` picks a selector member before dialing.
 //! `nodes.dae` holds a `node { ... }` (and optional `group { ... }`) block.
+//! A `<nodes.json>` instead holds imported nodes (honk-core example
+//! `import_nodes`); `CHAIN_GROUPS=<file.dae>` adds that file's nodes/groups.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,10 +32,26 @@ async fn main() -> anyhow::Result<()> {
         args.len() >= 4,
         "usage: chain_probe <nodes.dae> <node> <host:port> [path]"
     );
-    let text = std::fs::read_to_string(&args[1])?;
-    let config =
+    let config = if args[1].ends_with(".json") {
+        // Imported nodes (see honk-core's `import_nodes` example), plus the
+        // groups of an optional `CHAIN_GROUPS=<file.dae>`.
+        let nodes: Vec<honk_config::node::Node> =
+            serde_json::from_str(&std::fs::read_to_string(&args[1])?)?;
+        let mut config = match std::env::var("CHAIN_GROUPS") {
+            Ok(path) => honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+                &std::fs::read_to_string(path)?,
+                &mut Vec::new(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            Err(_) => honk_config::Config::default(),
+        };
+        config.nodes.extend(nodes);
+        config
+    } else {
+        let text = std::fs::read_to_string(&args[1])?;
         honk_config::parser::parse_dae_config_with_detailed_diagnostics(&text, &mut Vec::new())
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+    };
     config.validate_detailed().map_err(|e| {
         anyhow::anyhow!("validation: {} {}", e.diagnostic.code, e.diagnostic.setting)
     })?;

@@ -696,6 +696,29 @@ fn validate_imported_node(node: &Node) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Clash/mihomo `dialer-proxy` (sing-box `detour` is normalized to it): the
+/// node or group this proxy is dialed through, by name. Spellings that
+/// disagree are an error; identical repeats are fine.
+fn clash_detour(mapping: &Mapping) -> Result<Option<String>, &'static str> {
+    let mut detour: Option<String> = None;
+    for key in ["dialer-proxy", "dialer_proxy", "detour"] {
+        let Some(value) = yaml_text_alias(mapping, &[key])? else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match &detour {
+            Some(existing) if existing != value => {
+                return Err("conflicting dialer-proxy / detour values");
+            }
+            _ => detour = Some(value.to_owned()),
+        }
+    }
+    Ok(detour)
+}
+
 pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,
@@ -727,6 +750,10 @@ pub(super) fn parse_clash_proxy(
     node.normalize_stream_transport()?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
+    }
+    node.detour = clash_detour(mapping)?;
+    if node.detour.is_some() && !node.supports_detour() {
+        return Err("dialer-proxy/detour is unsupported for QUIC/UDP-native protocols");
     }
     validate_imported_node(&node)?;
     node.validate()

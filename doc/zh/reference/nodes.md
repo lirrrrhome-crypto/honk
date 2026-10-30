@@ -686,7 +686,7 @@ group {
 }
 ```
 
-该参数在解析前从链接中移除（大小写不敏感，支持百分号解码），只作用于 `a -> b` 链的第一跳。前置节点自身也可以再有前置（最多 8 跳）。名称优先匹配分组，其次匹配唯一的节点名。
+该参数在解析前从链接中移除（大小写不敏感，支持百分号解码），在 `a -> b` 链中只有最后一跳（最右侧）可以携带它。前置节点自身也可以再有前置（最多 8 跳）。名称优先匹配分组，其次匹配唯一的节点名。
 
 校验会拒绝：
 
@@ -708,7 +708,28 @@ group {
 - 经 detour 时不支持 REALITY 伪装证书重试。
 - `detour` 不参与[节点身份](#节点身份)：仅 `detour` 不同的两个节点会被视为重复节点。
 - 运行时分组成员变化才可能形成静态检查未发现的环，由拨号时的 8 跳上限兜底。
-- 订阅导入暂未映射 Clash `dialer-proxy` / sing-box `detour`；base64 形式的 `vmess://` 链接无法携带该参数，请使用结构化节点。
+- base64 形式的 `vmess://` 链接无法携带该参数，请改用 `->` 链、裸名称声明或结构化节点。
+
+### 同一条链的三种写法
+
+同一条链可以用三种语法表达，内部都设置相同的 `detour`（测试会比较解析后的链）。落地节点始终是你所选择的节点，前置节点最先被拨号。
+
+| | sing-box / Clash | dae `->` | 分享链接 |
+|---|---|---|---|
+| 位置 | sing-box outbound `"detour": "front"`；Clash/mihomo 代理 `dialer-proxy: front`（订阅与导入文件） | `node { }` 条目或订阅行，左边为落地，右边最先拨号 | 查询参数 `dialer-proxy=`（别名 `dialer_proxy`、`detour`） |
+| 前置为节点 | `{"tag":"land",...,"detour":"front"}` | `land: 'trojan://...@land:443 -> front'` | `trojan://...@land:443?dialer-proxy=front#land` |
+| 前置为分组 | `"detour": "fronts"`（selector/urltest 标签，见下文） | `land: 'trojan://... -> fronts'` | `?dialer-proxy=fronts` |
+| 已有节点 | 不适用 | `land -> front`（两侧都是裸名称） | 不适用 |
+| 内联中继 | 不适用 | `land: 'trojan://... -> ss://... -> socks5://...'` | 不适用 |
+
+**`->` 中裸名称与链接的区分。** 一跳当且仅当包含 `://` 时视为分享链接；否则视为节点或分组名称，解析规则与 `detour` 相同（先匹配分组，再匹配唯一的节点名）。
+
+- 名称只能作为**最后一跳**（最右侧），它成为其左侧链接的 detour。位于链接之间的名称（`a -> name -> b`）会被拒绝，因为那会改变另一个节点的链。
+- 名称作为**第一跳**（`my_node -> proxy_group`）只允许出现在 `node { }` 条目中。它不新增节点，而是为同一节中的节点 `my_node` 声明 detour；其后的中继可以是链接，也可以以名称结尾。条目标签必须为空或等于 `my_node`。
+
+**重复与冲突。** 同一节点的 detour 可以来自多处：自身的 `dialer-proxy=`、自身的 `->` 链以及裸名称声明。完全相同的声明会被接受，不同的声明报错 `conflicting-detour`。同一链接或 Clash 代理中的 `dialer-proxy`、`dialer_proxy`、`detour` 必须一致；导入的代理若写法不一致，会被丢弃并给出诊断。
+
+**导入。** sing-box outbound 的 tag 与 Clash 代理的 name 会成为节点名，因此指向同一文件中其他 outbound 的 `detour`/`dialer-proxy` 能保留链关系。sing-box 的 `selector`/`urltest` 与 Clash 的 `proxy-groups` **不会**作为分组导入：指向它们的 detour 只有在你的配置中存在同名分组时才能解析，否则校验报 `unknown-detour-target`。带 detour 的 QUIC 原生导入代理（Hysteria2/TUIC/Juicity）会被丢弃并给出诊断。
 
 ## 相关文档
 

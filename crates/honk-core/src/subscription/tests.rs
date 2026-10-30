@@ -849,3 +849,139 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
     let error = error.downcast_ref::<DetailedConfigError>().unwrap();
     assert_eq!(error.diagnostic.as_ref(), &diagnostics[0]);
 }
+
+/// Follow a node's detour chain by name, as validation resolves it: node
+/// identities in dial-order reverse (landing first), ending with the group
+/// name when the chain leaves for a group.
+fn resolved_chain(nodes: &[Node], start: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = nodes.iter().find(|node| node.name == start);
+    while let Some(node) = current {
+        out.push(format!("{}:{}", node.protocol().as_str(), node.id));
+        current = match node.detour.as_deref() {
+            Some(next) => {
+                let found = nodes.iter().find(|node| node.name == next);
+                if found.is_none() {
+                    out.push(format!("group:{next}"));
+                }
+                found
+            }
+            None => None,
+        };
+    }
+    out
+}
+
+fn parse_as(sub_type: SubscriptionType, content: &str) -> Vec<Node> {
+    parse_subscription_content(
+        &Subscription {
+            sub_type,
+            ..Default::default()
+        },
+        content,
+    )
+    .unwrap()
+}
+
+#[test]
+fn chain_syntaxes_resolve_to_the_same_chain() {
+    let land = "trojan://pw@land.example:443?sni=land.example";
+    let mid = "ss://YWVzLTEyOC1nY206cHc@10.0.0.2:8388";
+    let front = "socks5://10.0.0.1:1080";
+    let b64 = |text: String| base64::engine::general_purpose::STANDARD.encode(text);
+    let dae = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!("{land}#Land -> {mid} -> {front}")),
+    );
+    let links = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!(
+            "{land}&dialer-proxy=Mid#Land\n{mid}?detour=Front#Mid\n{front}#Front"
+        )),
+    );
+    let clash = parse_as(
+        SubscriptionType::Clash,
+        r#"
+proxies:
+  - {name: Land, type: trojan, server: land.example, port: 443, password: pw, sni: land.example, dialer-proxy: Mid}
+  - {name: Mid, type: ss, server: 10.0.0.2, port: 8388, cipher: aes-128-gcm, password: pw, dialer-proxy: Front}
+  - {name: Front, type: socks5, server: 10.0.0.1, port: 1080}
+"#,
+    );
+    let sing_box = parse_as(
+        SubscriptionType::Simple,
+        r#"{"outbounds":[
+  {"type":"trojan","tag":"Land","server":"land.example","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"land.example"},"detour":"Mid"},
+  {"type":"shadowsocks","tag":"Mid","server":"10.0.0.2","server_port":8388,"method":"aes-128-gcm","password":"pw","detour":"Front"},
+  {"type":"socks","tag":"Front","server":"10.0.0.1","server_port":1080}
+]}"#,
+    );
+    let expected = resolved_chain(&dae, "Land");
+    assert_eq!(expected.len(), 3, "{expected:?}");
+    for (label, nodes) in [
+        ("links", &links),
+        ("clash", &clash),
+        ("sing-box", &sing_box),
+    ] {
+        assert_eq!(resolved_chain(nodes, "Land"), expected, "{label}");
+    }
+}
+
+#[test]
+fn chain_syntaxes_agree_on_a_group_target() {
+    let land = "socks5://192.0.2.9:1080";
+    let b64 = |text: String| base64::engine::general_purpose::STANDARD.encode(text);
+    let dae = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!("{land}#Land -> relays")),
+    );
+    let link = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!("{land}?dialer-proxy=relays#Land")),
+    );
+    let clash = parse_as(
+        SubscriptionType::Clash,
+        "proxies:\n  - {name: Land, type: socks5, server: 192.0.2.9, port: 1080, dialer-proxy: relays}\n",
+    );
+    let sing_box = parse_as(
+        SubscriptionType::Simple,
+        r#"{"outbounds":[{"type":"socks","tag":"Land","server":"192.0.2.9","server_port":1080,"detour":"relays"},{"type":"selector","tag":"relays","outbounds":["x"]}]}"#,
+    );
+    let expected = resolved_chain(&dae, "Land");
+    assert_eq!(expected.last().map(String::as_str), Some("group:relays"));
+    for (label, nodes) in [("link", &link), ("clash", &clash), ("sing-box", &sing_box)] {
+        assert_eq!(resolved_chain(nodes, "Land"), expected, "{label}");
+    }
+}
+
+#[test]
+fn imported_conflicting_detours_are_rejected_identical_ones_kept() {
+    let clash = |extra: &str| {
+        parse_as(
+            SubscriptionType::Clash,
+            &format!(
+                "proxies:\n  - {{name: Land, type: socks5, server: 192.0.2.9, port: 1080, dialer-proxy: a{extra}}}\n  - {{name: Ok, type: socks5, server: 192.0.2.8, port: 1080}}\n"
+            ),
+        )
+    };
+    let same = clash(", dialer_proxy: a");
+    assert_eq!(
+        same.iter()
+            .find(|n| n.name == "Land")
+            .unwrap()
+            .detour
+            .as_deref(),
+        Some("a")
+    );
+    let conflict = clash(", dialer_proxy: b");
+    assert!(
+        conflict.iter().all(|n| n.name != "Land"),
+        "conflicting node dropped"
+    );
+    assert!(conflict.iter().any(|n| n.name == "Ok"));
+    let quic = parse_as(
+        SubscriptionType::Clash,
+        "proxies:\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, dialer-proxy: a}\n  - {name: Ok, type: socks5, server: 192.0.2.8, port: 1080}\n",
+    );
+    assert!(quic.iter().all(|n| n.name != "Q"));
+}

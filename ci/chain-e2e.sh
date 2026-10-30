@@ -10,6 +10,8 @@
 # rides a trojan landing through A and through the group; ss/socks5
 # landings carry native UDP over socks5, ss, trojan, nested and group fronts,
 # a vless front is refused for UDP, and UDP fails closed with A down.
+# Finally the same chain is imported from sing-box JSON (`detour`) and Clash
+# YAML (`dialer-proxy`, via a group), and written with dae bare-name hops.
 #
 # Usage: ci/chain-e2e.sh [workdir]   (Linux x86_64; needs curl, python3)
 set -euo pipefail
@@ -330,3 +332,71 @@ if "$PROBE" arrow.dae C 127.0.0.4:18080 /index.html; then
 fi
 if grep -q 'inbound' t.log; then echo "FAIL: T reached without B" >&2; exit 1; fi
 echo "PASS: '->' middle hop down -> fails, no bypass"
+
+# Imported chains: the same A -> B -> T chain from a sing-box JSON
+# subscription (`detour` by tag) and a Clash YAML one (`dialer-proxy`, the
+# middle hop naming a selector group from the local config), run through the
+# real importer (honk-core example import_nodes), then a dae entry whose hops
+# are bare names of existing nodes. Each hop must show up in the next hop's log.
+./sing-box run -c b.json > b.out 2>&1 & b_pid=$!; pids+=("$b_pid")
+sleep 1
+(cd "$ROOT" && cargo build -q -p honk-core --example import_nodes)
+IMPORT="$ROOT/target/debug/examples/import_nodes"
+cat > sub-singbox.json <<'JSON'
+{"outbounds":[
+ {"type":"trojan","tag":"SC","server":"127.0.0.6","server_port":24443,"password":"chainpw",
+  "tls":{"enabled":true,"server_name":"localhost","insecure":true},"detour":"SB"},
+ {"type":"shadowsocks","tag":"SB","server":"127.0.0.3","server_port":28388,"method":"aes-128-gcm","password":"chainpw","detour":"SA"},
+ {"type":"socks","tag":"SA","server":"127.0.0.2","server_port":21080},
+ {"type":"selector","tag":"proxy","outbounds":["SC"]}
+]}
+JSON
+cat > sub-clash.yaml <<'YAML'
+proxies:
+  - {name: KC, type: trojan, server: 127.0.0.6, port: 24443, password: chainpw, sni: localhost, skip-cert-verify: true, dialer-proxy: KB}
+  - {name: KB, type: ss, server: 127.0.0.3, port: 28388, cipher: aes-128-gcm, password: chainpw, dialer-proxy: kfronts}
+proxy-groups:
+  - {name: kfronts, type: select, proxies: [KB]}
+YAML
+cat > kgroups.dae <<'DAE'
+node {
+    KA: 'socks5://127.0.0.2:21080'
+}
+group {
+    kfronts {
+        filter: name(KA)
+        policy: selector
+    }
+}
+DAE
+"$IMPORT" auto sub-singbox.json > sub-singbox.nodes.json
+"$IMPORT" clash sub-clash.yaml > sub-clash.nodes.json
+imported() { # label, probe args...
+  local label=$1; shift
+  : > a.log; : > b.log; : > t.log
+  "$@" 127.0.0.4:18080 /index.html | tee probe.out
+  grep -q hello-through-chain probe.out
+  arrow_hops
+  grep -q 'T-trojan.*inbound connection to 127.0.0.4:18080' t.log \
+    || { echo "FAIL: $label: T did not reach the target" >&2; exit 1; }
+  echo "PASS: $label chain via A -> B -> T"
+}
+imported "imported sing-box JSON (detour)" "$PROBE" sub-singbox.nodes.json SC
+CHAIN_GROUPS=kgroups.dae imported "imported Clash YAML (dialer-proxy -> group)" \
+  "$PROBE" sub-clash.nodes.json KC
+cat > names.dae <<'DAE'
+node {
+    NA: 'socks5://127.0.0.2:21080'
+    NB: 'ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388'
+    NC: 'trojan://chainpw@127.0.0.6:24443?sni=localhost&allowInsecure=1'
+    'NC -> NB'
+    NB: 'NB -> nfronts'
+}
+group {
+    nfronts {
+        filter: name(NA)
+        policy: selector
+    }
+}
+DAE
+imported "dae bare-name hops (node -> node -> group)" "$PROBE" names.dae NC

@@ -689,7 +689,7 @@ group {
 }
 ```
 
-The parameter is removed from the link before parsing (case-insensitive, percent-decoded) and applies only to the first hop of an `a -> b` chain. A front may itself have a front (up to 8 hops). Names resolve to a group first, then to a unique node name.
+The parameter is removed from the link before parsing (case-insensitive, percent-decoded) and in an `a -> b` chain only the last (rightmost) hop may carry it. A front may itself have a front (up to 8 hops). Names resolve to a group first, then to a unique node name.
 
 Validation rejects:
 
@@ -711,7 +711,28 @@ Limitations (MVP):
 - The REALITY mask-certificate retry is not available through a detour.
 - `detour` is not part of [node identity](#node-identity): two nodes that differ only in `detour` collide as a duplicate node.
 - Group membership that changes at runtime can only form a cycle the static check missed; the 8-hop limit stops it at dial time.
-- Subscription import of Clash `dialer-proxy` / sing-box `detour` is not mapped yet, and base64 `vmess://` links cannot carry the parameter; use a structured node instead.
+- Base64 `vmess://` links cannot carry the parameter; use a `->` chain, a bare-name declaration or a structured node instead.
+
+### One chain, three syntaxes
+
+The same chain can be written three ways; all of them set the same internal `detour` (tests compare the resolved chains). The landing is always the node you select; the front is dialed first.
+
+| | sing-box / Clash | dae `->` | Share link |
+|---|---|---|---|
+| Where | sing-box outbound `"detour": "front"`; Clash/mihomo proxy `dialer-proxy: front` (subscriptions and imported files) | `node { }` entry or subscription line, left = landing, right = dialed first | query parameter `dialer-proxy=` (aliases `dialer_proxy`, `detour`) |
+| Node front | `{"tag":"land",...,"detour":"front"}` | `land: 'trojan://...@land:443 -> front'` | `trojan://...@land:443?dialer-proxy=front#land` |
+| Group front | `"detour": "fronts"` (a selector/urltest tag, see below) | `land: 'trojan://... -> fronts'` | `?dialer-proxy=fronts` |
+| Existing node | n/a | `land -> front` (bare names on both sides) | n/a |
+| Inline relays | n/a | `land: 'trojan://... -> ss://... -> socks5://...'` | n/a |
+
+**Bare names versus links in `->`.** A hop is a share link exactly when it contains `://`; anything else is a name of a node or group, resolved like `detour` (group first, then a unique node name).
+
+- A name may only be the **last** (rightmost) hop. It becomes the detour of the link to its left. A name between links (`a -> name -> b`) is rejected because it would change another node's chain.
+- A name as the **first** hop (`my_node -> proxy_group`) is allowed only as a `node { }` entry. It adds no node; it declares the detour of the node `my_node` from the same section. The relays after it may be links or end with a name. The entry tag must be empty or equal `my_node`.
+
+**Duplicates and conflicts.** One node may receive its detour from several places: its own `dialer-proxy=`, its own `->` chain, and bare-name declarations. Identical declarations are accepted. Different ones fail with `conflicting-detour`. Within one link or Clash proxy, `dialer-proxy`, `dialer_proxy` and `detour` must agree; an imported proxy whose spellings disagree is dropped with a diagnostic.
+
+**Imports.** sing-box outbound tags and Clash proxy names become node names, so a `detour`/`dialer-proxy` that names another outbound in the same file keeps the chain. sing-box `selector`/`urltest` outbounds and Clash `proxy-groups` are **not** imported as groups. A detour naming one resolves only if your configuration has a group with that name; otherwise validation reports `unknown-detour-target`. QUIC-native imported proxies (Hysteria2/TUIC/Juicity) with a detour are dropped with a diagnostic.
 
 ## Related docs
 

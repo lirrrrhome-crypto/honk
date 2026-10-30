@@ -553,7 +553,7 @@ mod tests {
             r#"{"outbounds":[{"type":"vless","server":"secret.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000031","packet_encoding":"","multiplex":{"enabled":true,"protocol":"yamux"}}]}"#,
             r#"{"outbounds":[{"type":"trojan","server":"secret.example","server_port":443,"password":"secret-password","tls":{"enabled":true},"transport":{"type":"http","path":"/secret"}}]}"#,
             r#"{"outbounds":[{"type":"trojan","server":"secret.example","server_port":443,"password":"secret-password"}]}"#,
-            r#"{"outbounds":[{"type":"vless","server":"secret.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000031","detour":"secret-hop"}]}"#,
+            r#"{"outbounds":[{"type":"vless","server":"secret.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000031","detour":7}]}"#,
             r#"{"version":3,"servers":[{"server":"secret.example","server_port":8388,"method":"aes-256-gcm","password":"secret-password"}]}"#,
         ] {
             let error = parse_json_subscription(json(input), None)
