@@ -622,3 +622,80 @@ impl GroupPolicy {
 
 #[cfg(test)]
 mod tests;
+
+/// Outcome of resolving a detour name against node candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetourNodeMatch<T> {
+    /// No candidate carries the name.
+    None,
+    /// Exactly one candidate in the preferred scope, or globally.
+    Unique(T),
+    /// Several candidates and no unique one in the referring node's subscription.
+    Ambiguous,
+}
+
+/// Resolve a detour node by name: a unique match inside the referring
+/// node's own subscription wins; otherwise the name must be unique among all
+/// candidates. `candidates` yields `(subscription_id, item)` for nodes whose
+/// name equals the detour target.
+pub fn pick_detour_node<T: Copy>(
+    scope: Option<uuid::Uuid>,
+    candidates: impl IntoIterator<Item = (Option<uuid::Uuid>, T)>,
+) -> DetourNodeMatch<T> {
+    let mut global = DetourNodeMatch::None;
+    let mut scoped = DetourNodeMatch::None;
+    let bump = |slot: &mut DetourNodeMatch<T>, item: T| {
+        *slot = match slot {
+            DetourNodeMatch::None => DetourNodeMatch::Unique(item),
+            _ => DetourNodeMatch::Ambiguous,
+        }
+    };
+    for (subscription, item) in candidates {
+        if scope.is_some() && subscription == scope {
+            bump(&mut scoped, item);
+        }
+        bump(&mut global, item);
+    }
+    match scoped {
+        DetourNodeMatch::None => global,
+        found => found,
+    }
+}
+
+#[cfg(test)]
+mod detour_pick_tests {
+    use super::{DetourNodeMatch, pick_detour_node};
+
+    #[test]
+    fn own_subscription_wins_then_global_must_be_unique() {
+        let a = Some(uuid::Uuid::from_u128(1));
+        let b = Some(uuid::Uuid::from_u128(2));
+        // Same name in two subscriptions: each resolves to its own.
+        assert_eq!(
+            pick_detour_node(a, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Unique(1)
+        );
+        assert_eq!(
+            pick_detour_node(b, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Unique(2)
+        );
+        // Inline (no subscription) or a third subscription sees a global duplicate.
+        assert_eq!(
+            pick_detour_node(None, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Ambiguous
+        );
+        let c = Some(uuid::Uuid::from_u128(3));
+        assert_eq!(
+            pick_detour_node(c, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Ambiguous
+        );
+        // Falls back to a unique global match.
+        assert_eq!(pick_detour_node(a, [(None, 7)]), DetourNodeMatch::Unique(7));
+        // Duplicates inside the own subscription stay ambiguous.
+        assert_eq!(
+            pick_detour_node(a, [(a, 1), (a, 2), (None, 3)]),
+            DetourNodeMatch::Ambiguous
+        );
+        assert_eq!(pick_detour_node::<u8>(a, []), DetourNodeMatch::None);
+    }
+}

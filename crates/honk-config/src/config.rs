@@ -944,25 +944,30 @@ impl Config {
                 front[index] = Some(Vertex::Group(group));
                 continue;
             }
-            let mut matches = self
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| user_node(candidate) && candidate.name == target)
-                .map(|(candidate, _)| candidate);
-            match (matches.next(), matches.next()) {
-                (Some(_), Some(_)) => {
+            let picked = crate::node::pick_detour_node(
+                node.subscription_id,
+                self.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| user_node(candidate) && candidate.name == target)
+                    .map(|(candidate, found)| (found.subscription_id, candidate)),
+            );
+            match picked {
+                crate::node::DetourNodeMatch::Ambiguous => {
                     return Err(error(
                         index,
                         "ambiguous-detour-target",
-                        "detour names a node name shared by several nodes; use a group",
+                        "detour names a node name shared by several nodes outside its own \
+                         subscription; use a group",
                     ));
                 }
-                (Some(candidate), None) if candidate == index => {
+                crate::node::DetourNodeMatch::Unique(candidate) if candidate == index => {
                     return Err(error(index, "detour-cycle", "node detour names itself"));
                 }
-                (Some(candidate), None) => front[index] = Some(Vertex::Node(candidate)),
-                (None, _) => {
+                crate::node::DetourNodeMatch::Unique(candidate) => {
+                    front[index] = Some(Vertex::Node(candidate));
+                }
+                crate::node::DetourNodeMatch::None => {
                     return Err(error(
                         index,
                         "unknown-detour-target",

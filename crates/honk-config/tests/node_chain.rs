@@ -263,3 +263,38 @@ fn bare_name_rules_are_enforced() {
         assert!(!diagnostics.is_empty(), "{entry}");
     }
 }
+
+#[test]
+fn detour_names_prefer_the_own_subscription_then_must_be_globally_unique() {
+    let mut config = parse(&format!(
+        "f: '{FRONT}'\n x: '{MID}?dialer-proxy=f'\n g: '{FRONT}'\n y: '{MID}?dialer-proxy=f'"
+    ));
+    let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+    for n in &mut config.nodes {
+        n.subscription_id = Some(if matches!(n.name.as_str(), "f" | "x") {
+            a
+        } else {
+            b
+        });
+        if n.name == "g" {
+            n.name = "f".into();
+            n.host = "10.0.0.9".into();
+        }
+        if n.name == "y" {
+            n.host = "10.0.0.8".into();
+        }
+        n.id = n.derive_id();
+    }
+    assert_eq!(
+        code(&config),
+        None,
+        "each subscription resolves its own `f`"
+    );
+    for n in &mut config.nodes {
+        if n.name == "y" {
+            n.subscription_id = None;
+            n.id = n.derive_id();
+        }
+    }
+    assert_eq!(code(&config), Some("ambiguous-detour-target"));
+}

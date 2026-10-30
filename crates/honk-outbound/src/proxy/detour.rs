@@ -219,6 +219,7 @@ fn group_front(name: &str) -> Option<Option<Node>> {
 /// that name in the captured generation.
 pub(crate) fn resolve_front(
     name: &str,
+    scope: Option<uuid::Uuid>,
     generation: Option<&OutboundRuntimeRegistry>,
 ) -> anyhow::Result<Node> {
     if let Some(selection) = group_front(name) {
@@ -227,15 +228,21 @@ pub(crate) fn resolve_front(
         });
     }
     if let Some(generation) = generation {
-        let mut matches = generation
-            .values()
-            .filter(|runtime| runtime.node.name == name);
-        if let Some(runtime) = matches.next() {
-            anyhow::ensure!(
-                matches.next().is_none(),
-                "detour front {name:?} names several nodes"
-            );
-            return Ok(runtime.node.as_ref().clone());
+        // Same subscription first, then a globally unique name.
+        match honk_config::node::pick_detour_node(
+            scope,
+            generation
+                .values()
+                .filter(|runtime| runtime.node.name == name)
+                .map(|runtime| (runtime.node.subscription_id, runtime)),
+        ) {
+            honk_config::node::DetourNodeMatch::Unique(runtime) => {
+                return Ok(runtime.node.as_ref().clone());
+            }
+            honk_config::node::DetourNodeMatch::Ambiguous => {
+                anyhow::bail!("detour front {name:?} names several nodes")
+            }
+            honk_config::node::DetourNodeMatch::None => {}
         }
     }
     Err(anyhow::anyhow!(
@@ -344,7 +351,7 @@ pub(crate) fn dial_front_tcp<'a>(
             node.protocol().as_str()
         );
         let generation = generation.or_else(caller_generation);
-        let front = resolve_front(&front_name, generation.as_deref())?;
+        let front = resolve_front(&front_name, node.subscription_id, generation.as_deref())?;
         anyhow::ensure!(front.id != node.id, "node detour resolves to itself");
         let (server, server_domain) = server_target(node, &front).await?;
         tracing::debug!("Dialing {} server through detour {}", node.name, front.name);
@@ -502,7 +509,7 @@ impl FrontCarrier {
             self.depth < MAX_DETOUR_DEPTH,
             "detour chain exceeds {MAX_DETOUR_DEPTH} hops (cycle?)"
         );
-        let front = resolve_front(name, self.generation.as_deref())?;
+        let front = resolve_front(name, self.node.subscription_id, self.generation.as_deref())?;
         anyhow::ensure!(front.id != self.node.id, "node detour resolves to itself");
         Ok(front)
     }

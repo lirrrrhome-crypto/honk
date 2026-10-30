@@ -689,14 +689,14 @@ group {
 }
 ```
 
-The parameter is removed from the link before parsing (case-insensitive, percent-decoded) and in an `a -> b` chain only the last (rightmost) hop may carry it. A front may itself have a front (up to 8 hops). Names resolve to a group first, then to a unique node name.
+The parameter is removed from the link before parsing (case-insensitive, percent-decoded) and in an `a -> b` chain only the last (rightmost) hop may carry it. A front may itself have a front (up to 8 hops). Names resolve to a group first, then to a node name: a subscription node first looks inside its own subscription and takes a unique match there; otherwise the name must be unique across all nodes.
 
 Validation rejects:
 
 | Code | Meaning |
 |---|---|
 | `unknown-detour-target` | No group or node has that name |
-| `ambiguous-detour-target` | Several nodes share the name; use a group or rename |
+| `ambiguous-detour-target` | No unique match in the node's own subscription and several nodes share the name globally (or it is duplicated inside the subscription); use a group or rename |
 | `detour-cycle` | A chain returns to a node, including through a group that contains the node |
 | `unsupported-detour-protocol` | The chained node is not TCP-carried (see below) |
 | `invalid-detour` | Builtin `direct`/`block` cannot carry a detour |
@@ -728,7 +728,7 @@ The same chain can be written three ways; all of them set the same internal `det
 **Bare names versus links in `->`.** A hop is a share link exactly when it contains `://`; anything else is a name of a node or group, resolved like `detour` (group first, then a unique node name).
 
 - A name may only be the **last** (rightmost) hop. It becomes the detour of the link to its left. A name between links (`a -> name -> b`) is rejected because it would change another node's chain.
-- A name as the **first** hop (`my_node -> proxy_group`) is allowed only as a `node { }` entry. It adds no node; it declares the detour of the node `my_node` from the same section. The relays after it may be links or end with a name. The entry tag must be empty or equal `my_node`.
+- A name as the **first** hop (`my_node -> proxy_group`) is allowed only as a `node { }` entry. It adds no node; it declares the detour of the node `my_node` from the same section. The relays after it may be links or end with a name. The entry tag must be empty or equal `my_node`. Known limitation: subscription lines do not accept this bare-name first hop; a subscription node gets its detour only from its own link's `dialer-proxy=` or a `link -> front` chain.
 
 **Duplicates and conflicts.** One node may receive its detour from several places: its own `dialer-proxy=`, its own `->` chain, and bare-name declarations. Identical declarations are accepted. Different ones fail with `conflicting-detour`. Within one link or Clash proxy, `dialer-proxy`, `dialer_proxy` and `detour` must agree; an imported proxy whose spellings disagree is dropped with a diagnostic.
 
