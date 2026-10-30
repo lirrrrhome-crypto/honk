@@ -217,6 +217,18 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        if node.detour.is_some() {
+            return super::detour::dial_chained(
+                self,
+                None,
+                node.clone(),
+                target,
+                target_domain.map(str::to_owned),
+                connect_timeout,
+                0,
+            )
+            .await;
+        }
         let protocol = node.protocol();
         let entry = self
             .find(protocol)
@@ -246,6 +258,22 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        if let Some(node) = generation
+            .get(&node_id)
+            .filter(|runtime| runtime.node.detour.is_some())
+            .map(|runtime| runtime.node.as_ref().clone())
+        {
+            return super::detour::dial_chained(
+                self,
+                Some(generation),
+                node,
+                target,
+                target_domain.map(str::to_owned),
+                connect_timeout,
+                0,
+            )
+            .await;
+        }
         self.dial_generation(generation, node_id, |runtime, entry| {
             let tcp = Arc::clone(&entry.tcp);
             Ok(async move {
@@ -552,6 +580,12 @@ impl ProxyRegistry {
         target_port: u16,
     ) -> anyhow::Result<&'a Arc<dyn PacketOutbound>> {
         let protocol = runtime.node.protocol();
+        if runtime.node.detour.is_some() {
+            anyhow::bail!(
+                "UDP not supported through a detour (node {:?})",
+                runtime.node.name
+            );
+        }
         if protocol != NodeProtocol::Block
             && !crate::descriptor::udp_target_allowed(&runtime.node, target_port)
         {

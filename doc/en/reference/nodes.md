@@ -672,6 +672,47 @@ A static config offers real ECH and ECH rejection fails the handshake closed. Di
 
 For a chain written as `a -> b`, only `a` is parsed. Automatic names come only from a decoded `#fragment`, VMess `ps`, or `{scheme}-{host}`; the parser never uses the raw URI or userinfo as a fallback, so credentials do not leak into generated names. Explicit tags, fragments, and `ps` values remain user-controlled.
 
+## Chained proxies (`detour` / `dialer-proxy`)
+
+A TCP node can open its server connection *through* another node or a group. Add a `dialer-proxy` (aliases: `dialer_proxy`, `detour`) query parameter to the share link, or a `detour` (alias `dialer-proxy`) field to a structured node:
+
+```dae
+node {
+    front: 'socks5://10.0.0.1:1080'
+    # land is reached through front; traffic then leaves from land.
+    land: 'trojan://secret@land.example:443?sni=land.example&dialer-proxy=front'
+    # A group name works too: the group's current TCP selection is the front.
+    land2: 'ss://YWVzLTI1Ni1nY206cHc@203.0.113.5:8388?detour=fronts'
+}
+group {
+    fronts { filter: name(front) policy: min_moving_avg }
+}
+```
+
+The parameter is removed from the link before parsing (case-insensitive, percent-decoded) and applies only to the first hop of an `a -> b` chain. A front may itself have a front (up to 8 hops). Names resolve to a group first, then to a unique node name.
+
+Validation rejects:
+
+| Code | Meaning |
+|---|---|
+| `unknown-detour-target` | No group or node has that name |
+| `ambiguous-detour-target` | Several nodes share the name; use a group or rename |
+| `detour-cycle` | A chain returns to a node, including through a group that contains the node |
+| `unsupported-detour-protocol` | The chained node is not TCP-carried (see below) |
+| `invalid-detour` | Builtin `direct`/`block` cannot carry a detour |
+
+Supported chained (landing) protocols: `socks5`, `shadowsocks`, `trojan`, `vmess`, and `vless` over a direct TCP path (no XHTTP, H2 or shared-carrier mux). Any node or group can be the front.
+
+Limitations (MVP):
+
+- TCP only. A detour node never relays UDP (its UDP flows are refused rather than leaking around the front), and Hysteria2/TUIC/Juicity (QUIC) and AnyTLS cannot be chained.
+- Detour nodes skip connection pooling, preconnect and warm sessions; each flow dials its front fresh. The front stream is bridged to the landing handler through a private loopback socket, costing one local copy.
+- Health probes and latency tests of the landing node still connect directly, so group selection reflects the direct path.
+- The REALITY mask-certificate retry is not available through a detour.
+- `detour` is not part of [node identity](#node-identity): two nodes that differ only in `detour` collide as a duplicate node.
+- Group membership that changes at runtime can only form a cycle the static check missed; the 8-hop limit stops it at dial time.
+- Subscription import of Clash `dialer-proxy` / sing-box `detour` is not mapped yet, and base64 `vmess://` links cannot carry the parameter; use a structured node instead.
+
 ## Related docs
 
 - [Subscription reference](./subscription.md)

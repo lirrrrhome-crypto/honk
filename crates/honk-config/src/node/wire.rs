@@ -74,6 +74,8 @@ impl<'de> Deserialize<'de> for RawVlessMode {
 struct FlatNode {
     #[serde(default)]
     id: uuid::Uuid,
+    #[serde(default, alias = "dialer-proxy", alias = "dialer_proxy")]
+    detour: Option<String>,
     name: String,
     protocol: NodeProtocol,
     address: String,
@@ -691,6 +693,7 @@ impl FlatNode {
             port: flat.port,
             outbound,
             mark: flat.mark,
+            detour: flat.detour.filter(|detour| !detour.trim().is_empty()),
             tags: flat.tags,
             subscription_id: flat.subscription_id,
             group_id: flat.group_id,
@@ -770,6 +773,8 @@ struct WireOptions<'a> {
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
     mark: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detour: Option<&'a str>,
     tags: &'a [String],
     subscription_id: Option<uuid::Uuid>,
     group_id: Option<uuid::Uuid>,
@@ -811,6 +816,7 @@ impl<'a> WireOptions<'a> {
             vless_mode: (node.protocol() != NodeProtocol::VLess).then_some("legacy"),
             transport: "tcp",
             mark: node.mark,
+            detour: node.detour.as_deref(),
             tags: &node.tags,
             subscription_id: node.subscription_id,
             group_id: node.group_id,

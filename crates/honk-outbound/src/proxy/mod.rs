@@ -19,6 +19,7 @@ pub mod vless;
 #[cfg(feature = "rprx")]
 pub mod vmess;
 
+pub mod detour;
 mod error;
 mod outbound;
 mod packet;

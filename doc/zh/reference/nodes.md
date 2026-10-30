@@ -669,6 +669,47 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。目标 TLS 记录的缓冲�
 
 对于写成 `a -> b` 的链，只解析 `a`。自动名称只来自解码后的 `#fragment`、VMess `ps` 或 `{scheme}-{host}`；解析器绝不以原始 URI 或用户信息作为回退，因此生成名称不会泄漏凭据。显式标签、片段与 `ps` 值仍由用户控制。
 
+## 链式代理（`detour` / `dialer-proxy`）
+
+TCP 节点可以先经过另一个节点或分组再连接自己的服务器。在分享链接中添加 `dialer-proxy` 查询参数（别名 `dialer_proxy`、`detour`），或在结构化节点中写 `detour` 字段（别名 `dialer-proxy`）：
+
+```dae
+node {
+    front: 'socks5://10.0.0.1:1080'
+    # 先经 front 连到 land，流量最终从 land 出口。
+    land: 'trojan://secret@land.example:443?sni=land.example&dialer-proxy=front'
+    # 也可以写分组名：前置跳为该分组当前的 TCP 选择。
+    land2: 'ss://YWVzLTI1Ni1nY206cHc@203.0.113.5:8388?detour=fronts'
+}
+group {
+    fronts { filter: name(front) policy: min_moving_avg }
+}
+```
+
+该参数在解析前从链接中移除（大小写不敏感，支持百分号解码），只作用于 `a -> b` 链的第一跳。前置节点自身也可以再有前置（最多 8 跳）。名称优先匹配分组，其次匹配唯一的节点名。
+
+校验会拒绝：
+
+| 代码 | 含义 |
+|---|---|
+| `unknown-detour-target` | 不存在该名称的分组或节点 |
+| `ambiguous-detour-target` | 多个节点同名；请改用分组或重命名 |
+| `detour-cycle` | 链路回到自身，包括经由包含该节点的分组 |
+| `unsupported-detour-protocol` | 被链节点不是基于 TCP 的协议（见下文） |
+| `invalid-detour` | 内置 `direct`/`block` 不能设置 detour |
+
+支持作为落地（被链）节点的协议：`socks5`、`shadowsocks`、`trojan`、`vmess`，以及直连 TCP 路径的 `vless`（不含 XHTTP、H2 或共享载体 mux）。任何节点或分组都可以作为前置。
+
+限制（MVP）：
+
+- 仅 TCP。带 detour 的节点不转发 UDP（UDP 流会被拒绝，而不是绕过前置泄漏），Hysteria2/TUIC/Juicity（QUIC）与 AnyTLS 不能被链。
+- detour 节点不使用连接池、预连接与 warm 会话，每条流都会重新拨前置。前置流通过私有回环 socket 交给落地处理器，多一次本地拷贝。
+- 落地节点的健康探测与延迟测试仍为直连，分组选择反映的是直连路径。
+- 经 detour 时不支持 REALITY 伪装证书重试。
+- `detour` 不参与[节点身份](#节点身份)：仅 `detour` 不同的两个节点会被视为重复节点。
+- 运行时分组成员变化才可能形成静态检查未发现的环，由拨号时的 8 跳上限兜底。
+- 订阅导入暂未映射 Clash `dialer-proxy` / sing-box `detour`；base64 形式的 `vmess://` 链接无法携带该参数，请使用结构化节点。
+
 ## 相关文档
 
 - [订阅参考](./subscription.md)

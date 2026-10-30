@@ -142,6 +142,7 @@ fn serialization_golden_node() -> Node {
             },
         }),
         mark: Some(7),
+        detour: None,
         tags: vec!["paid".into(), "hk".into()],
         subscription_id: Some(
             uuid::Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap(),

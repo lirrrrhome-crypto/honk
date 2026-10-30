@@ -185,6 +185,8 @@ impl OutboundHealthPublisher {
         group_manager: SharedGroupManager,
         alive_set: Arc<AliveDialerSet>,
     ) -> Self {
+        // Group-named detour fronts resolve against the live selection.
+        honk_outbound::proxy::detour::install_group_manager(group_manager.clone());
         Self {
             ebpf,
             config,

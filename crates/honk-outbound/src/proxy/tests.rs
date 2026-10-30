@@ -603,3 +603,115 @@ async fn speculative_udp_rejects_a_shutdown_generation_before_dispatch() {
             .is_err()
     );
 }
+
+/// Minimal no-auth SOCKS5 CONNECT server (IPv4 targets only) that records
+/// every target it is asked to reach.
+async fn detour_test_socks5(seen: Arc<parking_lot::Mutex<Vec<SocketAddr>>>) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut head = [0u8; 2];
+                client.read_exact(&mut head).await.unwrap();
+                let mut methods = vec![0u8; head[1] as usize];
+                client.read_exact(&mut methods).await.unwrap();
+                client.write_all(&[5, 0]).await.unwrap();
+                let mut req = [0u8; 4];
+                client.read_exact(&mut req).await.unwrap();
+                assert_eq!(req[3], 1, "test server handles IPv4 only");
+                let mut raw = [0u8; 6];
+                client.read_exact(&mut raw).await.unwrap();
+                let target = SocketAddr::from((
+                    [raw[0], raw[1], raw[2], raw[3]],
+                    u16::from_be_bytes([raw[4], raw[5]]),
+                ));
+                seen.lock().push(target);
+                let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+                client
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn detour_dials_the_landing_node_through_its_front() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = echo.accept().await.unwrap();
+        let mut buf = [0u8; 5];
+        s.read_exact(&mut buf).await.unwrap();
+        s.write_all(&buf).await.unwrap();
+    });
+    let front_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let land_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let front_addr = detour_test_socks5(Arc::clone(&front_seen)).await;
+    let land_addr = detour_test_socks5(Arc::clone(&land_seen)).await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n front: 'socks5://{front_addr}'\n land: 'socks5://{land_addr}?dialer-proxy=front'\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let land = config.nodes.iter().find(|n| n.name == "land").unwrap();
+    assert!(!(crate::descriptor::descriptor(land.protocol()).supports_udp)(land));
+    assert!(!(crate::descriptor::descriptor(land.protocol()).pool_bare_tcp)(land));
+
+    let generation =
+        Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let land_id = land.id;
+    let mut stream = registry
+        .dial_runtime(
+            generation,
+            land_id,
+            echo_addr,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    stream.stream.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    stream.stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello");
+    assert_eq!(
+        *front_seen.lock(),
+        vec![land_addr],
+        "front carried the hop to the landing server"
+    );
+    assert_eq!(
+        *land_seen.lock(),
+        vec![echo_addr],
+        "landing node reached the target"
+    );
+
+    let mut detached = land.clone();
+    detached.detour = Some("nowhere".into());
+    let error = registry
+        .dial(
+            &detached,
+            echo_addr,
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("not a known node or group"),
+        "{error}"
+    );
+}

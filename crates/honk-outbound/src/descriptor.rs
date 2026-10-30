@@ -30,33 +30,45 @@ impl ProtocolDescriptor {
 /// paths: no `network` restriction means UDP is allowed; otherwise the list
 /// must contain "udp".
 pub(crate) fn network_allows_udp(node: &Node) -> bool {
-    node.network().is_none_or(|network| {
-        network
-            .split(',')
-            .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
-    })
+    unchained(node)
+        && node.network().is_none_or(|network| {
+            network
+                .split(',')
+                .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
+        })
 }
 
 fn never(_: &Node) -> bool {
     false
 }
 
-fn always(_: &Node) -> bool {
-    true
+/// Every capability that would open a server connection outside the
+/// per-flow dial (UDP relays, pooled bare TCP or ready streams, warm
+/// sessions) bypasses a chained front hop, so a node with a `detour` keeps
+/// none of them: it is TCP-only and dialed fresh through its front.
+fn unchained(node: &Node) -> bool {
+    node.detour.is_none()
+}
+
+fn always(node: &Node) -> bool {
+    unchained(node)
 }
 
 fn stream_pool_bare_tcp(node: &Node) -> bool {
-    !node.is_xhttp()
+    unchained(node) && !node.is_xhttp()
 }
 
 fn stream_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
-    node.is_xhttp()
+    unchained(node)
+        && node.is_xhttp()
         && (requirement == WarmRequirement::Session
             || (descriptor(node.protocol()).supports_udp)(node))
 }
 
 fn pooled_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
-    requirement == WarmRequirement::Session || (descriptor(node.protocol()).supports_udp)(node)
+    unchained(node)
+        && (requirement == WarmRequirement::Session
+            || (descriptor(node.protocol()).supports_udp)(node))
 }
 
 fn no_warm(_: &Node, _: WarmRequirement) -> bool {
@@ -64,6 +76,9 @@ fn no_warm(_: &Node, _: WarmRequirement) -> bool {
 }
 
 fn vless_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
+    if !unchained(node) {
+        return false;
+    }
     let vless = node
         .vless()
         .expect("VLESS descriptor requires VLESS config");
@@ -80,7 +95,7 @@ fn vless_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
 }
 
 fn vless_supports_udp(node: &Node) -> bool {
-    node.vless().unwrap().udp_enabled()
+    unchained(node) && node.vless().unwrap().udp_enabled()
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
@@ -94,7 +109,7 @@ fn vless_pool_bare_tcp(node: &Node) -> bool {
 /// framing state whose idle liveness cannot be probed at the fd level, so
 /// they stay on bare-TCP pooling. XHTTP instead owns its physical session pool.
 fn trojan_pool_ready_streams(node: &Node) -> bool {
-    matches!(node.transport().unwrap().transport.as_str(), "" | "tcp")
+    unchained(node) && matches!(node.transport().unwrap().transport.as_str(), "" | "tcp")
 }
 
 static DESCRIPTORS: &[ProtocolDescriptor] = &[

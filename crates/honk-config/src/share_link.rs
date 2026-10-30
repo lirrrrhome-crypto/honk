@@ -81,6 +81,10 @@ impl Node {
         source: &crate::diagnostic::SourceRef,
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, crate::error::DetailedConfigError> {
+        // Chained-dial front hop: `dialer-proxy=` / `detour=` query parameter.
+        // Stripped before protocol decoding so no handler sees it.
+        let (stripped, detour) = take_detour_param(link);
+        let link = stripped.as_ref();
         // A node entry that parses only ever warns with `legacy-*` codes, so native
         // clients read any other warning on the entry as the entry being dropped.
         let mut node = Self::decode_share_link(link, source, &mut |diagnostic| {
@@ -108,6 +112,7 @@ impl Node {
             error
         })?;
         node.id = node.derive_id();
+        node.detour = detour;
         Ok(node)
     }
 
@@ -735,4 +740,51 @@ fn hex_to_byte(h: u8, l: u8) -> Result<u8, ()> {
     let hi = hex_val(h).ok_or(())?;
     let lo = hex_val(l).ok_or(())?;
     Ok(hi << 4 | lo)
+}
+
+/// Query keys naming a chained-dial front hop on a share link.
+const DETOUR_PARAMS: [&str; 3] = ["dialer-proxy", "dialer_proxy", "detour"];
+
+/// Remove every `dialer-proxy=` / `detour=` query parameter from the first
+/// hop of `link`, returning the remaining link and the last non-empty
+/// (percent-decoded) value. Links without such a parameter are borrowed as-is.
+pub(crate) fn take_detour_param(link: &str) -> (Cow<'_, str>, Option<String>) {
+    let hop_end = link.find("->").unwrap_or(link.len());
+    let (hop, rest) = link.split_at(hop_end);
+    let fragment_start = hop.find('#').unwrap_or(hop.len());
+    let (body, fragment) = hop.split_at(fragment_start);
+    let Some((base, query)) = body.split_once('?') else {
+        return (Cow::Borrowed(link), None);
+    };
+    let mut detour = None;
+    let mut kept = Vec::new();
+    let mut found = false;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if DETOUR_PARAMS
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+        {
+            found = true;
+            let value = percent_decode_str(value);
+            let value = value.trim();
+            if !value.is_empty() {
+                detour = Some(value.to_string());
+            }
+        } else {
+            kept.push(pair);
+        }
+    }
+    if !found {
+        return (Cow::Borrowed(link), None);
+    }
+    let mut out = String::with_capacity(link.len());
+    out.push_str(base);
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    out.push_str(fragment);
+    out.push_str(rest);
+    (Cow::Owned(out), detour)
 }

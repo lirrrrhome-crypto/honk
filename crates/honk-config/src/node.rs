@@ -69,6 +69,13 @@ pub struct Node {
     pub port: u16,
     pub outbound: OutboundConfig,
     pub mark: Option<u32>,
+    /// Front hop for chained dialing (sing-box `detour`, Clash Meta
+    /// `dialer-proxy`): the name of another node or a group. The node's own
+    /// TCP connection to its server is opened *through* that front instead of
+    /// a direct socket. Dial-path metadata only: it does not take part in
+    /// [`Node::derive_id`]. Only TCP-carried protocols accept it; see
+    /// [`Node::supports_detour`].
+    pub detour: Option<String>,
     pub tags: Vec<String>,
     pub subscription_id: Option<uuid::Uuid>,
     pub group_id: Option<uuid::Uuid>,
@@ -90,6 +97,7 @@ impl Default for Node {
             port: 0,
             outbound: OutboundConfig::default(),
             mark: None,
+            detour: None,
             tags: Vec::new(),
             subscription_id: None,
             group_id: None,
@@ -100,6 +108,25 @@ impl Default for Node {
 }
 
 impl Node {
+    /// Whether this node's protocol can carry its server connection over a
+    /// chained front stream (MVP: TCP-carried protocols with a real
+    /// `dial_with_tcp` path). QUIC/UDP-native protocols (Hysteria2, TUIC,
+    /// Juicity), AnyTLS, XHTTP transports, multiplexed VLESS TCP and the
+    /// builtins cannot.
+    pub fn supports_detour(&self) -> bool {
+        match self.protocol() {
+            NodeProtocol::Socks5 | NodeProtocol::SS | NodeProtocol::Trojan => !self.is_xhttp(),
+            NodeProtocol::VMess => !self.is_xhttp(),
+            NodeProtocol::VLess => {
+                !self.is_xhttp()
+                    && self
+                        .vless()
+                        .is_some_and(|config| config.tcp_path() == VlessTcpPath::Direct)
+            }
+            _ => false,
+        }
+    }
+
     pub fn protocol(&self) -> NodeProtocol {
         self.outbound.protocol()
     }
