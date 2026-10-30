@@ -190,6 +190,7 @@ not the unprivileged suite. Deployment A/B needs real eBPF/netns/upstreams and t
 `bench` lab harness. TLS backends and the HTTP-download exception: Technology stack.
 
 `routing::tests::test_geosite_*` need `geosite.dat`/`geoip.dat`. Both tests call `use_repo_geo_assets()`, which points `DAE_LOCATION_ASSET` at the checkout root, so files at the top of the checkout are the quickest local setup; otherwise the loader falls through the documented geo asset search order, which is how CI's `/etc/dae` install works, and the tests fail for a reason unrelated to the change under test.
+Run `ci/fetch-geodata.sh` to download the versions pinned in `.github/ci/pins.env`, verify their sha256 and place them at the checkout root (or `ci/fetch-geodata.sh DIR`, default `$DAE_LOCATION_ASSET` when set); the `.dat` files are gitignored and must not be committed.
 Unset `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` so HTTP clients do not proxy loopback fetches.
 The maintainer's REALITY interop lab: `.agents/rules/maintainer-lab.md` (not required for contributions).
 
