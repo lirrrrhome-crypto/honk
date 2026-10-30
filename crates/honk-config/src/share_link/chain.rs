@@ -41,6 +41,14 @@ pub fn is_chain(link: &str) -> bool {
     link.contains("->")
 }
 
+/// Whether a `->` hop is a bare node/group name rather than a share link.
+/// A hop is a link exactly when it contains `://`; anything else names a
+/// node or group declared elsewhere (resolved like `detour`: group first,
+/// then a unique node name).
+pub fn is_bare_name(hop: &str) -> bool {
+    !hop.contains("://")
+}
+
 pub(crate) fn chain_error(
     source: &SourceRef,
     code: &'static str,
@@ -98,6 +106,8 @@ impl Node {
             ));
         }
         let mut nodes = Vec::with_capacity(hops.len());
+        let mut target = None;
+        let link_count = hops.len() - usize::from(hops.last().is_some_and(|hop| is_bare_name(hop)));
         for (index, hop) in hops.iter().enumerate() {
             if hop.is_empty() {
                 return Err(chain_error(
@@ -105,6 +115,26 @@ impl Node {
                     "invalid-chain",
                     "node chain (->) has an empty hop",
                 ));
+            }
+            if is_bare_name(hop) {
+                if index == 0 {
+                    return Err(chain_error(
+                        source,
+                        "invalid-chain",
+                        "node chain (->) landing must be a share link here; a bare-name \
+                         landing (`my_node -> relay`) is only allowed as a node section entry",
+                    ));
+                }
+                if index + 1 != hops.len() {
+                    return Err(chain_error(
+                        source,
+                        "invalid-chain",
+                        "node chain (->): a bare node/group name hop must be the last \
+                         (rightmost) hop",
+                    ));
+                }
+                target = Some((*hop).to_owned());
+                break;
             }
             let scheme = hop
                 .split_once("://")
@@ -121,7 +151,8 @@ impl Node {
                 ));
             }
             let node = Self::parse_share_link(hop, source, emit)?;
-            let last = index + 1 == hops.len();
+            // The rightmost link; a trailing name hop becomes its detour.
+            let last = index + 1 == link_count;
             if node.detour.is_some() && !last {
                 return Err(chain_error(
                     source,
@@ -129,7 +160,7 @@ impl Node {
                     "only the last (rightmost) hop of a node chain (->) may set dialer-proxy/detour",
                 ));
             }
-            if !last && !node.supports_detour() {
+            if index + 1 < hops.len() && !node.supports_detour() {
                 return Err(chain_error(
                     source,
                     "unsupported-detour-protocol",
@@ -138,6 +169,18 @@ impl Node {
                 ));
             }
             nodes.push(node);
+        }
+        if let Some(target) = target {
+            let tail = nodes.last_mut().expect("landing parsed before a name hop");
+            if tail.detour.as_ref().is_some_and(|detour| *detour != target) {
+                return Err(chain_error(
+                    source,
+                    "conflicting-detour",
+                    "node chain (->): the last link's dialer-proxy/detour differs from the \
+                     named hop after it",
+                ));
+            }
+            tail.detour = Some(target);
         }
         let landing = nodes.remove(0);
         Ok(ShareLinkChain {

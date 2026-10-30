@@ -200,3 +200,66 @@ fn namer_rejects_a_relay_reused_with_another_onward_chain() {
     let second = Node::from_share_link_chain(&format!("{LAND}#b -> {MID}")).unwrap();
     assert!(namer.link(second).is_err());
 }
+
+#[test]
+fn bare_name_hop_targets_a_node_or_group() {
+    let (config, _) = parse_with(
+        &format!(
+            "front: '{FRONT}'\nc: '{LAND} -> front'\nd: 'trojan://pw2@land.example:443?sni=land.example -> {MID} -> relays'"
+        ),
+        "relays {\n filter: name(front)\n policy: fixed(0)\n}",
+    );
+    assert_eq!(hops(&config, "c"), ["c", "front"]);
+    let d = hops(&config, "d");
+    assert_eq!(d.len(), 3);
+    assert_eq!(d[2], "relays");
+    assert_eq!(code(&config), None);
+}
+
+#[test]
+fn bare_name_landing_declares_an_existing_nodes_detour() {
+    let explicit = parse(&format!("land: '{LAND}'\nmid: '{MID}'\nland -> mid"));
+    // Unquoted and quoted bare-name declarations, plus an identical repeat.
+    let repeated = parse(&format!(
+        "land: '{LAND}'\nmid: '{MID}'\n'land -> mid'\nland: 'land -> mid'"
+    ));
+    let via_param = parse(&format!("land: '{LAND}&dialer-proxy=mid'\nmid: '{MID}'"));
+    for config in [&explicit, &repeated, &via_param] {
+        assert_eq!(config.nodes.len(), 2);
+        assert_eq!(hops(config, "land"), ["land", "mid"]);
+        assert_eq!(code(config), None);
+    }
+    // A named landing with link relays generates relay nodes like a chain.
+    let relayed = parse(&format!("land: '{LAND}'\n'land -> {MID} -> {FRONT}'"));
+    assert_eq!(hops(&relayed, "land").len(), 3);
+}
+
+#[test]
+fn conflicting_detour_declarations_are_an_error() {
+    let mut diagnostics = Vec::new();
+    let error = parse_dae_config_with_detailed_diagnostics(
+        &format!("node {{\nland: '{LAND}&dialer-proxy=mid'\nmid: '{MID}'\nfront: '{FRONT}'\n'land -> front'\n}}\n"),
+        &mut diagnostics,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("conflicting-detour"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn bare_name_rules_are_enforced() {
+    // A name in the middle, an unknown named landing, and a tag mismatch are
+    // warned and dropped; a lone link entry still parses.
+    for entry in [
+        format!("c: '{LAND} -> front -> {FRONT}'"),
+        "'ghost -> front'".to_owned(),
+        "x: 'front -> other'".to_owned(),
+    ] {
+        let (config, diagnostics) = parse_with(&format!("front: '{FRONT}'\n{entry}"), "");
+        assert_eq!(config.nodes.len(), 1, "{entry}");
+        assert!(node(&config, "front").detour.is_none(), "{entry}");
+        assert!(!diagnostics.is_empty(), "{entry}");
+    }
+}

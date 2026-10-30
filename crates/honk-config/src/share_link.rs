@@ -30,7 +30,7 @@ mod chain;
 mod options;
 mod xhttp;
 
-pub use chain::{ChainNamer, ShareLinkChain, chain_hops, is_chain};
+pub use chain::{ChainNamer, ShareLinkChain, chain_hops, is_bare_name, is_chain};
 
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
