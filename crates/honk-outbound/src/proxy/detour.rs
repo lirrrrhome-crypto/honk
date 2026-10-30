@@ -60,6 +60,29 @@ pub fn install_runtime_registry(registry: &SharedRuntimeRegistry) {
         .write() = Arc::downgrade(registry);
 }
 
+tokio::task_local! {
+    static PINNED_GENERATION: Arc<OutboundRuntimeRegistry>;
+}
+
+/// Run `future` with `generation` pinned for chained dials made through a
+/// bare handler (probes, delay tests, download tunnels): their node-named
+/// fronts resolve against this generation instead of the live one, so a
+/// probe started before a reload keeps using the fronts it was planned with.
+pub async fn pin_generation<F: std::future::Future>(
+    generation: Arc<OutboundRuntimeRegistry>,
+    future: F,
+) -> F::Output {
+    PINNED_GENERATION.scope(generation, future).await
+}
+
+/// The caller's pinned generation if any, otherwise the live one.
+fn caller_generation() -> Option<Arc<OutboundRuntimeRegistry>> {
+    PINNED_GENERATION
+        .try_with(Arc::clone)
+        .ok()
+        .or_else(current_generation)
+}
+
 fn current_generation() -> Option<Arc<OutboundRuntimeRegistry>> {
     let cell = RUNTIME_REGISTRY.get()?.read().upgrade()?;
     let generation = Arc::clone(&cell.read());
@@ -102,7 +125,7 @@ impl TcpOutbound for ChainAware {
         if node.detour.is_some() {
             return dial_chained(
                 &self.table,
-                current_generation(),
+                caller_generation(),
                 node.clone(),
                 target,
                 target_domain.map(str::to_owned),
@@ -139,7 +162,7 @@ impl TcpOutbound for ChainAware {
         if runtime.node.detour.is_some() {
             return dial_chained(
                 &self.table,
-                current_generation(),
+                caller_generation(),
                 runtime.node.as_ref().clone(),
                 target,
                 target_domain.map(str::to_owned),
@@ -172,18 +195,29 @@ impl TcpOutbound for ChainAware {
     }
 }
 
-fn group_front(name: &str) -> Option<Node> {
+/// `Some(selection)` when `name` is a live group (`None` inside when it has
+/// no current TCP selection); `None` when it is not a group.
+fn group_front(name: &str) -> Option<Option<Node>> {
     let shared = GROUP_MANAGER.get()?.read().clone()?;
     let manager = Arc::clone(&shared.read());
-    manager.select_node(name).cloned()
+    manager.get_group_policy(name)?;
+    Some(manager.select_node(name).cloned())
 }
 
-/// Resolve a front name: a node in the captured generation first, then a
-/// group's current selection.
+/// Resolve a front name at connect time, matching configuration validation:
+/// a group name wins and yields the group's *current* TCP selection (select,
+/// url-test, fallback, ... — whatever the policy picks right now), so a
+/// group switch affects new connections only; otherwise the unique node of
+/// that name in the captured generation.
 pub(crate) fn resolve_front(
     name: &str,
     generation: Option<&OutboundRuntimeRegistry>,
 ) -> anyhow::Result<Node> {
+    if let Some(selection) = group_front(name) {
+        return selection.ok_or_else(|| {
+            anyhow::anyhow!("detour front group {name:?} has no available selection")
+        });
+    }
     if let Some(generation) = generation {
         let mut matches = generation
             .values()
@@ -196,8 +230,9 @@ pub(crate) fn resolve_front(
             return Ok(runtime.node.as_ref().clone());
         }
     }
-    group_front(name)
-        .ok_or_else(|| anyhow::anyhow!("detour front {name:?} is not a known node or group"))
+    Err(anyhow::anyhow!(
+        "detour front {name:?} is not a known node or group"
+    ))
 }
 
 /// The chained node's server as the front hop's target. A domain server is
@@ -276,7 +311,7 @@ pub(crate) fn dial_chained<'a>(
             "protocol {} cannot be chained through a detour",
             node.protocol().as_str()
         );
-        let generation = generation.or_else(current_generation);
+        let generation = generation.or_else(caller_generation);
         let front = resolve_front(&front_name, generation.as_deref())?;
         anyhow::ensure!(front.id != node.id, "node detour resolves to itself");
         let (server, server_domain) = server_target(&node, &front).await?;

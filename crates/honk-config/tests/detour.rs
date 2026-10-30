@@ -268,3 +268,60 @@ fn fuzz_share_links_do_not_panic() {
         }
     }
 }
+
+#[test]
+fn group_front_depth_uses_the_deepest_member() {
+    // g holds a shallow n0 and the deepest n7; a node fronted by g is one
+    // hop deeper than n7 whichever member the policy picks at connect time.
+    let mut nodes = chain(7);
+    nodes.push_str("top: 'socks5://9.9.9.9:1080?detour=g'\n");
+    let shallow_and_deep = "g {\n filter: name(n0, n7)\n policy: selector\n}";
+    assert_eq!(code(&parse(&nodes, shallow_and_deep)), None);
+    nodes.push_str("top2: 'socks5://9.9.9.8:1080?detour=top'\n");
+    assert_eq!(
+        code(&parse(&nodes, shallow_and_deep)),
+        Some("detour-chain-too-deep")
+    );
+    // Through a nested group as well: outer → inner → n8.
+    let mut nodes = chain(8);
+    nodes.push_str("top: 'socks5://9.9.9.9:1080?detour=outer'\n");
+    assert_eq!(
+        code(&parse(
+            &nodes,
+            "inner {\n filter: name(n0, n8)\n policy: selector\n}\nouter {\n filter: group(inner)\n policy: selector\n}"
+        )),
+        Some("detour-chain-too-deep")
+    );
+}
+
+#[test]
+fn cycles_through_nested_groups_and_final_are_rejected() {
+    for (nodes, groups) in [
+        (
+            "a: 'socks5://1.1.1.1:1080?detour=outer'\n b: 'socks5://2.2.2.2:1080'",
+            "inner {\n filter: name(a, b)\n policy: selector\n}\nouter {\n filter: group(inner)\n policy: selector\n}",
+        ),
+        (
+            "a: 'socks5://1.1.1.1:1080?detour=g'\n b: 'socks5://2.2.2.2:1080'",
+            "g {\n filter: name(b)\n policy: fallback\n final: a\n}",
+        ),
+        (
+            "a: 'socks5://1.1.1.1:1080?detour=g'\n b: 'socks5://2.2.2.2:1080?detour=h'",
+            "g {\n filter: name(b)\n policy: selector\n}\nh {\n filter: name(a)\n policy: url_test\n}",
+        ),
+    ] {
+        assert_eq!(
+            code(&parse(nodes, groups)),
+            Some("detour-cycle"),
+            "{groups}"
+        );
+    }
+    // Sibling members of the same group are not a cycle.
+    assert_eq!(
+        code(&parse(
+            "a1: 'socks5://1.1.1.1:1080'\n a2: 'socks5://1.1.1.2:1080'\n b: 'socks5://2.2.2.2:1080?detour=fronts'",
+            "fronts {\n filter: name(a1, a2)\n policy: selector\n}"
+        )),
+        None
+    );
+}

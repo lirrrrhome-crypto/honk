@@ -6,6 +6,10 @@
 //!        (forward every accepted local TCP connection to host:port through the node)
 //!        chain_probe <nodes.dae> <node-name> <ip:port> --healthcheck <url>
 //!        (run the group health-check HTTP probe path against the node)
+//!        chain_probe <nodes.dae> <node-name> <host:port> --switch <group> <first> <second> [path]
+//!        (open one connection with selector <group> on <first>, switch to
+//!        <second>, open another, then fetch <path> over both)
+//! `CHAIN_SELECT=<group>=<member>` picks a selector member before dialing.
 //! `nodes.dae` holds a `node { ... }` (and optional `group { ... }`) block.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -60,7 +64,63 @@ async fn main() -> anyhow::Result<()> {
     // against the live generation.
     let cell = Arc::new(parking_lot::RwLock::new(Arc::clone(&generation)));
     honk_outbound::proxy::detour::install_runtime_registry(&cell);
+    // Group-named fronts resolve against the live group selection.
+    let manager = Arc::new(honk_outbound::group::GroupManager::new(
+        &config.groups,
+        &config.nodes,
+    ));
+    honk_outbound::proxy::detour::install_group_manager(Arc::new(parking_lot::RwLock::new(
+        Arc::clone(&manager),
+    )));
+    let select = |group: &str, member: &str| -> anyhow::Result<()> {
+        manager
+            .set_selector_choice(group, member, honk_outbound::group::SelectorNetworks::Both)
+            .map_err(|e| anyhow::anyhow!("select {group}={member}: {e:?}"))?;
+        println!("selected {group}={member}");
+        Ok(())
+    };
+    if let Ok(choice) = std::env::var("CHAIN_SELECT") {
+        let (group, member) = choice
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("CHAIN_SELECT=<group>=<member>"))?;
+        select(group, member)?;
+    }
     let registry = Arc::new(ProxyRegistry::default_resolver()?);
+    if args.get(4).map(String::as_str) == Some("--switch") {
+        let [group, first, second] = [5, 6, 7].map(|i| args.get(i).cloned().unwrap_or_default());
+        let path = args.get(8).map(String::as_str).unwrap_or("/");
+        let dial = || {
+            registry.dial_runtime(
+                Arc::clone(&generation),
+                node.id,
+                target,
+                domain.as_deref(),
+                Duration::from_secs(10),
+            )
+        };
+        select(&group, &first)?;
+        let mut before = dial().await?;
+        select(&group, &second)?;
+        let mut after = dial().await?;
+        for (label, stream) in [("before", &mut before), ("after", &mut after)] {
+            stream
+                .stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+            let mut body = Vec::new();
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                stream.stream.read_to_end(&mut body),
+            )
+            .await??;
+            let ok = String::from_utf8_lossy(&body).contains("200");
+            println!("switch {label}: {}", if ok { "Ok" } else { "Err" });
+        }
+        return Ok(());
+    }
     if args.get(4).map(String::as_str) == Some("--healthcheck") {
         let url = args
             .get(5)

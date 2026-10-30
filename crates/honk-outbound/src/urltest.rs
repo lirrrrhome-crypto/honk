@@ -376,10 +376,15 @@ async fn urltest_node_in_generation_impl(
         })
     };
     let result = cancel
-        .run(runtime.scope_tasks(generation.scope_dials(Box::pin(async {
-            warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
-            urltest_request_impl(&runtime, handler, &request, timeout, &cancel).await
-        }))))
+        .run(
+            runtime.scope_tasks(generation.scope_dials(crate::proxy::detour::pin_generation(
+                Arc::clone(generation),
+                Box::pin(async {
+                    warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
+                    urltest_request_impl(&runtime, handler, &request, timeout, &cancel).await
+                }),
+            ))),
+        )
         .await
         .unwrap_or_else(|| Err(crate::proxy::PacketRejection::Cancelled.into()));
     if let Some(mut guard) = guard

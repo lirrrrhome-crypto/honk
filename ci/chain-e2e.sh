@@ -4,7 +4,9 @@
 # the landing node. Proves the A -> B -> target hops from the servers' access
 # logs, runs the group health-check probe path the same way, then stops A and
 # checks both fail instead of bypassing A, and that the health check recovers
-# once A is back.
+# once A is back. Finally B's front becomes a selector group of A1/A2:
+# the selected member carries each new connection, a switch moves new
+# connections only, and a down selected member fails closed.
 #
 # Usage: ci/chain-e2e.sh [workdir]   (Linux x86_64; needs curl, python3)
 set -euo pipefail
@@ -90,3 +92,57 @@ sleep 1
 grep -q 'healthcheck: Ok' health.out
 grep -q 'A-socks.*inbound connection to 127.0.0.3:28388' a.log
 echo "PASS: front back -> health check recovers via A"
+
+# Group front: B's dialer-proxy names a selector group of two fronts A1/A2.
+# New connections use the group's selection at connect time; a connection
+# opened before a switch keeps its front.
+cat > a2.json <<JSON
+{"log":{"level":"debug","output":"$WORK/a2.log"},
+ "inbounds":[{"type":"socks","tag":"A2-socks","listen":"127.0.0.5","listen_port":21081}],
+ "outbounds":[{"type":"direct","tag":"A2-direct"}]}
+JSON
+cat > group.dae <<'DAE'
+node {
+    A1: 'socks5://127.0.0.2:21080'
+    A2: 'socks5://127.0.0.5:21081'
+    B: 'ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388?dialer-proxy=fronts#B'
+}
+group {
+    fronts {
+        filter: name(A1, A2)
+        policy: selector
+    }
+}
+DAE
+: > a2.log
+./sing-box run -c a2.json > a2.out 2>&1 & a2_pid=$!; pids+=("$a2_pid")
+sleep 1
+hops() { grep -c "$1.*inbound connection to 127.0.0.3:28388" "$2" || true; }
+for pick in A1 A2; do
+  : > a.log; : > a2.log; : > b.log
+  CHAIN_SELECT=fronts=$pick "$PROBE" group.dae B 127.0.0.4:18080 /index.html | tee probe.out
+  grep -q hello-through-chain probe.out
+  CHAIN_SELECT=fronts=$pick "$PROBE" group.dae B 127.0.0.4:18080 --healthcheck "$HEALTH_URL" | tee health.out
+  grep -q 'healthcheck: Ok' health.out
+  if [ "$pick" = A1 ]; then on=$(hops A-socks a.log); off=$(hops A2-socks a2.log)
+  else on=$(hops A2-socks a2.log); off=$(hops A-socks a.log); fi
+  [ "$on" = 2 ] && [ "$off" = 0 ] || { echo "FAIL: select $pick -> hops on=$on off=$off" >&2; exit 1; }
+  echo "PASS: group front selected $pick carries dial + health check"
+done
+
+: > a.log; : > a2.log; : > b.log
+"$PROBE" group.dae B 127.0.0.4:18080 --switch fronts A1 A2 /index.html | tee switch.out
+[ "$(grep -c 'switch .*: Ok' switch.out)" = 2 ]
+[ "$(hops A-socks a.log)" = 1 ] && [ "$(hops A2-socks a2.log)" = 1 ] \
+  || { echo "FAIL: switch hops A1=$(hops A-socks a.log) A2=$(hops A2-socks a2.log)" >&2; exit 1; }
+echo "PASS: group switch -> new connection via A2, open one kept via A1"
+
+kill "$a2_pid"; wait "$a2_pid" 2>/dev/null || true
+: > b.log
+if CHAIN_SELECT=fronts=A2 "$PROBE" group.dae B 127.0.0.4:18080 /index.html; then
+  echo "FAIL: dial succeeded with the selected front down" >&2; exit 1
+fi
+if grep -q 'inbound connection' b.log; then
+  echo "FAIL: landing node reached without the selected front" >&2; exit 1
+fi
+echo "PASS: selected group front down -> dial fails, no bypass"

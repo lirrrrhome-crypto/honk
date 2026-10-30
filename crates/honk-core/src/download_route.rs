@@ -304,11 +304,14 @@ impl Tunnel {
     pub(crate) async fn dial(&self) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let proxy = self
             .generation
-            .scope_dials(self.tcp.dial_runtime(
-                std::sync::Arc::clone(&self.runtime),
-                self.addr,
-                self.domain.as_deref(),
-                self.connect_timeout,
+            .scope_dials(honk_outbound::proxy::detour::pin_generation(
+                std::sync::Arc::clone(&self.generation),
+                self.tcp.dial_runtime(
+                    std::sync::Arc::clone(&self.runtime),
+                    self.addr,
+                    self.domain.as_deref(),
+                    self.connect_timeout,
+                ),
             ))
             .await?;
         Ok(proxy.stream)

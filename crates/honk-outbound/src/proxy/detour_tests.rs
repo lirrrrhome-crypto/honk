@@ -394,3 +394,184 @@ async fn handler_level_dials_of_a_chained_node_use_the_front() {
     assert!(entry.tcp.dial(&node, f.http, None, timeout).await.is_err());
     assert_eq!(f.land.peers.lock().len(), land_before);
 }
+
+async fn http_204(stream: &mut crate::proxy::ProxyStream) {
+    stream
+        .stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut head = [0u8; 12];
+    stream.stream.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 204");
+    let mut rest = [0u8; 2];
+    // Drain the remaining header bytes so the next request starts clean.
+    let mut tail = Vec::new();
+    while !tail.ends_with(b"\r\n\r\n") {
+        stream.stream.read_exact(&mut rest[..1]).await.unwrap();
+        tail.push(rest[0]);
+    }
+}
+
+/// A front that is a selector group: each new connection uses the group's
+/// selection at connect time; a switch leaves open connections alone.
+#[tokio::test]
+async fn group_front_follows_the_current_selection() {
+    let _serial = SERIAL.lock().await;
+    let land = Arc::new(Log::default());
+    let land_real = socks_server(Arc::new(AtomicBool::new(true)), None, Arc::clone(&land)).await;
+    let land_alias = SocketAddr::from(([192, 0, 2, 1], land_real.port()));
+    let (a1, a2) = (Arc::new(Log::default()), Arc::new(Log::default()));
+    let a1_addr = socks_server(
+        Arc::new(AtomicBool::new(true)),
+        Some((land_alias, land_real)),
+        Arc::clone(&a1),
+    )
+    .await;
+    let a2_addr = socks_server(
+        Arc::new(AtomicBool::new(true)),
+        Some((land_alias, land_real)),
+        Arc::clone(&a2),
+    )
+    .await;
+    let http = http_server().await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n ga1: 'socks5://{a1_addr}'\n ga2: 'socks5://{a2_addr}'\n gb: 'socks5://{land_alias}?detour=gfronts'\n}}\n\
+             group {{\n gfronts {{\n filter: name(ga1, ga2)\n policy: selector\n }}\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let land_id = config.nodes.iter().find(|n| n.name == "gb").unwrap().id;
+    let generation = Arc::new(OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+    let cell = Arc::new(parking_lot::RwLock::new(Arc::clone(&generation)));
+    super::install_runtime_registry(&cell);
+    let manager = Arc::new(crate::group::GroupManager::new(
+        &config.groups,
+        &config.nodes,
+    ));
+    super::install_group_manager(Arc::new(parking_lot::RwLock::new(Arc::clone(&manager))));
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let runtime = generation.get(&land_id).unwrap();
+    let entry = registry.find(runtime.node.protocol()).unwrap();
+    let timeout = Duration::from_secs(2);
+    let select = |member: &str| {
+        manager
+            .set_selector_choice("gfronts", member, crate::group::SelectorNetworks::Both)
+            .unwrap();
+    };
+
+    select("ga1");
+    // Connection path (registry hook, pinned generation) and handler path.
+    let mut held = registry
+        .dial_runtime(Arc::clone(&generation), land_id, http, None, timeout)
+        .await
+        .expect("registry dial via ga1");
+    http_204(&mut held).await;
+    let mut probe = entry
+        .tcp
+        .dial_runtime(Arc::clone(&runtime), http, None, timeout)
+        .await
+        .expect("handler dial via ga1");
+    http_204(&mut probe).await;
+    drop(probe);
+    assert_eq!(a1.targets.lock().len(), 2);
+    assert!(a2.targets.lock().is_empty());
+
+    select("ga2");
+    let mut fresh = registry
+        .dial_runtime(Arc::clone(&generation), land_id, http, None, timeout)
+        .await
+        .expect("registry dial via ga2");
+    http_204(&mut fresh).await;
+    let latency = crate::urltest::urltest_node_in_generation_with_feedback(
+        &generation,
+        &runtime.node,
+        entry.tcp.as_ref(),
+        entry.warmable.as_deref(),
+        &format!("http://{http}/"),
+        timeout,
+        &manager,
+        ProbeCancellation::default(),
+    )
+    .await;
+    assert!(latency.is_ok(), "delay test via ga2: {latency:?}");
+    assert_eq!(a1.targets.lock().len(), 2, "no new hop through ga1");
+    assert_eq!(a2.targets.lock().len(), 2);
+    // The connection opened before the switch still works through ga1.
+    http_204(&mut held).await;
+
+    let upstream: Vec<_> = a1
+        .upstream_locals
+        .lock()
+        .iter()
+        .chain(a2.upstream_locals.lock().iter())
+        .copied()
+        .collect();
+    for peer in land.peers.lock().iter() {
+        assert!(upstream.contains(peer), "direct connection from {peer}");
+    }
+}
+
+/// Handler-level dials resolve node-named fronts in the caller's pinned
+/// generation, not whatever generation is live.
+#[tokio::test]
+async fn pinned_generation_decides_the_front() {
+    let _serial = SERIAL.lock().await;
+    let land = Arc::new(Log::default());
+    let land_real = socks_server(Arc::new(AtomicBool::new(true)), None, Arc::clone(&land)).await;
+    let land_alias = SocketAddr::from(([192, 0, 2, 1], land_real.port()));
+    let (old, new) = (Arc::new(Log::default()), Arc::new(Log::default()));
+    let mut addrs = Vec::new();
+    for log in [&old, &new] {
+        addrs.push(
+            socks_server(
+                Arc::new(AtomicBool::new(true)),
+                Some((land_alias, land_real)),
+                Arc::clone(log),
+            )
+            .await,
+        );
+    }
+    let http = http_server().await;
+    let build = |front: SocketAddr| {
+        let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+            &format!(
+                "node {{\n pa: 'socks5://{front}'\n pb: 'socks5://{land_alias}?detour=pa'\n}}\n"
+            ),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        Arc::new(OutboundRuntimeRegistry::build(&config.nodes).unwrap())
+    };
+    let (gen_old, gen_new) = (build(addrs[0]), build(addrs[1]));
+    let cell = Arc::new(parking_lot::RwLock::new(Arc::clone(&gen_new)));
+    super::install_runtime_registry(&cell);
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let runtime = gen_old
+        .values()
+        .find(|runtime| runtime.node.name == "pb")
+        .unwrap();
+    let entry = registry.find(runtime.node.protocol()).unwrap();
+    let timeout = Duration::from_secs(2);
+
+    super::pin_generation(
+        Arc::clone(&gen_old),
+        entry
+            .tcp
+            .dial_runtime(Arc::clone(runtime), http, None, timeout),
+    )
+    .await
+    .expect("pinned dial");
+    assert_eq!(old.targets.lock().len(), 1);
+    assert!(new.targets.lock().is_empty());
+
+    entry
+        .tcp
+        .dial_runtime(Arc::clone(runtime), http, None, timeout)
+        .await
+        .expect("unpinned dial");
+    assert_eq!(new.targets.lock().len(), 1, "unpinned uses the live one");
+}

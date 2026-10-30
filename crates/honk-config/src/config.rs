@@ -971,8 +971,9 @@ impl Config {
                 }
             }
         }
-        // Edges: node → its front; group → every explicit member node and
-        // nested group. Iterative three-color DFS; a back edge is a cycle.
+        // Edges: node → its front; group → every member node, nested group
+        // and `final_outbound` (any of which the policy may pick at connect
+        // time, so cycles and depth are checked against the worst member). Iterative three-color DFS; a back edge is a cycle.
         let edges = |vertex: Vertex| -> Vec<Vertex> {
             match vertex {
                 Vertex::Node(index) => front[index].into_iter().collect(),
@@ -989,6 +990,16 @@ impl Config {
                                 .filter_map(|name| group_by_name.get(name.as_str()))
                                 .map(|&nested| Vertex::Group(nested)),
                         )
+                        // `final_outbound` is selected when the policy has
+                        // nothing available, so it is a member too (a node
+                        // name wins over a group, as in the resolver).
+                        .chain(group.final_outbound.as_deref().and_then(|name| {
+                            self.nodes
+                                .iter()
+                                .position(|node| user_node(node) && node.name == name)
+                                .map(Vertex::Node)
+                                .or_else(|| group_by_name.get(name).map(|&g| Vertex::Group(g)))
+                        }))
                         .collect()
                 }
             }
