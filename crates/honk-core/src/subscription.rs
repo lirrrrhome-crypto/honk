@@ -803,6 +803,7 @@ fn parse_uri_subscription(
     subscription_id: Option<uuid::Uuid>,
     mut emit: impl FnMut(IndexedOutcome),
 ) -> anyhow::Result<()> {
+    let mut namer = honk_config::share_link::ChainNamer::default();
     for (index, uri) in text.lines().enumerate() {
         let uri = uri.trim();
         if uri.is_empty()
@@ -823,20 +824,36 @@ fn parse_uri_subscription(
             emit(outcome);
             continue;
         }
-        let result = Node::from_share_link_with_detailed_diagnostics_emit(uri, &mut |diagnostic| {
-            emit(IndexedOutcome {
-                ordinal,
-                line: Some(ordinal),
-                path: "entries",
-                kind: IndexedOutcomeKind::Diagnostic(diagnostic),
+        let result =
+            Node::from_share_link_chain_with_detailed_diagnostics_emit(uri, &mut |diagnostic| {
+                emit(IndexedOutcome {
+                    ordinal,
+                    line: Some(ordinal),
+                    path: "entries",
+                    kind: IndexedOutcomeKind::Diagnostic(diagnostic),
+                });
             });
+        // dae `->` chains: relays get generated names that avoid every name
+        // seen so far in this subscription, or reuse an identical node.
+        let result = result.and_then(|chain| {
+            namer.link(chain).map_err(|message| {
+                honk_config::error::DetailedConfigError::new(
+                    ErrorCategory::Validation,
+                    "invalid-chain",
+                    honk_config::diagnostic::DiagnosticSources::new(None).root(),
+                    honk_config::diagnostic::SettingPath::new("nodes").field("chain"),
+                    message,
+                )
+            })
         });
         match result {
-            Ok(mut node) => {
-                node.subscription_id = subscription_id;
-                let mut outcome = IndexedOutcome::node(ordinal, "entries", node);
-                outcome.line = Some(ordinal);
-                emit(outcome);
+            Ok(nodes) => {
+                for mut node in nodes {
+                    node.subscription_id = subscription_id;
+                    let mut outcome = IndexedOutcome::node(ordinal, "entries", node);
+                    outcome.line = Some(ordinal);
+                    emit(outcome);
+                }
             }
             Err(error) => {
                 let mut diagnostic = *error.diagnostic;

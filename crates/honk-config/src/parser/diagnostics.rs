@@ -77,7 +77,7 @@ impl<'a> ParserDiagnostics<'a> {
     pub fn parse_share_link(
         &mut self,
         link: &str,
-    ) -> Result<crate::node::Node, crate::error::DetailedConfigError> {
+    ) -> Result<crate::share_link::ShareLinkChain, crate::error::DetailedConfigError> {
         let source = self.source();
         let location = &self.current;
         let entry = self.entry;
@@ -101,7 +101,7 @@ impl<'a> ParserDiagnostics<'a> {
                     .insert(1, crate::diagnostic::SettingSegment::Index(index));
             }
         };
-        crate::node::Node::parse_share_link(link, &source, &mut |mut diagnostic| {
+        crate::node::Node::parse_share_link_chain(link, &source, &mut |mut diagnostic| {
             locate_entry(&mut diagnostic);
             self.output.push(diagnostic);
         })

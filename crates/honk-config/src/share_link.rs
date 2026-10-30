@@ -26,12 +26,15 @@ use crate::error::{ConfigError, DetailedConfigError, ErrorCategory};
 use crate::node::{Node, OutboundConfig, ShadowsocksConfig};
 use crate::options::vocab::{optional_text, vmess_cipher, xhttp_stream_transport};
 
+mod chain;
 mod options;
 mod xhttp;
 
+pub use chain::{ChainNamer, ShareLinkChain, chain_hops, is_chain};
+
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
-    /// A chain describes several hops; only the first is parsed.
+    /// A dae `->` chain is rejected here; use [`Node::from_share_link_chain`].
     pub fn from_share_link(link: &str) -> Result<Node, ConfigError> {
         let mut diagnostics = Vec::new();
         let result = Self::from_share_link_with_detailed_diagnostics(link, &mut diagnostics);
@@ -81,6 +84,13 @@ impl Node {
         source: &crate::diagnostic::SourceRef,
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, crate::error::DetailedConfigError> {
+        if chain::is_chain(link) {
+            return Err(chain::chain_error(
+                source,
+                "invalid-chain",
+                "node chain (->) link needs chain parsing; it was not reduced to its first hop",
+            ));
+        }
         // Chained-dial front hop: `dialer-proxy=` / `detour=` query parameter.
         // Stripped before protocol decoding so no handler sees it.
         let (stripped, detour) = take_detour_param(link).map_err(|message| {
@@ -130,7 +140,7 @@ impl Node {
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, DetailedConfigError> {
         let legacy = |error| DetailedConfigError::from_legacy(error, source.clone());
-        let first = link.split("->").next().unwrap_or("").trim();
+        let first = link.trim();
         let mut ss_config = None;
         let (decoded, shadowrocket) = match first.split_once("://") {
             Some((scheme, payload)) if scheme.eq_ignore_ascii_case("vmess") => {
@@ -759,8 +769,7 @@ const DETOUR_PARAMS: [&str; 3] = ["dialer-proxy", "dialer_proxy", "detour"];
 pub(crate) fn take_detour_param(
     link: &str,
 ) -> Result<(Cow<'_, str>, Option<String>), &'static str> {
-    let hop_end = link.find("->").unwrap_or(link.len());
-    let (hop, rest) = link.split_at(hop_end);
+    let (hop, rest) = link.split_at(link.len());
     let fragment_start = hop.find('#').unwrap_or(hop.len());
     let (body, fragment) = hop.split_at(fragment_start);
     let Some((base, query)) = body.split_once('?') else {

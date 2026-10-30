@@ -50,7 +50,7 @@ pids=()
 cleanup() { kill "${pids[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 ./sing-box run -c a.json > a.out 2>&1 & a_pid=$!; pids+=("$a_pid")
-./sing-box run -c b.json > b.out 2>&1 & pids+=($!)
+./sing-box run -c b.json > b.out 2>&1 & b_pid=$!; pids+=("$b_pid")
 python3 -m http.server 18080 --bind 127.0.0.4 --directory www > http.log 2>&1 & pids+=($!)
 sleep 1
 
@@ -233,3 +233,41 @@ if "$PROBE" udp.dae T 127.0.0.4:15353 --udp; then
 fi
 if grep -q 'inbound' t.log; then echo "FAIL: T reached without the front" >&2; exit 1; fi
 echo "PASS: front down -> UDP fails, no bypass"
+
+# dae `->` chain syntax: left = landing, right = relay dialed first, so
+# C rides A -> B -> T -> target. Each hop must show up in the next hop's log.
+./sing-box run -c a.json > a.out 2>&1 & a_pid=$!; pids+=("$a_pid")
+sleep 1
+cat > arrow.dae <<'DAE'
+node {
+    C: 'trojan://chainpw@127.0.0.6:24443?sni=localhost&allowInsecure=1#C -> ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388 -> socks5://127.0.0.2:21080'
+}
+DAE
+arrow_hops() {
+  grep -q 'A-socks.*inbound connection to 127.0.0.3:28388' a.log \
+    || { echo "FAIL: A did not dial B" >&2; exit 1; }
+  grep -q 'B-ss.*inbound connection to 127.0.0.6:24443' b.log \
+    || { echo "FAIL: B did not dial T" >&2; exit 1; }
+}
+: > a.log; : > b.log; : > t.log
+"$PROBE" arrow.dae C 127.0.0.4:18080 /index.html | tee probe.out
+grep -q hello-through-chain probe.out
+arrow_hops
+grep -q 'T-trojan.*inbound connection to 127.0.0.4:18080' t.log \
+  || { echo "FAIL: T did not reach the target" >&2; exit 1; }
+echo "PASS: '->' chain TCP via A -> B -> T"
+
+: > a.log; : > b.log; : > t.log
+"$PROBE" arrow.dae C 127.0.0.4:15353 --udp 64 | tee udp.out
+grep -q 'udp echo: Ok' udp.out
+arrow_hops
+udp_seen || { echo "FAIL: T did not relay UDP" >&2; exit 1; }
+echo "PASS: '->' chain UDP via A -> B -> T"
+
+kill "$b_pid"; wait "$b_pid" 2>/dev/null || true
+: > t.log
+if "$PROBE" arrow.dae C 127.0.0.4:18080 /index.html; then
+  echo "FAIL: '->' chain succeeded with the middle hop down" >&2; exit 1
+fi
+if grep -q 'inbound' t.log; then echo "FAIL: T reached without B" >&2; exit 1; fi
+echo "PASS: '->' middle hop down -> fails, no bypass"

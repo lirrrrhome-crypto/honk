@@ -114,6 +114,55 @@ fn test_parse_base64_subscription() {
 }
 
 #[test]
+fn base64_subscription_chains_become_detour_hops() {
+    // dae: left = landing, right = relay. The second chain reuses the first
+    // relay; the plain node named like a generated relay name keeps its own.
+    let lines = [
+        "trojan://pw@land.example:443?sni=land.example#Land -> socks5://10.0.0.1:1080",
+        "ss://YWVzLTEyOC1nY206cHc@10.0.0.9:8388#Land2 -> ss://YWVzLTEyOC1nY206cHc@10.0.0.2:8388 -> socks5://10.0.0.1:1080",
+        "socks5://192.0.2.1:1080#Plain",
+        "tuic://00000000-0000-0000-0000-000000000001:p@t.example:443#Bad -> socks5://10.0.0.1:1080",
+    ];
+    let encoded = base64::engine::general_purpose::STANDARD.encode(lines.join("\n"));
+    let nodes = parse_subscription_content(
+        &Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        },
+        &encoded,
+    )
+    .unwrap();
+    let by_name = |name: &str| nodes.iter().find(|n| n.name == name).unwrap();
+    let hosts = |start: &str| {
+        let mut out = Vec::new();
+        let mut current = Some(by_name(start));
+        while let Some(node) = current {
+            out.push(node.host.clone());
+            current = node.detour.as_deref().map(by_name);
+        }
+        out
+    };
+    assert_eq!(hosts("Land"), ["land.example", "10.0.0.1"]);
+    assert_eq!(hosts("Land2"), ["10.0.0.9", "10.0.0.2", "10.0.0.1"]);
+    assert_eq!(
+        by_name("Land").detour,
+        nodes.iter().find(|n| n.host == "10.0.0.2").unwrap().detour
+    );
+    assert!(by_name("Plain").detour.is_none());
+    assert!(
+        nodes
+            .iter()
+            .all(|n| n.name != "Bad" && n.host != "t.example"),
+        "QUIC landing chain dropped"
+    );
+    let mut names: Vec<_> = nodes.iter().map(|n| &n.name).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), nodes.len());
+    assert_eq!(nodes.len(), 5);
+}
+
+#[test]
 fn uri_subscription_with_empty_vmess_remark_remains_usable() {
     let payload = r#"{"ps":"","add":"vmess.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}"#;
     let uri = format!(

@@ -21,6 +21,7 @@ pub(super) fn parse_node_section_indexed(
     mut on_entry: impl FnMut(&Node, Span),
 ) -> Result<Vec<Node>, super::ParseFailure> {
     let mut nodes = Vec::new();
+    let mut chains = Vec::new();
     let mut entry_index = 0;
     for root in section {
         let Some(body) = root.body_with(super::cursor::BodySyntax::Entries) else {
@@ -31,11 +32,67 @@ pub(super) fn parse_node_section_indexed(
                 &child,
                 diagnostics,
                 &mut nodes,
+                &mut chains,
                 &mut entry_index,
                 &mut on_entry,
             )?;
         }
     }
+    link_chains(nodes, chains, diagnostics)
+}
+
+/// A `->` chain entry awaiting relay naming: the landing's index in the
+/// section's nodes, its relays, and its diagnostic location.
+struct PendingChain {
+    landing: usize,
+    relays: Vec<Node>,
+    entry: Option<usize>,
+}
+
+/// Wire every `->` chain once all user-declared names are known, so
+/// generated relay names never collide with a node declared later.
+fn link_chains(
+    nodes: Vec<Node>,
+    chains: Vec<PendingChain>,
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Result<Vec<Node>, super::ParseFailure> {
+    if chains.is_empty() {
+        return Ok(nodes);
+    }
+    let mut namer = crate::share_link::ChainNamer::new(&nodes);
+    let mut landings: Vec<Option<Node>> = nodes.into_iter().map(Some).collect();
+    let mut relays_out = Vec::new();
+    for chain in chains {
+        let landing = landings[chain.landing]
+            .take()
+            .expect("one chain per landing");
+        match namer.link(crate::share_link::ShareLinkChain {
+            landing,
+            relays: chain.relays,
+        }) {
+            Ok(mut linked) => {
+                landings[chain.landing] = Some(linked.remove(0));
+                relays_out.extend(linked);
+            }
+            Err(message) => {
+                let mut error = crate::error::DetailedConfigError::new(
+                    crate::error::ErrorCategory::Validation,
+                    "invalid-chain",
+                    diagnostics.source(),
+                    crate::diagnostic::SettingPath::new("nodes").field("chain"),
+                    message,
+                );
+                // Like any unusable entry: warn and drop it (never keep the
+                // landing without its relays).
+                error.diagnostic.entry_index = chain.entry;
+                error.diagnostic.severity = Severity::Warning;
+                error.diagnostic.terminal = false;
+                diagnostics.output.push(*error.diagnostic);
+            }
+        }
+    }
+    let mut nodes: Vec<Node> = landings.into_iter().flatten().collect();
+    nodes.extend(relays_out);
     Ok(nodes)
 }
 
@@ -43,6 +100,7 @@ fn visit_node_segment<'d, 'a>(
     segment: &Segment<'d, 'a>,
     diagnostics: &mut ParserDiagnostics<'_>,
     nodes: &mut Vec<Node>,
+    chains: &mut Vec<PendingChain>,
     entry_index: &mut usize,
     on_entry: &mut impl FnMut(&Node, Span),
 ) -> Result<(), super::ParseFailure> {
@@ -56,7 +114,7 @@ fn visit_node_segment<'d, 'a>(
         );
         if let Some(body) = segment.body_with(super::cursor::BodySyntax::Entries) {
             for child in body {
-                visit_node_segment(&child, diagnostics, nodes, entry_index, on_entry)?;
+                visit_node_segment(&child, diagnostics, nodes, chains, entry_index, on_entry)?;
             }
         }
         return Ok(());
@@ -68,13 +126,15 @@ fn visit_node_segment<'d, 'a>(
     }
     *entry_index += 1;
     diagnostics.entry_text(text, *entry_index);
-    parse_node_entry(text, diagnostics, nodes, on_entry)
+    parse_node_entry(text, diagnostics, nodes, chains, *entry_index, on_entry)
 }
 
 fn parse_node_entry(
     text: Text<'_, '_>,
     diagnostics: &mut ParserDiagnostics<'_>,
     nodes: &mut Vec<Node>,
+    chains: &mut Vec<PendingChain>,
+    entry_index: usize,
     on_entry: &mut impl FnMut(&Node, Span),
 ) -> Result<(), super::ParseFailure> {
     let raw = text.raw();
@@ -118,11 +178,19 @@ fn parse_node_entry(
         return Ok(());
     };
     match diagnostics.parse_share_link(uri.raw()) {
-        Ok(mut node) => {
+        Ok(chain) => {
+            let mut node = chain.landing;
             if let Some(tag) = tag.filter(|tag| !tag.raw().is_empty()) {
                 node.name = tag.raw().to_owned();
             }
             on_entry(&node, text.source.span(text.span.start, end));
+            if !chain.relays.is_empty() {
+                chains.push(PendingChain {
+                    landing: nodes.len(),
+                    relays: chain.relays,
+                    entry: Some(entry_index),
+                });
+            }
             nodes.push(node);
         }
         Err(error) if error.category == crate::error::ErrorCategory::UnknownProtocol => {
