@@ -101,12 +101,14 @@ impl ProtocolEntry {
 
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
+    tcp_table: super::detour::TcpTable,
 }
 
 impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            tcp_table: Default::default(),
         }
     }
 
@@ -200,7 +202,35 @@ impl ProxyRegistry {
         Ok(registry)
     }
 
-    pub fn register(&mut self, entry: ProtocolEntry) {
+    /// Register a protocol. Its TCP handler is wrapped so that every dial of
+    /// a chained node, including direct handler calls, goes through the
+    /// detour front.
+    pub fn register(&mut self, mut entry: ProtocolEntry) {
+        let inner = Arc::clone(&entry.tcp);
+        self.tcp_table
+            .write()
+            .push((entry.descriptor.protocol, Arc::clone(&inner)));
+        entry.tcp = Arc::new(super::detour::ChainAware {
+            inner,
+            table: Arc::clone(&self.tcp_table),
+        });
+        use super::detour::DetourGuard;
+        entry.packet = entry
+            .packet
+            .take()
+            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn PacketOutbound>);
+        entry.shared = entry
+            .shared
+            .take()
+            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn SharedSourceOutbound>);
+        entry.warmable = entry
+            .warmable
+            .take()
+            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn WarmableOutbound>);
+        entry.probeable = entry
+            .probeable
+            .take()
+            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn ProbeableOutbound>);
         self.entries.push(entry);
     }
 
@@ -219,7 +249,7 @@ impl ProxyRegistry {
     ) -> anyhow::Result<ProxyStream> {
         if node.detour.is_some() {
             return super::detour::dial_chained(
-                self,
+                &self.tcp_table,
                 None,
                 node.clone(),
                 target,
@@ -264,7 +294,7 @@ impl ProxyRegistry {
             .map(|runtime| runtime.node.as_ref().clone())
         {
             return super::detour::dial_chained(
-                self,
+                &self.tcp_table,
                 Some(generation),
                 node,
                 target,

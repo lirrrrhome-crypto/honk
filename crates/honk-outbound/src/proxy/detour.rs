@@ -25,9 +25,12 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{ProxyRegistry, ProxyStream};
+use async_trait::async_trait;
+
+use super::{DirectMark, ProxyStream, TcpOutbound};
 use crate::group::SharedGroupManager;
 use crate::runtime::OutboundRuntimeRegistry;
+use crate::runtime::{NodeRuntime, SharedRuntimeRegistry};
 
 /// Longest accepted front chain; deeper chains are treated as a cycle.
 pub const MAX_DETOUR_DEPTH: usize = honk_config::node::MAX_DETOUR_HOPS;
@@ -41,6 +44,132 @@ pub fn install_group_manager(manager: SharedGroupManager) {
     *GROUP_MANAGER
         .get_or_init(|| parking_lot::RwLock::new(None))
         .write() = Some(manager);
+}
+
+static RUNTIME_REGISTRY: OnceLock<
+    parking_lot::RwLock<std::sync::Weak<parking_lot::RwLock<Arc<OutboundRuntimeRegistry>>>>,
+> = OnceLock::new();
+
+/// Install the live runtime-generation cell so handler-level dials (health
+/// probes, delay tests, downloads) that hold only a [`NodeRuntime`] resolve
+/// node-named fronts against the current generation. Held weakly: the owner
+/// of the cell keeps it alive.
+pub fn install_runtime_registry(registry: &SharedRuntimeRegistry) {
+    *RUNTIME_REGISTRY
+        .get_or_init(|| parking_lot::RwLock::new(std::sync::Weak::new()))
+        .write() = Arc::downgrade(registry);
+}
+
+fn current_generation() -> Option<Arc<OutboundRuntimeRegistry>> {
+    let cell = RUNTIME_REGISTRY.get()?.read().upgrade()?;
+    let generation = Arc::clone(&cell.read());
+    Some(generation)
+}
+
+/// Raw (unwrapped) TCP handlers by protocol, shared between a registry and
+/// the [`ChainAware`] wrappers it hands out. It holds only inner handlers, so
+/// there is no reference cycle back to the wrappers or the registry.
+pub(crate) type TcpTable = Arc<parking_lot::RwLock<Vec<(NodeProtocol, Arc<dyn TcpOutbound>)>>>;
+
+fn inner_handler(table: &TcpTable, protocol: NodeProtocol) -> anyhow::Result<Arc<dyn TcpOutbound>> {
+    table
+        .read()
+        .iter()
+        .find(|(candidate, _)| *candidate == protocol)
+        .map(|(_, handler)| Arc::clone(handler))
+        .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))
+}
+
+/// The registry's public TCP handler: delegates to the protocol handler, but
+/// any dial of a node carrying a detour goes through [`dial_chained`]. Every
+/// caller that reaches a handler directly (urltest, delay tests, native
+/// probes, download tunnels) therefore honours the chain and never connects
+/// straight to a chained node's server.
+pub(crate) struct ChainAware {
+    pub(crate) inner: Arc<dyn TcpOutbound>,
+    pub(crate) table: TcpTable,
+}
+
+#[async_trait]
+impl TcpOutbound for ChainAware {
+    async fn dial(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if node.detour.is_some() {
+            return dial_chained(
+                &self.table,
+                current_generation(),
+                node.clone(),
+                target,
+                target_domain.map(str::to_owned),
+                connect_timeout,
+                0,
+            )
+            .await;
+        }
+        self.inner
+            .dial(node, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_with_tcp(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        tcp: TcpStream,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        self.inner
+            .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
+            .await
+    }
+
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if runtime.node.detour.is_some() {
+            return dial_chained(
+                &self.table,
+                current_generation(),
+                runtime.node.as_ref().clone(),
+                target,
+                target_domain.map(str::to_owned),
+                connect_timeout,
+                0,
+            )
+            .await;
+        }
+        self.inner
+            .dial_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_runtime_marked(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<ProxyStream> {
+        if runtime.node.detour.is_some() {
+            return self
+                .dial_runtime(runtime, target, target_domain, connect_timeout)
+                .await;
+        }
+        self.inner
+            .dial_runtime_marked(runtime, target, target_domain, connect_timeout, mark)
+            .await
+    }
 }
 
 fn group_front(name: &str) -> Option<Node> {
@@ -125,7 +254,7 @@ pub(crate) async fn bridge(
 
 /// Dial `node` (which carries a detour) to `target` through its front chain.
 pub(crate) fn dial_chained<'a>(
-    registry: &'a ProxyRegistry,
+    table: &'a TcpTable,
     generation: Option<Arc<OutboundRuntimeRegistry>>,
     node: Node,
     target: SocketAddr,
@@ -147,6 +276,7 @@ pub(crate) fn dial_chained<'a>(
             "protocol {} cannot be chained through a detour",
             node.protocol().as_str()
         );
+        let generation = generation.or_else(current_generation);
         let front = resolve_front(&front_name, generation.as_deref())?;
         anyhow::ensure!(front.id != node.id, "node detour resolves to itself");
         let (server, server_domain) = server_target(&node, &front).await?;
@@ -158,7 +288,7 @@ pub(crate) fn dial_chained<'a>(
         );
         let front_stream = if front.detour.is_some() {
             dial_chained(
-                registry,
+                table,
                 generation.clone(),
                 front,
                 server,
@@ -168,34 +298,34 @@ pub(crate) fn dial_chained<'a>(
             )
             .await?
         } else {
+            let handler = inner_handler(table, front.protocol())?;
             match generation
                 .as_ref()
-                .filter(|generation| generation.get(&front.id).is_some())
+                .and_then(|generation| Some((generation, generation.get(&front.id)?)))
             {
-                Some(generation) => {
-                    registry
-                        .dial_runtime(
-                            Arc::clone(generation),
-                            front.id,
+                Some((generation, runtime)) => {
+                    anyhow::ensure!(
+                        !generation.is_shutdown(),
+                        "outbound runtime generation is shut down"
+                    );
+                    generation
+                        .scope_dials(handler.dial_runtime(
+                            runtime,
                             server,
                             server_domain.as_deref(),
                             connect_timeout,
-                        )
+                        ))
                         .await?
                 }
                 None => {
-                    registry
+                    handler
                         .dial(&front, server, server_domain.as_deref(), connect_timeout)
                         .await?
                 }
             }
         };
         let tcp = bridge(front_stream, connect_timeout).await?;
-        let entry = registry
-            .find(node.protocol())
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol()))?;
-        entry
-            .tcp
+        inner_handler(table, node.protocol())?
             .dial_with_tcp(
                 &node,
                 target,
@@ -206,3 +336,121 @@ pub(crate) fn dial_chained<'a>(
             .await
     })
 }
+
+const NO_DETOUR_UDP: &str = "UDP not supported through a detour";
+
+/// Wraps a capability that has no chained implementation (UDP, shared
+/// sources, warm, raw reachability) so a node carrying a detour is refused
+/// instead of being contacted directly from this host.
+pub(crate) struct DetourGuard<T: ?Sized>(pub(crate) Arc<T>);
+
+#[async_trait]
+impl super::PacketOutbound for DetourGuard<dyn super::PacketOutbound> {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
+        anyhow::ensure!(node.detour.is_none(), NO_DETOUR_UDP);
+        self.0
+            .dial_udp_transport(node, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
+        anyhow::ensure!(runtime.node.detour.is_none(), NO_DETOUR_UDP);
+        self.0
+            .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_runtime_marked(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        mark: DirectMark,
+    ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
+        anyhow::ensure!(runtime.node.detour.is_none(), NO_DETOUR_UDP);
+        self.0
+            .dial_udp_transport_runtime_marked(
+                runtime,
+                target,
+                target_domain,
+                connect_timeout,
+                mark,
+            )
+            .await
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::PreparedUdpTransport> {
+        anyhow::ensure!(runtime.node.detour.is_none(), NO_DETOUR_UDP);
+        self.0
+            .dial_udp_transport_speculative_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+    }
+}
+
+#[async_trait]
+impl super::SharedSourceOutbound for DetourGuard<dyn super::SharedSourceOutbound> {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        speculative: bool,
+    ) -> anyhow::Result<super::PreparedUdpTransport<dyn super::MultiTargetTransport>> {
+        anyhow::ensure!(runtime.node.detour.is_none(), NO_DETOUR_UDP);
+        self.0
+            .prepare_shared_source(runtime, target, target_domain, connect_timeout, speculative)
+            .await
+    }
+}
+
+#[async_trait]
+impl super::WarmableOutbound for DetourGuard<dyn super::WarmableOutbound> {
+    async fn warm(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        connect_timeout: Duration,
+        requirement: super::WarmRequirement,
+    ) -> anyhow::Result<()> {
+        // Chained nodes own no warm state: every dial opens a fresh chain.
+        if runtime.node.detour.is_some() {
+            return Ok(());
+        }
+        self.0.warm(runtime, connect_timeout, requirement).await
+    }
+}
+
+#[async_trait]
+impl super::ProbeableOutbound for DetourGuard<dyn super::ProbeableOutbound> {
+    async fn test_connectivity(&self, node: &Node) -> bool {
+        // A raw reachability check would connect straight to the server;
+        // chained nodes are only judged by dials through their front.
+        if node.detour.is_some() {
+            return false;
+        }
+        self.0.test_connectivity(node).await
+    }
+}
+
+#[cfg(test)]
+#[path = "detour_tests.rs"]
+mod tests;

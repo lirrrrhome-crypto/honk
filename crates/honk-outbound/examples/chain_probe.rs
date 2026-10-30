@@ -56,6 +56,10 @@ async fn main() -> anyhow::Result<()> {
     let generation = Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(
         &config.nodes,
     )?);
+    // As in honk-core: handler-level dials resolve node-named fronts
+    // against the live generation.
+    let cell = Arc::new(parking_lot::RwLock::new(Arc::clone(&generation)));
+    honk_outbound::proxy::detour::install_runtime_registry(&cell);
     let registry = Arc::new(ProxyRegistry::default_resolver()?);
     if args.get(4).map(String::as_str) == Some("--healthcheck") {
         let url = args

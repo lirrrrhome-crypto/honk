@@ -672,6 +672,15 @@ impl AliveDialerSet {
         Arc::clone(&arr[idx])
     }
 
+    /// Test hook: end a node's registration grace window so probe failures
+    /// count immediately.
+    #[cfg(test)]
+    pub(crate) fn expire_grace_for_test(&self, node_id: Uuid) {
+        self.node_registered_at
+            .write()
+            .insert(node_id, Instant::now() - GRACE_PERIOD);
+    }
+
     pub fn register_node(&self, node_id: Uuid, name: String, address: String) {
         let mut registered = self.registered.write();
         registered.insert(node_id, Arc::new(RegisteredNode { name, address }));

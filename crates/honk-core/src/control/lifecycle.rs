@@ -70,6 +70,9 @@ impl HealthUpdates {
             plane.group_manager.clone(),
             plane.alive_set.clone(),
         ));
+        // Handler-level dials of chained nodes resolve node-named fronts
+        // against the live generation.
+        honk_outbound::proxy::detour::install_runtime_registry(&plane.runtime_registry);
         let task_pending = Arc::clone(&pending);
         let task_wake = Arc::clone(&wake);
         let task = tokio::spawn(async move {

@@ -2,7 +2,9 @@
 # End-to-end check of node-level chained dialing (`dialer-proxy`) against two
 # real sing-box servers on loopback: A (socks5) is the front, B (shadowsocks)
 # the landing node. Proves the A -> B -> target hops from the servers' access
-# logs, then stops A and checks the chained dial fails instead of bypassing A.
+# logs, runs the group health-check probe path the same way, then stops A and
+# checks both fail instead of bypassing A, and that the health check recovers
+# once A is back.
 #
 # Usage: ci/chain-e2e.sh [workdir]   (Linux x86_64; needs curl, python3)
 set -euo pipefail
@@ -57,8 +59,22 @@ grep -q 'A-socks.*inbound connection to 127.0.0.3:28388' a.log
 grep -q 'B-ss.*inbound connection to 127.0.0.4:18080' b.log
 echo "PASS: target reached via A -> B"
 
+HEALTH_URL=http://127.0.0.4:18080/index.html
+: > a.log; : > b.log
+"$PROBE" nodes.dae B 127.0.0.4:18080 --healthcheck "$HEALTH_URL" | tee health.out
+grep -q 'healthcheck: Ok' health.out
+grep -q 'A-socks.*inbound connection to 127.0.0.3:28388' a.log
+grep -q 'B-ss.*inbound connection to 127.0.0.4:18080' b.log
+echo "PASS: health check probes B via A"
+
 kill "$a_pid"; wait "$a_pid" 2>/dev/null || true
 : > b.log
+"$PROBE" nodes.dae B 127.0.0.4:18080 --healthcheck "$HEALTH_URL" | tee health.out
+grep -q 'healthcheck: Err' health.out
+if grep -q 'inbound connection' b.log; then
+  echo "FAIL: health check reached the landing node without the front" >&2; exit 1
+fi
+echo "PASS: front down -> health check fails, no bypass"
 if "$PROBE" nodes.dae B 127.0.0.4:18080 /index.html; then
   echo "FAIL: dial succeeded with the front down" >&2; exit 1
 fi
@@ -66,3 +82,11 @@ if grep -q 'inbound connection' b.log; then
   echo "FAIL: landing node reached without the front" >&2; exit 1
 fi
 echo "PASS: front down -> dial fails, no bypass"
+
+./sing-box run -c a.json > a.out 2>&1 & a_pid=$!; pids+=("$a_pid")
+sleep 1
+: > a.log; : > b.log
+"$PROBE" nodes.dae B 127.0.0.4:18080 --healthcheck "$HEALTH_URL" | tee health.out
+grep -q 'healthcheck: Ok' health.out
+grep -q 'A-socks.*inbound connection to 127.0.0.3:28388' a.log
+echo "PASS: front back -> health check recovers via A"
