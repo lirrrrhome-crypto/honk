@@ -133,6 +133,21 @@ pub trait PacketOutbound: Send + Sync {
             .await
             .map(PreparedUdpTransport::ready)
     }
+
+    /// Open a UDP transport framed inside `tcp`, an already-connected stream
+    /// to the node's server (the detour front chain). Only protocols that
+    /// carry UDP over their TCP stream override this; the default refuses so
+    /// a chained node is never contacted directly.
+    async fn dial_udp_transport_with_tcp(
+        &self,
+        node: &Node,
+        _tcp: tokio::net::TcpStream,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        anyhow::bail!(super::detour::chained_udp_refusal(node))
+    }
 }
 
 /// One association carrying every destination of a client source (the core
@@ -149,6 +164,19 @@ pub trait SharedSourceOutbound: Send + Sync {
         connect_timeout: Duration,
         speculative: bool,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>>;
+
+    /// Shared-source counterpart of
+    /// [`PacketOutbound::dial_udp_transport_with_tcp`].
+    async fn prepare_shared_source_with_tcp(
+        &self,
+        node: &Node,
+        _tcp: tokio::net::TcpStream,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        anyhow::bail!(super::detour::chained_udp_refusal(node))
+    }
 }
 
 /// Which property a warm request must establish. Selector ownership needs

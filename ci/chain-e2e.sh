@@ -6,7 +6,9 @@
 # checks both fail instead of bypassing A, and that the health check recovers
 # once A is back. Finally B's front becomes a selector group of A1/A2:
 # the selected member carries each new connection, a switch moves new
-# connections only, and a down selected member fails closed.
+# connections only, and a down selected member fails closed. Last, UDP
+# rides a trojan landing through A and through the group, an ss landing is
+# refused for UDP, and UDP fails closed with A down.
 #
 # Usage: ci/chain-e2e.sh [workdir]   (Linux x86_64; needs curl, python3)
 set -euo pipefail
@@ -146,3 +148,88 @@ if grep -q 'inbound connection' b.log; then
   echo "FAIL: landing node reached without the selected front" >&2; exit 1
 fi
 echo "PASS: selected group front down -> dial fails, no bypass"
+
+# UDP through the chain. T is a trojan landing (UDP framed inside its TCP
+# stream, so the front only has to carry TCP); its front is A, then the
+# selector group. A UDP echo server stands in for DNS/QUIC; the 1350-byte
+# datagram is QUIC Initial sized. B (shadowsocks) needs native UDP to its
+# server, which the front cannot relay, so it must be refused, never direct.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+  -subj /CN=localhost -keyout t.key -out t.crt 2>/dev/null
+cat > t.json <<JSON
+{"log":{"level":"debug","output":"$WORK/t.log"},
+ "inbounds":[{"type":"trojan","tag":"T-trojan","listen":"127.0.0.6","listen_port":24443,
+   "users":[{"password":"chainpw"}],
+   "tls":{"enabled":true,"server_name":"localhost","certificate_path":"$WORK/t.crt","key_path":"$WORK/t.key"}}],
+ "outbounds":[{"type":"direct","tag":"T-direct"}]}
+JSON
+cat > udp_echo.py <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.4", 15353))
+while True:
+    data, peer = s.recvfrom(65535)
+    s.sendto(data, peer)
+PY
+cat > udp.dae <<'DAE'
+node {
+    A1: 'socks5://127.0.0.2:21080'
+    A2: 'socks5://127.0.0.5:21081'
+    T: 'trojan://chainpw@127.0.0.6:24443?sni=localhost&allowInsecure=1&dialer-proxy=A1#T'
+    B: 'ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388?dialer-proxy=A1#B'
+}
+DAE
+cat > udpg.dae <<'DAE'
+node {
+    A1: 'socks5://127.0.0.2:21080'
+    A2: 'socks5://127.0.0.5:21081'
+    TG: 'trojan://chainpw@127.0.0.6:24443?sni=localhost&allowInsecure=1&dialer-proxy=fronts#TG'
+}
+group {
+    fronts {
+        filter: name(A1, A2)
+        policy: selector
+    }
+}
+DAE
+: > t.log
+./sing-box run -c t.json > t.out 2>&1 & t_pid=$!; pids+=("$t_pid")
+python3 udp_echo.py > udp_echo.log 2>&1 & pids+=($!)
+./sing-box run -c a2.json > a2.out 2>&1 & a2_pid=$!; pids+=("$a2_pid")
+sleep 1
+thops() { grep -c "$1.*inbound connection to 127.0.0.6:24443" "$2" || true; }
+udp_seen() { grep -q 'T-trojan.*inbound packet connection to 127.0.0.4:15353' t.log; }
+
+: > a.log; : > t.log
+"$PROBE" udp.dae T 127.0.0.4:15353 --udp 32 1350 | tee udp.out
+[ "$(grep -c 'udp echo: Ok' udp.out)" = 2 ]
+[ "$(thops A-socks a.log)" -ge 1 ] || { echo "FAIL: UDP did not ride A" >&2; exit 1; }
+udp_seen || { echo "FAIL: T did not relay the UDP target" >&2; exit 1; }
+echo "PASS: UDP (32B + 1350B QUIC-sized) reached via A -> T"
+
+for pick in A1 A2; do
+  : > a.log; : > a2.log; : > t.log
+  CHAIN_SELECT=fronts=$pick "$PROBE" udpg.dae TG 127.0.0.4:15353 --udp 64 | tee udp.out
+  grep -q 'udp echo: Ok' udp.out
+  if [ "$pick" = A1 ]; then on=$(thops A-socks a.log); off=$(thops A2-socks a2.log)
+  else on=$(thops A2-socks a2.log); off=$(thops A-socks a.log); fi
+  [ "$on" -ge 1 ] && [ "$off" = 0 ] || { echo "FAIL: UDP select $pick -> on=$on off=$off" >&2; exit 1; }
+  udp_seen
+  echo "PASS: UDP via group front $pick -> T"
+done
+
+: > b.log
+if "$PROBE" udp.dae B 127.0.0.4:15353 --udp 2> udp_ss.err; then
+  echo "FAIL: native-UDP landing B accepted UDP through a front" >&2; exit 1
+fi
+grep -q 'native UDP' udp_ss.err || { cat udp_ss.err >&2; echo "FAIL: unclear refusal" >&2; exit 1; }
+if grep -q 'packet' b.log; then echo "FAIL: B got UDP directly" >&2; exit 1; fi
+echo "PASS: ss landing UDP through a front -> clear refusal, nothing sent"
+
+kill "$a_pid"; wait "$a_pid" 2>/dev/null || true
+: > t.log
+if "$PROBE" udp.dae T 127.0.0.4:15353 --udp; then
+  echo "FAIL: UDP succeeded with the front down" >&2; exit 1
+fi
+if grep -q 'inbound' t.log; then echo "FAIL: T reached without the front" >&2; exit 1; fi
+echo "PASS: front down -> UDP fails, no bypass"

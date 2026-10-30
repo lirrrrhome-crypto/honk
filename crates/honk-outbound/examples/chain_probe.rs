@@ -6,6 +6,8 @@
 //!        (forward every accepted local TCP connection to host:port through the node)
 //!        chain_probe <nodes.dae> <node-name> <ip:port> --healthcheck <url>
 //!        (run the group health-check HTTP probe path against the node)
+//!        chain_probe <nodes.dae> <node-name> <ip:port> --udp [size...]
+//!        (UDP echo through the node: one datagram per size, default 32)
 //!        chain_probe <nodes.dae> <node-name> <host:port> --switch <group> <first> <second> [path]
 //!        (open one connection with selector <group> on <first>, switch to
 //!        <second>, open another, then fetch <path> over both)
@@ -86,6 +88,37 @@ async fn main() -> anyhow::Result<()> {
         select(group, member)?;
     }
     let registry = Arc::new(ProxyRegistry::default_resolver()?);
+    if args.get(4).map(String::as_str) == Some("--udp") {
+        // UDP through the node (and its front chain): send one datagram per
+        // payload size and expect each echoed back.
+        let mut sizes: Vec<usize> = args[5..]
+            .iter()
+            .map(|size| size.parse())
+            .collect::<Result<_, _>>()?;
+        if sizes.is_empty() {
+            sizes.push(32);
+        }
+        let transport = registry
+            .dial_udp_transport_runtime(
+                Arc::clone(&generation),
+                node.id,
+                target,
+                domain.as_deref(),
+                Duration::from_secs(10),
+            )
+            .await?;
+        for size in sizes {
+            let payload: Vec<u8> = (0..size).map(|i| b'a' + (i % 26) as u8).collect();
+            transport.send_packet(&payload).await?;
+            let mut buf = vec![0u8; 65_535];
+            let (n, peer) =
+                tokio::time::timeout(Duration::from_secs(10), transport.recv_packet(&mut buf))
+                    .await??;
+            anyhow::ensure!(buf[..n] == payload[..], "udp echo mismatch ({n} bytes)");
+            println!("udp echo: Ok {n} bytes from {peer}");
+        }
+        return Ok(());
+    }
     if args.get(4).map(String::as_str) == Some("--switch") {
         let [group, first, second] = [5, 6, 7].map(|i| args.get(i).cloned().unwrap_or_default());
         let path = args.get(8).map(String::as_str).unwrap_or("/");

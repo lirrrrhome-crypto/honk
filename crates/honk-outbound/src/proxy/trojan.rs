@@ -106,7 +106,7 @@ impl TrojanHandler {
         timeout: std::time::Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
         let (transport, preparation) =
-            Self::open_udp_stream(node, runtime, target, domain, timeout).await?;
+            Self::open_udp_stream(node, runtime, None, target, domain, timeout).await?;
         Ok(Self::commit_udp_stream(
             transport as Arc<dyn PacketTransport>,
             preparation,
@@ -123,7 +123,8 @@ impl TrojanHandler {
         timeout: std::time::Duration,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
         let (transport, preparation) =
-            Self::open_udp_stream(&runtime.node, Some(runtime), target, domain, timeout).await?;
+            Self::open_udp_stream(&runtime.node, Some(runtime), None, target, domain, timeout)
+                .await?;
         Ok(Self::commit_udp_stream(
             transport as Arc<dyn MultiTargetTransport>,
             preparation,
@@ -133,6 +134,7 @@ impl TrojanHandler {
     async fn open_udp_stream(
         node: &Node,
         runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
+        tcp: Option<TcpStream>,
         target: SocketAddr,
         domain: Option<&str>,
         timeout: std::time::Duration,
@@ -140,13 +142,13 @@ impl TrojanHandler {
         Arc<TrojanUdpTransport>,
         super::transport::TransportPreparation,
     )> {
-        if !crate::descriptor::network_allows_udp(node) {
+        if tcp.is_none() && !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!(
                 "Trojan UDP: node network {:?} does not include \"udp\"",
                 node.network()
             );
         }
-        let (control, preparation) = Self::prepare_transport(node, runtime, None, timeout).await?;
+        let (control, preparation) = Self::prepare_transport(node, runtime, tcp, timeout).await?;
         let transport = Self::finish_udp_stream(node, target, domain, control).await?;
         Ok((transport, preparation))
     }
@@ -252,6 +254,29 @@ impl SharedSourceOutbound for TrojanHandler {
         let _ = speculative;
         Self::prepare_udp_source(&runtime, target, target_domain, connect_timeout).await
     }
+
+    async fn prepare_shared_source_with_tcp(
+        &self,
+        node: &Node,
+        tcp: TcpStream,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        let (transport, preparation) = Self::open_udp_stream(
+            node,
+            None,
+            Some(tcp),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await?;
+        Ok(Self::commit_udp_stream(
+            transport as Arc<dyn MultiTargetTransport>,
+            preparation,
+        ))
+    }
 }
 
 #[async_trait]
@@ -281,6 +306,28 @@ impl PacketOutbound for TrojanHandler {
             connect_timeout,
         )
         .await
+    }
+
+    async fn dial_udp_transport_with_tcp(
+        &self,
+        node: &Node,
+        tcp: TcpStream,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let (transport, preparation) = Self::open_udp_stream(
+            node,
+            None,
+            Some(tcp),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await?;
+        Self::commit_udp_stream(transport as Arc<dyn PacketTransport>, preparation)
+            .commit()
+            .await
     }
 
     async fn dial_udp_transport_speculative_runtime(
@@ -317,7 +364,7 @@ impl WarmableOutbound for TrojanHandler {
 impl ProbeableOutbound for TrojanHandler {}
 
 /// Compute the lowercase hex encoding of SHA224(password).
-fn hex_sha224(password: &str) -> String {
+pub(crate) fn hex_sha224(password: &str) -> String {
     let hash = Sha224::digest(password.as_bytes());
     let mut out = String::with_capacity(hash.len() * 2);
     for byte in hash {

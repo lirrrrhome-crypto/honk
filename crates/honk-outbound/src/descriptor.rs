@@ -30,12 +30,30 @@ impl ProtocolDescriptor {
 /// paths: no `network` restriction means UDP is allowed; otherwise the list
 /// must contain "udp".
 pub(crate) fn network_allows_udp(node: &Node) -> bool {
-    unchained(node)
-        && node.network().is_none_or(|network| {
-            network
-                .split(',')
-                .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
-        })
+    unchained(node) && network_lists_udp(node)
+}
+
+fn network_lists_udp(node: &Node) -> bool {
+    node.network().is_none_or(|network| {
+        network
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
+    })
+}
+
+/// Whether a node carrying a detour can carry UDP: only landings that frame
+/// UDP inside their own TCP stream (Trojan UDP over TLS/TCP) ride the front's
+/// TCP chain. Native-UDP landings (Shadowsocks, SOCKS5 UDP ASSOCIATE) would
+/// need a UDP relay from the front and are refused, never sent directly.
+pub fn chained_udp_supported(node: &Node) -> bool {
+    node.detour.is_some()
+        && node.supports_detour()
+        && node.protocol() == NodeProtocol::Trojan
+        && network_lists_udp(node)
+}
+
+fn trojan_supports_udp(node: &Node) -> bool {
+    network_allows_udp(node) || chained_udp_supported(node)
 }
 
 fn never(_: &Node) -> bool {
@@ -124,7 +142,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Trojan,
-        supports_udp: network_allows_udp,
+        supports_udp: trojan_supports_udp,
         pool_ready_streams: trojan_pool_ready_streams,
         pool_bare_tcp: stream_pool_bare_tcp,
         supports_warm: stream_supports_warm,

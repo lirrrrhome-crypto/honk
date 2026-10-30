@@ -215,22 +215,19 @@ impl ProxyRegistry {
             table: Arc::clone(&self.tcp_table),
         });
         use super::detour::DetourGuard;
-        entry.packet = entry
-            .packet
-            .take()
-            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn PacketOutbound>);
-        entry.shared = entry
-            .shared
-            .take()
-            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn SharedSourceOutbound>);
-        entry.warmable = entry
-            .warmable
-            .take()
-            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn WarmableOutbound>);
-        entry.probeable = entry
-            .probeable
-            .take()
-            .map(|inner| Arc::new(DetourGuard(inner)) as Arc<dyn ProbeableOutbound>);
+        entry.packet = entry.packet.take().map(|inner| {
+            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table))) as Arc<dyn PacketOutbound>
+        });
+        entry.shared = entry.shared.take().map(|inner| {
+            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table)))
+                as Arc<dyn SharedSourceOutbound>
+        });
+        entry.warmable = entry.warmable.take().map(|inner| {
+            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table))) as Arc<dyn WarmableOutbound>
+        });
+        entry.probeable = entry.probeable.take().map(|inner| {
+            Arc::new(DetourGuard(inner, Arc::clone(&self.tcp_table))) as Arc<dyn ProbeableOutbound>
+        });
         self.entries.push(entry);
     }
 
@@ -464,6 +461,9 @@ impl ProxyRegistry {
         {
             return Err(PacketRejection::Policy.into());
         }
+        if node.detour.is_some() && !crate::descriptor::chained_udp_supported(node) {
+            anyhow::bail!(super::detour::chained_udp_refusal(node));
+        }
         if protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
@@ -610,11 +610,9 @@ impl ProxyRegistry {
         target_port: u16,
     ) -> anyhow::Result<&'a Arc<dyn PacketOutbound>> {
         let protocol = runtime.node.protocol();
-        if runtime.node.detour.is_some() {
-            anyhow::bail!(
-                "UDP not supported through a detour (node {:?})",
-                runtime.node.name
-            );
+        if runtime.node.detour.is_some() && !crate::descriptor::chained_udp_supported(&runtime.node)
+        {
+            anyhow::bail!(super::detour::chained_udp_refusal(&runtime.node));
         }
         if protocol != NodeProtocol::Block
             && !crate::descriptor::udp_target_allowed(&runtime.node, target_port)
