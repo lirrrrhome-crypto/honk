@@ -705,7 +705,7 @@ Supported chained (landing) protocols: `socks5`, `shadowsocks`, `trojan`, `vmess
 
 Limitations (MVP):
 
-- TCP only. A detour node never relays UDP (its UDP flows are refused rather than leaking around the front), and Hysteria2/TUIC/Juicity (QUIC) and AnyTLS cannot be chained.
+- UDP through a front is supported for `trojan` landings (UDP-over-TCP inside the chained stream) and for `shadowsocks`/`socks5` landings (native UDP: their datagrams to the landing server ride the front's own UDP path, i.e. SOCKS5 UDP ASSOCIATE, Shadowsocks UDP, Trojan UDP-over-TCP, or a chained/group front recursively). VMess/VLESS landings and fronts without a UDP path (e.g. VLESS) refuse UDP with a clear error; UDP is never sent around the front. Hysteria2/TUIC/Juicity (QUIC) and AnyTLS cannot be chained (they may still be the front).
 - Detour nodes skip connection pooling, preconnect and warm sessions; each flow dials its front fresh. The front stream is bridged to the landing handler through a private loopback socket, costing one local copy.
 - Health probes and latency tests of the landing node still connect directly, so group selection reflects the direct path.
 - The REALITY mask-certificate retry is not available through a detour.

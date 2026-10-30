@@ -702,7 +702,7 @@ group {
 
 限制（MVP）：
 
-- 仅 TCP。带 detour 的节点不转发 UDP（UDP 流会被拒绝，而不是绕过前置泄漏），Hysteria2/TUIC/Juicity（QUIC）与 AnyTLS 不能被链。
+- 经前置转发 UDP 支持 `trojan` 落地（在链式流内做 UDP-over-TCP）以及 `shadowsocks`/`socks5` 落地（原生 UDP：发往落地服务器的数据报走前置自身的 UDP 通道，即 SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP，或递归经过链式/分组前置）。VMess/VLESS 落地以及没有 UDP 通道的前置（如 VLESS）会以明确错误拒绝 UDP；UDP 绝不会绕过前置发出。Hysteria2/TUIC/Juicity（QUIC）与 AnyTLS 不能被链（但可以作为前置）。
 - detour 节点不使用连接池、预连接与 warm 会话，每条流都会重新拨前置。前置流通过私有回环 socket 交给落地处理器，多一次本地拷贝。
 - 落地节点的健康探测与延迟测试仍为直连，分组选择反映的是直连路径。
 - 经 detour 时不支持 REALITY 伪装证书重试。
