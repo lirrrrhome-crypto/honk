@@ -134,3 +134,137 @@ fn documented_example_validates() {
     let land2 = config.nodes.iter().find(|n| n.name == "land2").unwrap();
     assert_eq!(land2.detour.as_deref(), Some("fronts"));
 }
+
+#[test]
+fn empty_detour_value_means_no_detour() {
+    for query in ["dialer-proxy=", "detour=%20", "detour"] {
+        let config = parse(&format!("land: 'socks5://1.2.3.4:1080?{query}'"), "");
+        assert_eq!(config.nodes[0].detour, None, "{query}");
+        assert_eq!(code(&config), None, "{query}");
+    }
+}
+
+#[test]
+fn both_detour_keys_must_agree() {
+    let same = parse(
+        "a: 'socks5://1.1.1.1:1080'\n land: 'socks5://1.2.3.4:1080?detour=a&dialer-proxy=a'",
+        "",
+    );
+    let land = same.nodes.iter().find(|n| n.name == "land").unwrap();
+    assert_eq!(land.detour.as_deref(), Some("a"));
+    // A conflicting pair used to silently keep the last value.
+    let nodes = "a: 'socks5://1.1.1.1:1080'\n b: 'socks5://2.2.2.2:1080'\n land: 'socks5://1.2.3.4:1080?detour=a&dialer-proxy=b'";
+    let error = parse_dae_config_with_detailed_diagnostics(
+        &format!("node {{\n{nodes}\n}}\n"),
+        &mut Vec::new(),
+    );
+    match error {
+        Err(error) => assert_eq!(error.diagnostic.code, "invalid-detour"),
+        Ok(config) => {
+            let land = config.nodes.iter().find(|n| n.name == "land");
+            assert!(land.is_none(), "conflicting detours must not yield a node");
+        }
+    }
+}
+
+fn chain(len: usize) -> String {
+    // n0 is the outermost front; n{i} detours through n{i-1}.
+    let mut nodes = String::from("n0: 'socks5://10.0.0.1:1080'\n");
+    for i in 1..=len {
+        nodes.push_str(&format!(
+            "n{i}: 'socks5://10.0.0.{}:1080?detour=n{}'\n",
+            i + 1,
+            i - 1
+        ));
+    }
+    nodes
+}
+
+#[test]
+fn chain_depth_is_bounded_at_validation() {
+    assert_eq!(code(&parse(&chain(8), "")), None);
+    assert_eq!(code(&parse(&chain(9), "")), Some("detour-chain-too-deep"));
+    // A group hop costs nothing but its members' chains count.
+    let mut nodes = chain(8);
+    nodes.push_str("top: 'socks5://9.9.9.9:1080?detour=g'\n");
+    assert_eq!(
+        code(&parse(
+            &nodes,
+            "g {\n filter: name(n8)\n policy: fixed(0)\n}"
+        )),
+        Some("detour-chain-too-deep")
+    );
+}
+
+#[test]
+fn special_characters_in_detour_names() {
+    for (name, encoded) in [
+        ("a&b", "a%26b"),
+        ("a#b", "a%23b"),
+        ("a?b=c", "a%3Fb%3Dc"),
+        ("前置", "%E5%89%8D%E7%BD%AE"),
+    ] {
+        let config = parse(
+            &format!(
+                "'{name}': 'socks5://10.0.0.1:1080'\n land: 'socks5://1.2.3.4:1080?detour={encoded}#land'"
+            ),
+            "",
+        );
+        let land = config.nodes.iter().find(|n| n.name == "land").unwrap();
+        assert_eq!(land.detour.as_deref(), Some(name));
+        assert_eq!(code(&config), None, "{name}");
+    }
+}
+
+/// Dependency-free fuzz: random share-link-ish strings must never panic the
+/// parser or validator, and a parsed node never keeps a detour key upstream.
+#[test]
+fn fuzz_share_links_do_not_panic() {
+    const PIECES: &[&str] = &[
+        "socks5://",
+        "ss://YWVzLTEyOC1nY206cHc@",
+        "trojan://pw@",
+        "vless://",
+        "1.2.3.4",
+        ":1080",
+        "?",
+        "&",
+        "#",
+        "=",
+        "detour",
+        "dialer-proxy",
+        "dialer_proxy",
+        "%",
+        "%2",
+        "%ZZ",
+        "%E5",
+        "->",
+        "a",
+        "land",
+        "前",
+        " ",
+        "sni=x",
+        "type=ws",
+        "\\",
+        "@",
+        "[::1]",
+    ];
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let len = (next() % 12) as usize;
+        let link: String = (0..len)
+            .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+            .collect();
+        let link = link.replace('\'', "");
+        let text = format!("node {{\n a: 'socks5://9.9.9.9:1080'\n land: '{link}'\n}}\n");
+        if let Ok(config) = parse_dae_config_with_detailed_diagnostics(&text, &mut Vec::new()) {
+            let _ = config.validate_detailed();
+        }
+    }
+}

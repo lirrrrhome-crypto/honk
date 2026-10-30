@@ -737,8 +737,8 @@ impl ControlPlaneHandle {
                     .await
                     .map(|stream| (stream, true))
             } else {
-                entry
-                    .tcp
+                // Through the registry so a node `detour` is still honoured.
+                registry
                     .dial(node, target, target_domain, connect_timeout)
                     .await
                     .map(|stream| (stream, true))

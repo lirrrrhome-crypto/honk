@@ -715,3 +715,38 @@ async fn detour_dials_the_landing_node_through_its_front() {
         "{error}"
     );
 }
+
+/// UDP through a chained node is refused on every entry point instead of
+/// leaving the landing server directly (which would bypass the front).
+#[tokio::test]
+async fn detour_node_refuses_udp_on_every_path() {
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        "node {\n front: 'socks5://127.0.0.1:9'\n land: 'ss://YWVzLTEyOC1nY206cHc@127.0.0.1:9?dialer-proxy=front'\n}\n",
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let land = config.nodes.iter().find(|n| n.name == "land").unwrap();
+    let generation =
+        Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let target: SocketAddr = "1.1.1.1:53".parse().unwrap();
+    let timeout = Duration::from_millis(200);
+    let legacy = registry
+        .dial_udp_transport(land, target, None, timeout)
+        .await
+        .map(|_| ())
+        .expect_err("node-based UDP dial must fail");
+    assert!(legacy.to_string().contains("UDP not supported"), "{legacy}");
+    let runtime = registry
+        .dial_udp_transport_runtime(Arc::clone(&generation), land.id, target, None, timeout)
+        .await
+        .map(|_| ())
+        .expect_err("runtime UDP dial must fail");
+    assert!(runtime.to_string().contains("detour"), "{runtime}");
+    let warm = registry.warm_udp(generation, land.id, timeout).await;
+    assert!(
+        !matches!(warm, Ok(WarmOutcome::Ready)),
+        "a chained node must not warm a direct UDP session"
+    );
+}

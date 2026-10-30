@@ -54,6 +54,9 @@ use crate::types::NodeProtocol;
 pub const NODE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x3d8f2e1a_9b4c_4d57_8f3a_2c6e1d0b9a7f);
 
+/// Longest accepted chain of `detour` hops (node → front edges).
+pub const MAX_DETOUR_HOPS: usize = 8;
+
 /// A proxy node definition. Protocol-specific state lives in [`OutboundConfig`];
 /// the outer node carries only identity, endpoint, and provenance shared by all
 /// outbounds.

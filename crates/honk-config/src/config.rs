@@ -1030,6 +1030,38 @@ impl Config {
                 }
             }
         }
+        // The graph is acyclic now: bound the longest detour chain so a
+        // config the dialer would refuse at runtime fails validation instead.
+        // Group edges cost nothing; each node → front edge is one hop.
+        fn hops(
+            vertex: Vertex,
+            edges: &dyn Fn(Vertex) -> Vec<Vertex>,
+            memo: &mut HashMap<Vertex, usize>,
+        ) -> usize {
+            if let Some(&known) = memo.get(&vertex) {
+                return known;
+            }
+            let cost = usize::from(matches!(vertex, Vertex::Node(_)));
+            let longest = edges(vertex)
+                .into_iter()
+                .map(|child| cost + hops(child, edges, memo))
+                .max()
+                .unwrap_or(0);
+            memo.insert(vertex, longest);
+            longest
+        }
+        let mut memo = HashMap::new();
+        for (index, target) in front.iter().enumerate() {
+            if target.is_some()
+                && hops(Vertex::Node(index), &edges, &mut memo) > crate::node::MAX_DETOUR_HOPS
+            {
+                return Err(error(
+                    index,
+                    "detour-chain-too-deep",
+                    "detour chain is longer than 8 hops",
+                ));
+            }
+        }
         Ok(())
     }
 

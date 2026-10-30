@@ -30,7 +30,7 @@ use crate::group::SharedGroupManager;
 use crate::runtime::OutboundRuntimeRegistry;
 
 /// Longest accepted front chain; deeper chains are treated as a cycle.
-pub const MAX_DETOUR_DEPTH: usize = 8;
+pub const MAX_DETOUR_DEPTH: usize = honk_config::node::MAX_DETOUR_HOPS;
 
 static GROUP_MANAGER: OnceLock<parking_lot::RwLock<Option<SharedGroupManager>>> = OnceLock::new();
 

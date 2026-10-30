@@ -83,7 +83,15 @@ impl Node {
     ) -> Result<Node, crate::error::DetailedConfigError> {
         // Chained-dial front hop: `dialer-proxy=` / `detour=` query parameter.
         // Stripped before protocol decoding so no handler sees it.
-        let (stripped, detour) = take_detour_param(link);
+        let (stripped, detour) = take_detour_param(link).map_err(|message| {
+            DetailedConfigError::new(
+                ErrorCategory::Validation,
+                "invalid-detour",
+                source.clone(),
+                SettingPath::new("nodes").field("detour"),
+                message,
+            )
+        })?;
         let link = stripped.as_ref();
         // A node entry that parses only ever warns with `legacy-*` codes, so native
         // clients read any other warning on the entry as the entry being dropped.
@@ -748,13 +756,15 @@ const DETOUR_PARAMS: [&str; 3] = ["dialer-proxy", "dialer_proxy", "detour"];
 /// Remove every `dialer-proxy=` / `detour=` query parameter from the first
 /// hop of `link`, returning the remaining link and the last non-empty
 /// (percent-decoded) value. Links without such a parameter are borrowed as-is.
-pub(crate) fn take_detour_param(link: &str) -> (Cow<'_, str>, Option<String>) {
+pub(crate) fn take_detour_param(
+    link: &str,
+) -> Result<(Cow<'_, str>, Option<String>), &'static str> {
     let hop_end = link.find("->").unwrap_or(link.len());
     let (hop, rest) = link.split_at(hop_end);
     let fragment_start = hop.find('#').unwrap_or(hop.len());
     let (body, fragment) = hop.split_at(fragment_start);
     let Some((base, query)) = body.split_once('?') else {
-        return (Cow::Borrowed(link), None);
+        return Ok((Cow::Borrowed(link), None));
     };
     let mut detour = None;
     let mut kept = Vec::new();
@@ -769,6 +779,9 @@ pub(crate) fn take_detour_param(link: &str) -> (Cow<'_, str>, Option<String>) {
             let value = percent_decode_str(value);
             let value = value.trim();
             if !value.is_empty() {
+                if detour.as_deref().is_some_and(|previous| previous != value) {
+                    return Err("conflicting detour / dialer-proxy values in one share link");
+                }
                 detour = Some(value.to_string());
             }
         } else {
@@ -776,7 +789,7 @@ pub(crate) fn take_detour_param(link: &str) -> (Cow<'_, str>, Option<String>) {
         }
     }
     if !found {
-        return (Cow::Borrowed(link), None);
+        return Ok((Cow::Borrowed(link), None));
     }
     let mut out = String::with_capacity(link.len());
     out.push_str(base);
@@ -786,5 +799,5 @@ pub(crate) fn take_detour_param(link: &str) -> (Cow<'_, str>, Option<String>) {
     }
     out.push_str(fragment);
     out.push_str(rest);
-    (Cow::Owned(out), detour)
+    Ok((Cow::Owned(out), detour))
 }
