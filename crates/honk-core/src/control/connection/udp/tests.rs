@@ -161,3 +161,39 @@ fn quic_sources_keep_their_concrete_paths() {
         Some(SourcePath::Tuic)
     );
 }
+
+#[test]
+fn chained_nodes_never_take_a_concrete_source_path() {
+    let registry = production();
+    for protocol in [NodeProtocol::Hysteria2, NodeProtocol::Tuic] {
+        let mut chained = node(protocol);
+        chained.detour = Some("front".into());
+        assert_eq!(source_path(&registry, &chained, 443), None, "{protocol:?}");
+    }
+    for protocol in [NodeProtocol::SS, NodeProtocol::Trojan, NodeProtocol::Socks5] {
+        let mut chained = node(protocol);
+        chained.detour = Some("front".into());
+        assert_eq!(
+            source_path(&registry, &chained, 443),
+            Some(SourcePath::Shared),
+            "{protocol:?}: the shared slot is detour-guarded"
+        );
+    }
+}
+
+#[cfg(feature = "rprx")]
+#[test]
+fn chained_vless_xudp_leaves_the_concrete_source_path() {
+    use honk_config::node::{VlessConfig, VlessUdpEncoding};
+    let mut chained = Node {
+        outbound: OutboundConfig::Vless(VlessConfig {
+            udp_encoding: VlessUdpEncoding::Xudp,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let registry = production();
+    assert!(source_path(&registry, &chained, 5301).is_some());
+    chained.detour = Some("front".into());
+    assert_eq!(source_path(&registry, &chained, 5301), None);
+}

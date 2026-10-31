@@ -9,7 +9,8 @@
 # connections only, and a down selected member fails closed. Last, UDP
 # rides a trojan landing through A and through the group; ss/socks5
 # landings carry native UDP over socks5, ss, trojan, nested and group fronts,
-# a vless front is refused for UDP, and UDP fails closed with A down.
+# a vless front is refused for UDP, and UDP fails closed with A down
+# (also for hysteria2, tuic and VLESS XUDP landings).
 # Finally the same chain is imported from sing-box JSON (`detour`) and Clash
 # YAML (`dialer-proxy`, via a group), and written with dae bare-name hops.
 #
@@ -617,4 +618,17 @@ for pick in A1 A2; do
   if [ $pick = A1 ]; then grep -q 'A-socks.*127.0.0.8' a.log; ! grep -q 127.0.0.8 a2.log
   else grep -q 'A2-socks.*127.0.0.8' a2.log; ! grep -q 127.0.0.8 a.log; fi
   echo "PASS: vless landing UDP via group front $pick"
+done
+
+# Front down: chained UDP to QUIC (hysteria2, tuic) and VLESS XUDP landings
+# fails closed: the dial errors and the landing server sees nothing, so a
+# landing never gets its UDP sent straight from this host.
+nudp ua "A1: 'socks5://127.0.0.2:21080'" "U: '$TU&dialer-proxy=A1#U'"
+kill "$a_pid"; wait "$a_pid" 2>/dev/null || true
+for c in "qa Q q.log hysteria2" "ua U q.log tuic" "vl_xudp VL v.log vless-xudp"; do
+  set -- $c; qclr
+  if "$PROBE" "$1.dae" "$2" $E --udp 64 > down.out 2>&1 && grep -q 'udp echo: Ok' down.out; then
+    echo "FAIL: $4 UDP succeeded with the front down" >&2; exit 1; fi
+  if grep -q 'inbound' "$3"; then echo "FAIL: $4 landing reached without the front" >&2; exit 1; fi
+  echo "PASS: front down -> $4 landing UDP fails closed"
 done

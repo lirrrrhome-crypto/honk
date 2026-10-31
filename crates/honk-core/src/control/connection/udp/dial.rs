@@ -19,7 +19,20 @@ pub(super) enum PreparedEndpointTransport {
 
 /// The registry decides which protocols share one association per source: a
 /// protocol joins by registering a shared-source slot, not by a core list.
+///
+/// A chained node (one with a detour) only keeps the registry's shared path,
+/// which is detour-guarded; the concrete QUIC and VLESS source paths dial the
+/// server straight from this host and would bypass the front, so a chained
+/// node takes the ordinary (guarded) path instead.
 pub(super) fn source_path(registry: &ProxyRegistry, node: &Node, port: u16) -> Option<SourcePath> {
+    let path = unchained_source_path(registry, node, port);
+    if node.detour.is_some() {
+        return path.filter(|path| *path == SourcePath::Shared);
+    }
+    path
+}
+
+fn unchained_source_path(registry: &ProxyRegistry, node: &Node, port: u16) -> Option<SourcePath> {
     let protocol = node.protocol();
     let shared = || {
         registry
