@@ -164,6 +164,39 @@ if grep -q 'inbound connection' b.log; then
 fi
 echo "PASS: all group fronts down -> dial fails, no bypass"
 
+# Group-to-group chain: the landing is a selector group whose members detour
+# through an outer group that nests the front group; the selected front A2 is
+# down, so the dial fails over to A1 inside the nested group.
+cat > g2g.dae <<'DAE'
+node {
+    A1: 'socks5://127.0.0.2:21080'
+    A2: 'socks5://127.0.0.5:21081'
+    B1: 'ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388?dialer-proxy=outer#B1'
+    B2: 'ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28399?dialer-proxy=outer#B2'
+}
+group {
+    fronts {
+        filter: name(A2, A1)
+        policy: selector
+    }
+    outer {
+        filter: group(fronts)
+        policy: selector
+    }
+    lands {
+        filter: name(B1, B2)
+        policy: selector
+    }
+}
+DAE
+: > a.log; : > b.log
+CHAIN_SELECT=fronts=A2,lands=B1 "$PROBE" g2g.dae lands 127.0.0.4:18080 /index.html | tee probe.out
+grep -q 'landing group lands selected' probe.out
+grep -q hello-through-chain probe.out
+[ "$(hops A-socks a.log)" = 1 ] \
+  || { echo "FAIL: group-to-group hops A1=$(hops A-socks a.log)" >&2; exit 1; }
+echo "PASS: landing group -> nested front group chain (failover to A1)"
+
 # UDP through the chain. T is a trojan landing (UDP framed inside its TCP
 # stream, so the front only has to carry TCP); its front is A, then the
 # selector group. A UDP echo server stands in for DNS/QUIC; the 1350-byte

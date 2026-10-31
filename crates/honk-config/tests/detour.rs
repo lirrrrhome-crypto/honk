@@ -325,3 +325,19 @@ fn cycles_through_nested_groups_and_final_are_rejected() {
         None
     );
 }
+
+#[test]
+fn group_to_group_chains_validate_and_cycles_through_them_are_rejected() {
+    let nodes = "a1: 'socks5://10.0.0.1:1080'\n a2: 'socks5://10.0.0.2:1080'\n b1: 'socks5://10.0.0.3:1080?dialer-proxy=outer'\n b2: 'socks5://10.0.0.4:1080?dialer-proxy=outer'";
+    let ok = parse(
+        nodes,
+        "fronts {\n filter: name(a1, a2)\n policy: selector\n}\nouter {\n filter: group(fronts)\n policy: selector\n}\nlands {\n filter: name(b1, b2)\n policy: selector\n}",
+    );
+    assert_eq!(code(&ok), None);
+    // The front group nests the landing group: b1 -> outer -> lands -> b1.
+    let cyclic = parse(
+        nodes,
+        "lands {\n filter: name(b1, b2)\n policy: selector\n}\nouter {\n filter: group(lands)\n policy: selector\n}",
+    );
+    assert_eq!(code(&cyclic), Some("detour-cycle"));
+}

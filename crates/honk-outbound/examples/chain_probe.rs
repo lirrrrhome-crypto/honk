@@ -55,17 +55,6 @@ async fn main() -> anyhow::Result<()> {
     config.validate_detailed().map_err(|e| {
         anyhow::anyhow!("validation: {} {}", e.diagnostic.code, e.diagnostic.setting)
     })?;
-    let node = config
-        .nodes
-        .iter()
-        .find(|n| n.name == args[2])
-        .ok_or_else(|| anyhow::anyhow!("no node {}", args[2]))?;
-    println!(
-        "node {} protocol={} detour={:?}",
-        node.name,
-        node.protocol().as_str(),
-        node.detour
-    );
     let (host, port) = args[3]
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("host:port"))?;
@@ -99,12 +88,33 @@ async fn main() -> anyhow::Result<()> {
         println!("selected {group}={member}");
         Ok(())
     };
-    if let Ok(choice) = std::env::var("CHAIN_SELECT") {
-        let (group, member) = choice
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("CHAIN_SELECT=<group>=<member>"))?;
-        select(group, member)?;
+    if let Ok(choices) = std::env::var("CHAIN_SELECT") {
+        for choice in choices.split(',') {
+            let (group, member) = choice
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("CHAIN_SELECT=<group>=<member>[,...]"))?;
+            select(group, member)?;
+        }
     }
+    // The landing is a node name, or a group name standing for the group's
+    // current selection (a landing group whose members chain through fronts).
+    let node = match config.nodes.iter().find(|n| n.name == args[2]) {
+        Some(node) => node,
+        None => {
+            let id = manager
+                .select_node(&args[2])
+                .ok_or_else(|| anyhow::anyhow!("no node or group selection {}", args[2]))?
+                .id;
+            println!("landing group {} selected", args[2]);
+            config.nodes.iter().find(|n| n.id == id).ok_or_else(|| anyhow::anyhow!("no node {id}"))?
+        }
+    };
+    println!(
+        "node {} protocol={} detour={:?}",
+        node.name,
+        node.protocol().as_str(),
+        node.detour
+    );
     let registry = Arc::new(ProxyRegistry::default_resolver()?);
     if args.get(4).map(String::as_str) == Some("--udp") {
         // UDP through the node (and its front chain): send one datagram per
