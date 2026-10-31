@@ -7,6 +7,7 @@ pub mod anytls;
 pub mod block;
 pub mod datagram_pipe;
 pub mod direct;
+pub mod http;
 pub mod hysteria2;
 pub mod juicity;
 pub mod shadowsocks;

@@ -411,3 +411,68 @@ UB -> UA
 TXT
 "$IMPORT" auto sub-names.txt > sub-names.nodes.json
 imported "subscription bare-name lines (UC -> UB -> UA)" "$PROBE" sub-names.nodes.json UC
+# HTTP CONNECT outbound: H (plain http, basic auth) and HS (https over TLS).
+# As a front it carries a landing's TCP; as a landing it rides a front. It
+# has no UDP path, so UDP through it must be refused, never sent direct.
+cat > h.json <<JSON
+{"log":{"level":"debug","output":"$WORK/h.log"},
+ "inbounds":[
+  {"type":"http","tag":"H-http","listen":"127.0.0.9","listen_port":28080,"users":[{"username":"hu","password":"hp"}]},
+  {"type":"http","tag":"HS-https","listen":"127.0.0.10","listen_port":28443,
+   "tls":{"enabled":true,"server_name":"localhost","certificate_path":"$WORK/t.crt","key_path":"$WORK/t.key"}}],
+ "outbounds":[{"type":"direct","tag":"H-direct"}]}
+JSON
+: > h.log
+./sing-box run -c h.json > h.out 2>&1 & pids+=($!)
+sleep 1
+SSU='ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388'
+nudp hb "H: 'http://hu:hp@127.0.0.9:28080'" "B: '$SSU?dialer-proxy=H#B'"
+nudp ah "A: 'socks5://127.0.0.2:21080'" "HS: 'https://127.0.0.10:28443?sni=localhost&allowInsecure=1&dialer-proxy=A#HS'"
+nudp hsh "HS: 'https://127.0.0.10:28443?sni=localhost&allowInsecure=1#HS'" "H: 'http://hu:hp@127.0.0.9:28080?dialer-proxy=HS#H'"
+nudp hbad "H: 'http://hu:wrong@127.0.0.9:28080'" "B: '$SSU?dialer-proxy=H#B'"
+: > a.log; : > b.log; : > h.log
+"$PROBE" hb.dae B 127.0.0.4:18080 /index.html | tee probe.out; grep -q hello-through-chain probe.out
+grep -q 'H-http.*inbound connection to 127.0.0.3:28388' h.log && grep -q 'B-ss.*inbound connection to 127.0.0.4:18080' b.log \
+  || { echo "FAIL: http front" >&2; exit 1; }
+echo "PASS: ss landing via http front H (basic auth)"
+: > a.log; : > h.log
+"$PROBE" ah.dae HS 127.0.0.4:18080 /index.html | tee probe.out; grep -q hello-through-chain probe.out
+grep -q 'A-socks.*inbound connection to 127.0.0.10:28443' a.log && grep -q 'HS-https.*inbound connection to 127.0.0.4:18080' h.log \
+  || { echo "FAIL: https landing" >&2; exit 1; }
+echo "PASS: https landing HS via socks5 front A"
+: > h.log
+"$PROBE" hsh.dae H 127.0.0.4:18080 /index.html | tee probe.out; grep -q hello-through-chain probe.out
+grep -q 'HS-https.*inbound connection to 127.0.0.9:28080' h.log && grep -q 'H-http.*inbound connection to 127.0.0.4:18080' h.log \
+  || { echo "FAIL: http over https" >&2; exit 1; }
+echo "PASS: http landing H via https front HS"
+: > b.log
+if "$PROBE" hbad.dae B 127.0.0.4:18080 /index.html > probe.out 2>&1 && grep -q hello-through-chain probe.out; then
+  echo "FAIL: wrong http credentials accepted" >&2; exit 1; fi
+if grep -q 'B-ss.*inbound connection' b.log; then echo "FAIL: bad-auth front leaked to B" >&2; exit 1; fi
+echo "PASS: http front with wrong credentials refused"
+: > b.log; : > h.log
+"$PROBE" hb.dae B $E --udp 64 > udp.out 2>&1 || true
+if grep -q 'udp echo: Ok' udp.out || grep -q 'B-ss.*packet' b.log; then
+  echo "FAIL: UDP went through/around http front" >&2; exit 1; fi
+echo "PASS: UDP via http front refused (no bypass)"
+cat > sub-http.yaml <<'YAML'
+proxies:
+  - {name: KH, type: http, server: 127.0.0.9, port: 28080, username: hu, password: hp}
+  - {name: KHS, type: http, server: 127.0.0.10, port: 28443, tls: true, sni: localhost, skip-cert-verify: true, dialer-proxy: KH}
+YAML
+cat > sub-http.json <<'JSON'
+{"outbounds":[
+ {"type":"http","tag":"JHS","server":"127.0.0.10","server_port":28443,
+  "tls":{"enabled":true,"server_name":"localhost","insecure":true},"detour":"JH"},
+ {"type":"http","tag":"JH","server":"127.0.0.9","server_port":28080,"username":"hu","password":"hp"}
+]}
+JSON
+"$IMPORT" clash sub-http.yaml > sub-http.clash.json
+"$IMPORT" auto sub-http.json > sub-http.sb.json
+for pair in "sub-http.clash.json KHS" "sub-http.sb.json JHS"; do
+  set -- $pair; : > h.log
+  "$PROBE" "$1" "$2" 127.0.0.4:18080 /index.html | tee probe.out; grep -q hello-through-chain probe.out
+  grep -q 'H-http.*inbound connection to 127.0.0.10:28443' h.log && grep -q 'HS-https.*inbound connection to 127.0.0.4:18080' h.log \
+    || { echo "FAIL: imported http chain $1" >&2; exit 1; }
+  echo "PASS: imported http/https chain ($1)"
+done

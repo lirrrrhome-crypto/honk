@@ -206,6 +206,13 @@ fn invalid_link(source: &SourceRef) -> DetailedConfigError {
 fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedConfigError> {
     let outbound = match url.scheme() {
         "socks5" | "socks4" | "socks4a" => OutboundConfig::Socks5(Default::default()),
+        "http" | "https" => OutboundConfig::Http(crate::node::HttpConfig {
+            tls: crate::node::TlsOptions {
+                enabled: url.scheme() == "https",
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         "ss" => OutboundConfig::Shadowsocks(Default::default()),
         "trojan" => OutboundConfig::Trojan(Default::default()),
         "anytls" => OutboundConfig::AnyTls(Default::default()),
@@ -220,7 +227,7 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 "unknown-protocol",
                 source.clone(),
                 SettingPath::new("config").field("protocol"),
-                "unknown node protocol; expected socks5, socks4, socks4a, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic or juicity",
+                "unknown node protocol; expected socks5, socks4, socks4a, http, https, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic or juicity",
             ));
         }
     };
@@ -228,7 +235,12 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
         .host_str()
         .ok_or_else(|| invalid_link(source))?
         .to_string();
-    let port = match url.port() {
+    // `url` hides the scheme's default port (http 80, https 443).
+    let port = match url.port().or_else(|| {
+        matches!(url.scheme(), "http" | "https")
+            .then(|| url.port_or_known_default())
+            .flatten()
+    }) {
         Some(0) => return Err(invalid_link(source)),
         Some(port) => port,
         None => 443,
@@ -253,6 +265,10 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
         let single = || percent_decode_credential(raw_password.or(raw_username), source);
         match &mut node.outbound {
             OutboundConfig::Socks5(config) => {
+                config.username = username()?;
+                config.password = password()?;
+            }
+            OutboundConfig::Http(config) => {
                 config.username = username()?;
                 config.password = password()?;
             }

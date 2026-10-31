@@ -50,6 +50,7 @@ fn supports_tls(protocol: NodeProtocol) -> bool {
         NodeProtocol::Trojan
             | NodeProtocol::VMess
             | NodeProtocol::VLess
+            | NodeProtocol::Http
             | NodeProtocol::Hysteria2
             | NodeProtocol::Tuic
             | NodeProtocol::Juicity
@@ -97,6 +98,8 @@ fn reject_active_unless(
 fn protocol_from_name(proxy_type: &str) -> Result<NodeProtocol, &'static str> {
     if proxy_type.eq_ignore_ascii_case("socks5") {
         Ok(NodeProtocol::Socks5)
+    } else if proxy_type.eq_ignore_ascii_case("http") {
+        Ok(NodeProtocol::Http)
     } else if proxy_type.eq_ignore_ascii_case("ss")
         || proxy_type.eq_ignore_ascii_case("shadowsocks")
     {
@@ -323,6 +326,10 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
             config.encryption = cipher;
         }
         OutboundConfig::Socks5(config) => {
+            config.username = username;
+            config.password = password;
+        }
+        OutboundConfig::Http(config) => {
             config.username = username;
             config.password = password;
         }

@@ -1020,3 +1020,46 @@ fn imported_conflicting_detours_are_rejected_identical_ones_kept() {
     );
     assert!(quic.iter().all(|n| n.name != "Q"));
 }
+
+#[test]
+fn clash_and_sing_box_http_proxies_import_with_tls_and_detour() {
+    let parse = |sub_type, body: &str| {
+        parse_subscription_content(
+            &Subscription {
+                sub_type,
+                ..Default::default()
+            },
+            body,
+        )
+    };
+    let clash = r#"
+proxies:
+  - {name: H, type: http, server: 10.0.0.1, port: 3128, username: u, password: p}
+  - {name: HS, type: http, server: 10.0.0.2, port: 443, tls: true, sni: s.example, skip-cert-verify: true, dialer-proxy: H}
+"#;
+    let nodes = parse(SubscriptionType::Clash, clash).unwrap();
+    assert_eq!(nodes.len(), 2);
+    let h = nodes.iter().find(|n| n.name == "H").unwrap();
+    assert_eq!(h.protocol(), NodeProtocol::Http);
+    assert_eq!(h.http().unwrap().username.as_deref(), Some("u"));
+    assert!(!h.http().unwrap().tls.enabled);
+    let hs = nodes.iter().find(|n| n.name == "HS").unwrap();
+    let tls = &hs.http().unwrap().tls;
+    assert!(tls.enabled && tls.skip_cert_verify);
+    assert_eq!(tls.sni.as_deref(), Some("s.example"));
+    assert_eq!(hs.detour.as_deref(), Some("H"));
+
+    let sing_box = r#"{"outbounds":[
+      {"type":"http","tag":"J","server":"10.0.0.3","server_port":8080,"username":"a","password":"b",
+       "tls":{"enabled":true,"server_name":"j.example"},"detour":"K"},
+      {"type":"socks","tag":"K","server":"10.0.0.4","server_port":1080}]}"#;
+    let nodes = parse(SubscriptionType::Simple, sing_box).unwrap();
+    let j = nodes.iter().find(|n| n.name == "J").unwrap();
+    assert_eq!(j.protocol(), NodeProtocol::Http);
+    assert_eq!(j.http().unwrap().password.as_deref(), Some("b"));
+    assert!(j.http().unwrap().tls.enabled);
+    assert_eq!(j.detour.as_deref(), Some("K"));
+
+    let bad = r#"{"outbounds":[{"type":"http","tag":"P","server":"10.0.0.5","server_port":80,"path":"/x"}]}"#;
+    assert!(parse(SubscriptionType::Simple, bad).map(|n| n.is_empty()).unwrap_or(true));
+}

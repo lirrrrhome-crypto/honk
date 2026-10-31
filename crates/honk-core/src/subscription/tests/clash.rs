@@ -343,7 +343,7 @@ proxies:
 
 #[test]
 fn test_parse_clash_skips_removed_protocols() {
-    // ssr/http/trojan-go support was removed: subscription entries are
+    // ssr/trojan-go support was removed: subscription entries are
     // skipped with a warning instead of failing the whole fetch.
     let yaml = r#"
 proxies:
@@ -351,8 +351,8 @@ proxies:
     type: ssr
     server: 10.0.0.2
     port: 8388
-  - name: "HTTP node"
-    type: http
+  - name: "Snell node"
+    type: snell
     server: 10.0.0.3
     port: 8080
   - name: "Trojan-Go node"

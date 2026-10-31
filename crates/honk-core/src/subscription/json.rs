@@ -568,7 +568,7 @@ mod tests {
     fn structural_or_unknown_only_sing_box_body_is_rejected() {
         for input in [
             r#"{"outbounds":[]}"#,
-            r#"{"outbounds":[{"type":"selector","tag":"select","outbounds":[]},{"type":"direct","tag":"direct"},{"type":"http","tag":"unsupported","server":"proxy.example","server_port":8080}]}"#,
+            r#"{"outbounds":[{"type":"selector","tag":"select","outbounds":[]},{"type":"direct","tag":"direct"},{"type":"ssh","tag":"unsupported","server":"proxy.example","server_port":22}]}"#,
         ] {
             assert!(parse_json_subscription(json(input), None).is_err());
         }

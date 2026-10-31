@@ -548,15 +548,13 @@ fn test_vmess_invalid_links_rejected() {
 
 #[test]
 fn test_removed_protocol_links_rejected() {
-    // ssr/trojan-go/http(s) support was removed; the links now fail as
+    // ssr/trojan-go support was removed; the links now fail as
     // unknown protocols (hard error in config files, skipped with a
     // warning in subscriptions).
     let ssr_link = format!("ssr://{}", b64("example.com:443:origin:none:plain:cHc"));
     for link in [
         ssr_link.as_str(),
         "trojan-go://pw@example.com:443",
-        "http://proxy.example.com:8080",
-        "https://user:pass@proxy.example.com:8443",
     ] {
         let err = Node::from_share_link(link).unwrap_err();
         assert!(matches!(err, honk_config::ConfigError::UnknownProtocol(_)));
@@ -2570,4 +2568,41 @@ fn detailed_share_link_validation_preserves_intrinsic_cause() {
             .to_string()
             .contains("VLESS flow requires TLS or REALITY")
     );
+}
+
+#[test]
+fn http_and_https_share_links_parse_and_roundtrip() {
+    let node = Node::from_share_link("http://user:p%40ss@10.0.0.1:3128#H").unwrap();
+    assert_eq!(node.protocol(), NodeProtocol::Http);
+    assert_eq!((node.host.as_str(), node.port), ("10.0.0.1", 3128));
+    let config = node.http().unwrap();
+    assert_eq!(config.username.as_deref(), Some("user"));
+    assert_eq!(config.password.as_deref(), Some("p@ss"));
+    assert!(!config.tls.enabled);
+    assert!(node.supports_detour());
+
+    let default_port = Node::from_share_link("http://proxy.example#D").unwrap();
+    assert_eq!(default_port.port, 80);
+
+    let tls = Node::from_share_link(
+        "https://proxy.example?sni=front.example&allowInsecure=1&dialer-proxy=F#S",
+    )
+    .unwrap();
+    assert_eq!(tls.port, 443);
+    let config = tls.http().unwrap();
+    assert!(config.tls.enabled && config.tls.skip_cert_verify);
+    assert_eq!(config.tls.sni.as_deref(), Some("front.example"));
+    assert_eq!(tls.detour.as_deref(), Some("F"));
+    assert_ne!(node.id, default_port.id);
+
+    for node in [node, tls] {
+        let value = serde_json::to_value(&node).unwrap();
+        let restored: Node = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.outbound, node.outbound);
+        assert_eq!(restored.id, node.id);
+    }
+    // http and https to the same endpoint are different nodes.
+    let plain = Node::from_share_link("http://proxy.example:443#a").unwrap();
+    let secure = Node::from_share_link("https://proxy.example:443#a").unwrap();
+    assert_ne!(plain.id, secure.id);
 }

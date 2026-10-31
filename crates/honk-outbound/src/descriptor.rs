@@ -188,6 +188,18 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["socks5", "socks4", "socks4a"],
     },
+    // HTTP CONNECT: TCP only. After a 2xx reply the tunnel is a pure data
+    // channel bound to its target, like SOCKS5; a bare TCP still owes the
+    // (optional) TLS handshake, which `dial_with_tcp` performs.
+    ProtocolDescriptor {
+        protocol: NodeProtocol::Http,
+        supports_udp: never,
+        pool_ready_streams: never,
+        pool_bare_tcp: always,
+        supports_warm: no_warm,
+        generation_runtime: GenerationRuntime::None,
+        share_link_schemes: &["http", "https"],
+    },
     // QUIC-based (hy2/tuic/juicity): a pooled bare TCP is unusable — their
     // `dial_with_tcp` fails — so preconnect warmup must not deposit one (it
     // would poison the first flow).
@@ -277,6 +289,7 @@ mod tests {
             NodeProtocol::VMess,
             NodeProtocol::VLess,
             NodeProtocol::Socks5,
+            NodeProtocol::Http,
             NodeProtocol::Hysteria2,
             NodeProtocol::Tuic,
             NodeProtocol::Juicity,

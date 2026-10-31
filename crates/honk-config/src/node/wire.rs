@@ -255,6 +255,7 @@ impl FlatNode {
         let tls = matches!(
             self.protocol,
             NodeProtocol::Trojan
+                | NodeProtocol::Http
                 | NodeProtocol::VMess
                 | NodeProtocol::VLess
                 | NodeProtocol::Hysteria2
@@ -312,6 +313,7 @@ impl FlatNode {
                     || !matches!(
                         self.protocol,
                         NodeProtocol::Socks5
+                            | NodeProtocol::Http
                             | NodeProtocol::Trojan
                             | NodeProtocol::VLess
                             | NodeProtocol::Hysteria2
@@ -620,6 +622,14 @@ impl FlatNode {
                 username: flat.username.take(),
                 password: flat.password.take(),
             }),
+            NodeProtocol::Http => {
+                let tls = flat.take_tls();
+                OutboundConfig::Http(super::HttpConfig {
+                    username: flat.username.take(),
+                    password: flat.password.take(),
+                    tls,
+                })
+            }
             NodeProtocol::Hysteria2 => {
                 let tls = flat.take_tls();
                 OutboundConfig::Hysteria2(Hysteria2Config {
@@ -859,6 +869,11 @@ impl<'a> WireOptions<'a> {
             OutboundConfig::Socks5(config) => {
                 wire.username = config.username.as_deref();
                 wire.password = config.password.as_deref();
+            }
+            OutboundConfig::Http(config) => {
+                wire.username = config.username.as_deref();
+                wire.password = config.password.as_deref();
+                wire.set_tls(&config.tls);
             }
             OutboundConfig::Hysteria2(config) => {
                 wire.username = config.auth.as_deref();

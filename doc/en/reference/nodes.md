@@ -218,6 +218,7 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | `vmess` | — | Yes | No | AEAD; TCP/WS/gRPC/XHTTP and REALITY; handler requires `rprx` |
 | `vless` | — | Yes | Configurable* | Native UDP, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
 | `socks5` | — | Yes | Yes | CONNECT and UDP ASSOCIATE |
+| `http` | `https` | Yes | No | HTTP `CONNECT` proxy, optional TLS (`https`) and Basic auth |
 | `hysteria2` | — | Yes | Yes | QUIC/H3, salamander, brutal/BBR, and port hopping |
 | `tuic` | — | Yes | Yes | TUIC v5 over QUIC |
 | `juicity` | — | Yes | Yes | Juicity over QUIC |
@@ -480,6 +481,12 @@ Original Clash/Mihomo `proxies` entries materialize `h3` when TUIC `alpn` is mis
 
 **Upgrade:** imported TUIC nodes that relied on the previous `tuic` fallback must specify `alpn: [tuic]` to retain it. The protocol-specific ALPN does not change the node UUID, but an effective configuration change replaces its runtime for new work; existing flows retain the normal generation-retirement behavior.
 
+### HTTP / HTTPS proxy
+
+`http://[user:pass@]host[:port]` dials a plain HTTP proxy (default port 80); `https://` wraps it in TLS (default port 443, accepts `sni`, `allowInsecure`/`insecure` and the common TLS parameters). Userinfo becomes `Proxy-Authorization: Basic`. Each TCP flow sends one `CONNECT host:port HTTP/1.1` and needs a 2xx reply; anything else fails the dial. Clash `type: http` (with `tls: true` for HTTPS) and sing-box `type: http` outbounds import into the same protocol; sing-box `path` and `headers` are rejected.
+
+HTTP nodes carry TCP only. They work as a landing (`http://...?dialer-proxy=front`) and as a front for any TCP chain. UDP through an HTTP front, or to an HTTP landing, is refused at dial time; it is never sent outside the chain.
+
 ### AnyTLS
 
 | Link input | Node field / behavior |
@@ -668,6 +675,7 @@ A static config offers real ECH and ECH rejection fails the handshake closed. Di
 | `hysteria2://` | Hysteria2 query mapping above; `hysteria://` is also accepted |
 | `tuic://` | TUIC userinfo and QUIC tuning above |
 | `juicity://` | Juicity userinfo and shared QUIC/TLS queries |
+| `http://`, `https://` | HTTP CONNECT proxy; `https` enables TLS |
 | `socks5://` | SOCKS userinfo; `socks4://` and `socks4a://` are accepted into the same node protocol |
 
 For a chain written as `a -> b`, only `a` is parsed. Automatic names come only from a decoded `#fragment`, VMess `ps`, or `{scheme}-{host}`; the parser never uses the raw URI or userinfo as a fallback, so credentials do not leak into generated names. Explicit tags, fragments, and `ps` values remain user-controlled.

@@ -140,6 +140,14 @@ pub struct ShadowsocksConfig {
     pub plugin_opts: Option<String>,
 }
 
+/// HTTP CONNECT proxy; `tls.enabled` makes it an HTTPS proxy.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HttpConfig {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub tls: TlsOptions,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Socks5Config {
     pub username: Option<String>,
@@ -212,6 +220,7 @@ pub enum OutboundConfig {
     Vmess(VmessConfig),
     Vless(VlessConfig),
     Socks5(Socks5Config),
+    Http(HttpConfig),
     Hysteria2(Hysteria2Config),
     Tuic(TuicConfig),
     Juicity(JuicityConfig),
@@ -234,6 +243,7 @@ impl OutboundConfig {
             NodeProtocol::VMess => Self::Vmess(VmessConfig::default()),
             NodeProtocol::VLess => Self::Vless(VlessConfig::default()),
             NodeProtocol::Socks5 => Self::Socks5(Socks5Config::default()),
+            NodeProtocol::Http => Self::Http(HttpConfig::default()),
             NodeProtocol::Hysteria2 => Self::Hysteria2(Hysteria2Config::default()),
             NodeProtocol::Tuic => Self::Tuic(TuicConfig::default()),
             NodeProtocol::Juicity => Self::Juicity(JuicityConfig::default()),
@@ -250,6 +260,7 @@ impl OutboundConfig {
             Self::Vmess(_) => NodeProtocol::VMess,
             Self::Vless(_) => NodeProtocol::VLess,
             Self::Socks5(_) => NodeProtocol::Socks5,
+            Self::Http(_) => NodeProtocol::Http,
             Self::Hysteria2(_) => NodeProtocol::Hysteria2,
             Self::Tuic(_) => NodeProtocol::Tuic,
             Self::Juicity(_) => NodeProtocol::Juicity,
@@ -268,6 +279,7 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&config.quic.tls),
             Self::Juicity(config) => Some(&config.quic.tls),
             Self::AnyTls(config) => Some(&config.tls),
+            Self::Http(config) => Some(&config.tls),
             Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
         }
     }
@@ -281,6 +293,7 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&mut config.quic.tls),
             Self::Juicity(config) => Some(&mut config.quic.tls),
             Self::AnyTls(config) => Some(&mut config.tls),
+            Self::Http(config) => Some(&mut config.tls),
             Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
         }
     }
@@ -341,6 +354,11 @@ impl OutboundConfig {
             ]),
             Self::Vless(config) => identity_join(&[config.uuid.as_deref().unwrap_or("")]),
             Self::Socks5(config) => identity_join(&[
+                config.username.as_deref().unwrap_or(""),
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::Http(config) => identity_join(&[
+                if config.tls.enabled { "https" } else { "http" },
                 config.username.as_deref().unwrap_or(""),
                 config.password.as_deref().unwrap_or(""),
             ]),

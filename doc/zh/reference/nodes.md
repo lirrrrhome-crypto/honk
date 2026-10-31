@@ -218,6 +218,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC/XHTTP 与 REALITY；handler 需要 `rprx` |
 | `vless` | — | 是 | 可配置* | 原生 UDP、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
 | `socks5` | — | 是 | 是 | CONNECT 与 UDP ASSOCIATE |
+| `http` | `https` | 是 | 否 | HTTP `CONNECT` 代理，可选 TLS（`https`）与 Basic 认证 |
 | `hysteria2` | — | 是 | 是 | QUIC/H3、salamander、brutal/BBR 与端口跳跃 |
 | `tuic` | — | 是 | 是 | QUIC 上的 TUIC v5 |
 | `juicity` | — | 是 | 是 | QUIC 上的 Juicity |
@@ -477,6 +478,12 @@ node {
 
 **升级注意：** 依赖此前 `tuic` 回退的导入节点须显式设置 `alpn: [tuic]` 才能保留旧行为。协议专用 ALPN 不改变节点 UUID，但有效配置变化会为新请求重建运行时；已有流继续遵循正常的代际退休机制。
 
+### HTTP / HTTPS 代理
+
+`http://[user:pass@]host[:port]` 拨号普通 HTTP 代理（默认端口 80）；`https://` 外包 TLS（默认端口 443，接受 `sni`、`allowInsecure`/`insecure` 等通用 TLS 参数）。用户信息转为 `Proxy-Authorization: Basic`。每个 TCP 流发送一次 `CONNECT host:port HTTP/1.1`，必须收到 2xx 响应，否则拨号失败。Clash `type: http`（HTTPS 用 `tls: true`）和 sing-box `type: http` 出站导入为同一协议；sing-box 的 `path` 与 `headers` 会被拒绝。
+
+HTTP 节点只承载 TCP，既可作落地（`http://...?dialer-proxy=front`），也可作任意 TCP 链的前置。经 HTTP 前置或发往 HTTP 落地的 UDP 会在拨号时被拒绝，绝不会绕出链路发送。
+
 ### AnyTLS
 
 | 链接输入 | 节点字段 / 行为 |
@@ -665,6 +672,7 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。目标 TLS 记录的缓冲�
 | `hysteria2://` | 上述 Hysteria2 查询参数映射；也接受 `hysteria://` |
 | `tuic://` | 上述 TUIC 用户信息与 QUIC 调优 |
 | `juicity://` | Juicity 用户信息与共用 QUIC/TLS 查询参数 |
+| `http://`、`https://` | HTTP CONNECT 代理；`https` 启用 TLS |
 | `socks5://` | SOCKS 用户信息；`socks4://` 与 `socks4a://` 也导入同一种节点协议 |
 
 对于写成 `a -> b` 的链，只解析 `a`。自动名称只来自解码后的 `#fragment`、VMess `ps` 或 `{scheme}-{host}`；解析器绝不以原始 URI 或用户信息作为回退，因此生成名称不会泄漏凭据。显式标签、片段与 `ps` 值仍由用户控制。

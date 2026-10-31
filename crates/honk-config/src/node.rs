@@ -118,7 +118,9 @@ impl Node {
     /// builtins cannot.
     pub fn supports_detour(&self) -> bool {
         match self.protocol() {
-            NodeProtocol::Socks5 | NodeProtocol::SS | NodeProtocol::Trojan => !self.is_xhttp(),
+            NodeProtocol::Socks5 | NodeProtocol::Http | NodeProtocol::SS | NodeProtocol::Trojan => {
+                !self.is_xhttp()
+            }
             NodeProtocol::VMess => !self.is_xhttp(),
             NodeProtocol::VLess => {
                 !self.is_xhttp()
@@ -207,6 +209,20 @@ impl Node {
     pub fn shadowsocks_mut(&mut self) -> Option<&mut ShadowsocksConfig> {
         match &mut self.outbound {
             OutboundConfig::Shadowsocks(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn http(&self) -> Option<&HttpConfig> {
+        match &self.outbound {
+            OutboundConfig::Http(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn http_mut(&mut self) -> Option<&mut HttpConfig> {
+        match &mut self.outbound {
+            OutboundConfig::Http(config) => Some(config),
             _ => None,
         }
     }
