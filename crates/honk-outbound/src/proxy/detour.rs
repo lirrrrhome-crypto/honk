@@ -270,7 +270,10 @@ pub(crate) fn front_candidate_order(
             break;
         }
         if member.id == landing
-            || matches!(member.protocol(), NodeProtocol::Direct | NodeProtocol::Block)
+            || matches!(
+                member.protocol(),
+                NodeProtocol::Direct | NodeProtocol::Block
+            )
             || out.iter().any(|node| node.id == member.id)
         {
             continue;
@@ -471,7 +474,8 @@ pub(crate) fn dial_front_tcp<'a>(
                 }
             }
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("detour front {front_name:?} has no candidates")))
+        Err(last
+            .unwrap_or_else(|| anyhow::anyhow!("detour front {front_name:?} has no candidates")))
     })
 }
 
@@ -485,48 +489,48 @@ async fn dial_front_once(
     connect_timeout: Duration,
     depth: usize,
 ) -> anyhow::Result<TcpStream> {
-        let (server, server_domain) = server_target(node, &front).await?;
-        tracing::debug!("Dialing {} server through detour {}", node.name, front.name);
-        let front_stream = if front.detour.is_some() {
-            dial_chained(
-                table,
-                packet,
-                generation.clone(),
-                front,
-                server,
-                server_domain,
-                connect_timeout,
-                depth + 1,
-            )
-            .await?
-        } else {
-            let handler = inner_handler(table, front.protocol())?;
-            match generation
-                .as_ref()
-                .and_then(|generation| Some((generation, generation.get(&front.id)?)))
-            {
-                Some((generation, runtime)) => {
-                    anyhow::ensure!(
-                        !generation.is_shutdown(),
-                        "outbound runtime generation is shut down"
-                    );
-                    generation
-                        .scope_dials(handler.dial_runtime(
-                            runtime,
-                            server,
-                            server_domain.as_deref(),
-                            connect_timeout,
-                        ))
-                        .await?
-                }
-                None => {
-                    handler
-                        .dial(&front, server, server_domain.as_deref(), connect_timeout)
-                        .await?
-                }
+    let (server, server_domain) = server_target(node, &front).await?;
+    tracing::debug!("Dialing {} server through detour {}", node.name, front.name);
+    let front_stream = if front.detour.is_some() {
+        dial_chained(
+            table,
+            packet,
+            generation.clone(),
+            front,
+            server,
+            server_domain,
+            connect_timeout,
+            depth + 1,
+        )
+        .await?
+    } else {
+        let handler = inner_handler(table, front.protocol())?;
+        match generation
+            .as_ref()
+            .and_then(|generation| Some((generation, generation.get(&front.id)?)))
+        {
+            Some((generation, runtime)) => {
+                anyhow::ensure!(
+                    !generation.is_shutdown(),
+                    "outbound runtime generation is shut down"
+                );
+                generation
+                    .scope_dials(handler.dial_runtime(
+                        runtime,
+                        server,
+                        server_domain.as_deref(),
+                        connect_timeout,
+                    ))
+                    .await?
             }
-        };
-        bridge(front_stream, connect_timeout).await
+            None => {
+                handler
+                    .dial(&front, server, server_domain.as_deref(), connect_timeout)
+                    .await?
+            }
+        }
+    };
+    bridge(front_stream, connect_timeout).await
 }
 
 /// QUIC landings (hysteria2, tuic, juicity) reach their server through the
@@ -602,11 +606,15 @@ pub(crate) async fn udp_bridge(
         async move {
             let mut buf = vec![0u8; 65_536];
             loop {
-                let (n, from) =
-                    match tokio::time::timeout(QUIC_BRIDGE_IDLE, socket.recv_from(&mut buf)).await {
-                        Ok(Ok(received)) => received,
-                        _ => return,
-                    };
+                let (n, from) = match tokio::time::timeout(
+                    QUIC_BRIDGE_IDLE,
+                    socket.recv_from(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(received)) => received,
+                    _ => return,
+                };
                 if *peer.get_or_init(|| from) != from {
                     tracing::debug!("QUIC detour bridge: dropping datagram from foreign {from}");
                     continue;

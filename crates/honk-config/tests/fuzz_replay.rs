@@ -25,10 +25,11 @@ type Check = (&'static str, fn(&[u8]));
 #[test]
 fn saved_inputs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz");
-    let checks: [Check; 3] = [
+    let checks: [Check; 4] = [
         ("document", fuzz_checks::document),
         ("share_link", fuzz_checks::share_link),
         ("lexer", fuzz_checks::lexer),
+        ("share_link_chain", fuzz_checks::share_link_chain),
     ];
     let mut count = 0;
     for (target, check) in checks {

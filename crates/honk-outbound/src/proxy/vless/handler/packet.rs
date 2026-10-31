@@ -485,7 +485,6 @@ impl VLessHandler {
     }
 }
 
-
 impl VLessHandler {
     /// Open a chained (detour) UDP carrier over `tcp`, an already-connected
     /// stream to the server through the front chain. Only the single-stream
@@ -560,8 +559,12 @@ impl SharedSourceOutbound for VLessHandler {
             .open_chained_udp_carrier(node, path, tcp, target, target_domain, connect_timeout)
             .await?;
         let request = crate::proxy::uot::request(false, target, target_domain)?;
-        let transport: Arc<dyn MultiTargetTransport> =
-            Arc::new(VlessUotTransport::new(stream, target, target_domain, request));
+        let transport: Arc<dyn MultiTargetTransport> = Arc::new(VlessUotTransport::new(
+            stream,
+            target,
+            target_domain,
+            request,
+        ));
         Ok(PreparedUdpTransport::ready(transport))
     }
 }
@@ -607,7 +610,12 @@ impl PacketOutbound for VLessHandler {
             }
             VlessUdpPath::UotV2 => {
                 let request = crate::proxy::uot::request(false, target, target_domain)?;
-                Arc::new(VlessUotTransport::new(stream, target, target_domain, request))
+                Arc::new(VlessUotTransport::new(
+                    stream,
+                    target,
+                    target_domain,
+                    request,
+                ))
             }
             _ => Arc::new(VlessConnectedTransport::new(stream, target)),
         })

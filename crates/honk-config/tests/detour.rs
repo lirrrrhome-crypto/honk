@@ -354,7 +354,12 @@ fn detour_is_part_of_node_identity_and_unchained_ids_are_stable() {
     assert_ne!(id("via1"), id("plain"));
     assert_eq!(code(&config), None);
     // Unchained identity is unchanged and the chained one is reproducible.
-    let mut node = config.nodes.iter().find(|n| n.name == "via1").unwrap().clone();
+    let mut node = config
+        .nodes
+        .iter()
+        .find(|n| n.name == "via1")
+        .unwrap()
+        .clone();
     assert_eq!(node.id, node.derive_id());
     node.detour = None;
     assert_eq!(node.derive_id(), id("plain"));
@@ -363,5 +368,8 @@ fn detour_is_part_of_node_identity_and_unchained_ids_are_stable() {
         "f1: 'socks5://10.0.0.1:1080'\n via1: 'socks5://10.0.0.9:1080 -> f1'",
         "",
     );
-    assert_eq!(arrow.nodes.iter().find(|n| n.name == "via1").unwrap().id, id("via1"));
+    assert_eq!(
+        arrow.nodes.iter().find(|n| n.name == "via1").unwrap().id,
+        id("via1")
+    );
 }

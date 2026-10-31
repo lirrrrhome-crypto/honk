@@ -125,9 +125,8 @@ impl ProxyRegistry {
                 .with_probeable(socks5),
         );
         let http = Arc::new(super::http::HttpHandler::new());
-        registry.register(
-            ProtocolEntry::new(NodeProtocol::Http, http.clone()).with_probeable(http),
-        );
+        registry
+            .register(ProtocolEntry::new(NodeProtocol::Http, http.clone()).with_probeable(http));
         let direct = Arc::new(DirectHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::Direct, direct.clone())

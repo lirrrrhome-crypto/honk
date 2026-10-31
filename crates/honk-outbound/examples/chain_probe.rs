@@ -106,7 +106,11 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no node or group selection {}", args[2]))?
                 .id;
             println!("landing group {} selected", args[2]);
-            config.nodes.iter().find(|n| n.id == id).ok_or_else(|| anyhow::anyhow!("no node {id}"))?
+            config
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no node {id}"))?
         }
     };
     println!(

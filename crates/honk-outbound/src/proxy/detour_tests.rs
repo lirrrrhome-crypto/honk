@@ -1275,9 +1275,11 @@ async fn quic_udp_bridge_relays_owner_and_drops_foreign_peers() {
     let server_addr = server.local_addr().unwrap();
     let pipe_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     pipe_socket.connect(server_addr).await.unwrap();
-    let bridge = super::udp_bridge(crate::proxy::datagram_pipe::DatagramPipe::Socket(pipe_socket))
-        .await
-        .unwrap();
+    let bridge = super::udp_bridge(crate::proxy::datagram_pipe::DatagramPipe::Socket(
+        pipe_socket,
+    ))
+    .await
+    .unwrap();
     assert!(bridge.ip().is_loopback());
 
     let owner = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1296,7 +1298,11 @@ async fn quic_udp_bridge_relays_owner_and_drops_foreign_peers() {
     foreign.send_to(b"intruder", bridge).await.unwrap();
     owner.send_to(b"again", bridge).await.unwrap();
     let (n, _) = server.recv_from(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"again", "foreign datagram must not reach the front");
+    assert_eq!(
+        &buf[..n],
+        b"again",
+        "foreign datagram must not reach the front"
+    );
 }
 
 #[test]
@@ -1305,12 +1311,19 @@ fn quic_landings_ride_fronts_except_port_hopping_hysteria2() {
     for (link, chained) in [
         ("hysteria2://pw@1.2.3.4:443?sni=a.example", true),
         ("hysteria2://pw@1.2.3.4:443?mport=443-450", false),
-        ("tuic://00000000-0000-0000-0000-000000000001:p@1.2.3.4:443", true),
+        (
+            "tuic://00000000-0000-0000-0000-000000000001:p@1.2.3.4:443",
+            true,
+        ),
     ] {
         let mut node = Node::from_share_link(link).unwrap();
         node.detour = Some("front".into());
         assert_eq!(node.supports_detour(), chained, "{link}");
-        assert_eq!(crate::descriptor::chained_udp_supported(&node), chained, "{link}");
+        assert_eq!(
+            crate::descriptor::chained_udp_supported(&node),
+            chained,
+            "{link}"
+        );
     }
 }
 
@@ -1320,7 +1333,10 @@ fn vless_udp_rides_fronts_and_vless_fronts_relay_udp() {
     let id = "00000000-0000-0000-0000-000000000001";
     let mut landing =
         Node::from_share_link(&format!("vless://{id}@1.2.3.4:443?encryption=none")).unwrap();
-    assert!(super::front_relays_udp(&landing), "unchained vless front relays UDP");
+    assert!(
+        super::front_relays_udp(&landing),
+        "unchained vless front relays UDP"
+    );
     landing.detour = Some("front".into());
     assert!(crate::descriptor::chained_udp_supported(&landing));
     assert!((crate::descriptor::descriptor(landing.protocol()).supports_udp)(&landing));
@@ -1338,15 +1354,77 @@ fn group_front_candidates_put_selection_first_and_skip_landing() {
     let names = |v: Vec<honk_config::node::Node>| v.into_iter().map(|n| n.name).collect::<Vec<_>>();
     // Selection first, no duplicate, landing excluded, capped.
     assert_eq!(
-        names(super::front_candidate_order(Some(by("c3")), members.clone(), by("c2").id)),
+        names(super::front_candidate_order(
+            Some(by("c3")),
+            members.clone(),
+            by("c2").id
+        )),
         ["c3", "c1", "c4", "c5"]
     );
     assert_eq!(super::MAX_FRONT_CANDIDATES, 4);
     // No live selection: members are still tried in order.
     assert_eq!(
-        names(super::front_candidate_order(None, members[..2].to_vec(), Uuid::nil())),
+        names(super::front_candidate_order(
+            None,
+            members[..2].to_vec(),
+            Uuid::nil()
+        )),
         ["c1", "c2"]
     );
     // A selection equal to the landing is dropped, never dialed.
     assert!(super::front_candidate_order(Some(by("c1")), vec![by("c1")], by("c1").id).is_empty());
+}
+
+/// Every path that dials a node's server from this host outside the chained
+/// dialers (bare-TCP pool, ready-stream pool, warm) must stay closed for a
+/// node with a detour, for every protocol.
+#[test]
+fn chained_nodes_of_every_protocol_never_pool_or_warm_direct() {
+    use crate::proxy::WarmRequirement;
+    use base64::Engine;
+    use honk_config::node::Node;
+    let id = "00000000-0000-0000-0000-000000000001";
+    let vmess = base64::engine::general_purpose::STANDARD.encode(format!(
+        r#"{{"v":"2","ps":"v","add":"1.2.3.4","port":"443","id":"{id}","aid":"0","net":"tcp","type":"none","tls":""}}"#
+    ));
+    let links = [
+        "ss://YWVzLTI1Ni1nY206cHc@1.2.3.4:443".to_string(),
+        "socks5://1.2.3.4:1080".to_string(),
+        "http://1.2.3.4:8080".to_string(),
+        "trojan://pw@1.2.3.4:443?sni=a.example".to_string(),
+        format!("vmess://{vmess}"),
+        format!("vless://{id}@1.2.3.4:443?encryption=none"),
+        format!("vless://{id}@1.2.3.4:443?encryption=none&type=ws&path=/w"),
+        "trojan://pw@1.2.3.4:443?type=grpc&serviceName=g".to_string(),
+        "anytls://pw@1.2.3.4:443?sni=a.example".to_string(),
+        "hysteria2://pw@1.2.3.4:443?sni=a.example".to_string(),
+        format!("tuic://{id}:p@1.2.3.4:443"),
+        format!("juicity://{id}:p@1.2.3.4:443"),
+    ];
+    for link in links {
+        let mut node = Node::from_share_link(&link).unwrap_or_else(|e| panic!("{link}: {e:?}"));
+        node.detour = Some("front".into());
+        node.id = node.derive_id();
+        let d = crate::descriptor::descriptor(node.protocol());
+        assert!(
+            !(d.pool_bare_tcp)(&node),
+            "{link}: bare TCP pooled for chained node"
+        );
+        assert!(
+            !(d.pool_ready_streams)(&node),
+            "{link}: ready stream pooled for chained node"
+        );
+        for req in [WarmRequirement::Session, WarmRequirement::Udp] {
+            assert!(
+                !d.supports_warm(&node, req),
+                "{link}: chained node warmed ({req:?})"
+            );
+        }
+        if (d.supports_udp)(&node) {
+            assert!(
+                crate::descriptor::chained_udp_supported(&node),
+                "{link}: claims UDP while chained without a chained UDP path"
+            );
+        }
+    }
 }

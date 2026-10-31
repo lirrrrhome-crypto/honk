@@ -552,10 +552,7 @@ fn test_removed_protocol_links_rejected() {
     // unknown protocols (hard error in config files, skipped with a
     // warning in subscriptions).
     let ssr_link = format!("ssr://{}", b64("example.com:443:origin:none:plain:cHc"));
-    for link in [
-        ssr_link.as_str(),
-        "trojan-go://pw@example.com:443",
-    ] {
+    for link in [ssr_link.as_str(), "trojan-go://pw@example.com:443"] {
         let err = Node::from_share_link(link).unwrap_err();
         assert!(matches!(err, honk_config::ConfigError::UnknownProtocol(_)));
     }

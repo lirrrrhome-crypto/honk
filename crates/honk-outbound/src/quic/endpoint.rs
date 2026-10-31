@@ -123,7 +123,11 @@ const LOOPBACK_RECEIVE_SEGMENTS: usize = 2;
 pub(super) fn gro_receive_segments(enabled: bool, kernel: usize) -> usize {
     // Without GRO each slot still needs room for one full datagram: peers such as
     // quic-go send 1280-1452 byte packets even when 1252 is advertised.
-    if enabled { kernel } else { LOOPBACK_RECEIVE_SEGMENTS }
+    if enabled {
+        kernel
+    } else {
+        LOOPBACK_RECEIVE_SEGMENTS
+    }
 }
 
 fn client_endpoint_with_mtu_and_owner<T>(

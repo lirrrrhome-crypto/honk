@@ -65,8 +65,7 @@ async fn handshake_accepts_2xx_and_keeps_trailing_payload() {
 
 #[tokio::test]
 async fn handshake_rejects_non_2xx() {
-    let (addr, _task) =
-        serve_once(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").await;
+    let (addr, _task) = serve_once(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").await;
     let mut s = TcpStream::connect(addr).await.unwrap();
     let req = HttpHandler::request(target(), None, None, None);
     let err = HttpHandler::handshake(&mut s, &req).await.unwrap_err();
@@ -88,5 +87,8 @@ async fn handshake_rejects_garbage_and_eof() {
     });
     let mut s = TcpStream::connect(addr).await.unwrap();
     let err = HttpHandler::handshake(&mut s, &req).await.unwrap_err();
-    assert!(err.to_string().contains("closed") || err.to_string().contains("reset"), "{err}");
+    assert!(
+        err.to_string().contains("closed") || err.to_string().contains("reset"),
+        "{err}"
+    );
 }
