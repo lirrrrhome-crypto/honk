@@ -12,7 +12,7 @@ impl VLessHandler {
     /// concrete `EncryptedStream` through response and Vision wrapping so
     /// Direct bypasses only AEAD while its boxed outer transport stays intact.
     /// Unencrypted raw TCP/TLS keeps its concrete type for the existing raw switch.
-    async fn dial_carrier(
+    pub(super) async fn dial_carrier(
         &self,
         node: &Node,
         uuid: [u8; 16],

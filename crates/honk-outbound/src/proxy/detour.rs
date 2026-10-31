@@ -10,7 +10,7 @@
 //! connection, verified by peer address, relayed by one task). This keeps
 //! every TCP-carried protocol unchanged at the cost of one local copy.
 //!
-//! UDP: a landing that frames UDP inside its own TCP stream (Trojan) carries
+//! UDP: a landing that frames UDP inside its own TCP stream (Trojan, VLESS) carries
 //! it over the same front chain, so any TCP-capable front (node or group)
 //! works. Native-UDP landings (Shadowsocks, SOCKS5 UDP ASSOCIATE) send their
 //! framed datagrams through a [`super::datagram_pipe::DatagramPipe`] that is
@@ -556,8 +556,8 @@ async fn dial_udp_chained(
 pub(crate) fn chained_udp_refusal(node: &Node) -> String {
     format!(
         "UDP not supported through detour for node {:?}: protocol {} has no chained \
-         UDP path (only trojan, shadowsocks, socks5 and QUIC landings carry UDP \
-         through a front); refusing instead of sending direct",
+         UDP path (only trojan, vless, shadowsocks, socks5 and QUIC landings carry \
+         UDP through a front); refusing instead of sending direct",
         node.name,
         node.protocol().as_str()
     )
@@ -583,11 +583,10 @@ fn front_udp_refusal(front: &Node, landing: &Node) -> String {
     )
 }
 
-/// Whether an unchained `front` may relay a landing's datagrams. VLESS UDP is
-/// deliberately not used as a chain carrier.
+/// Whether an unchained `front` may relay a landing's datagrams: any front
+/// with its own UDP path (VLESS included when its UDP is enabled).
 fn front_relays_udp(front: &Node) -> bool {
-    front.protocol() != NodeProtocol::VLess
-        && (crate::descriptor::descriptor(front.protocol()).supports_udp)(front)
+    (crate::descriptor::descriptor(front.protocol()).supports_udp)(front)
 }
 
 /// Raw (unwrapped) packet handlers by protocol, the UDP counterpart of

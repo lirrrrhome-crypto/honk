@@ -485,6 +485,50 @@ impl VLessHandler {
     }
 }
 
+
+impl VLessHandler {
+    /// Open a chained (detour) UDP carrier over `tcp`, an already-connected
+    /// stream to the server through the front chain. Only the single-stream
+    /// paths (native UDP, single XUDP, UoT v2) can ride a front; pooled mux
+    /// paths are refused rather than dialed directly.
+    async fn open_chained_udp_carrier(
+        &self,
+        node: &Node,
+        path: VlessUdpPath,
+        tcp: TcpStream,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        let vless = node.vless().unwrap();
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+        let (command, header_target, header_domain) = match path {
+            VlessUdpPath::Native => (CMD_UDP, Some(target), domain),
+            VlessUdpPath::Xudp => (cool::VLESS_MUX_COMMAND, None, None),
+            VlessUdpPath::UotV2 => (
+                CMD_TCP,
+                Some(SocketAddr::from(([0, 0, 0, 0], 0))),
+                Some(crate::proxy::uot::MAGIC_ADDRESS),
+            ),
+            VlessUdpPath::H2 | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate => {
+                anyhow::bail!(
+                    "VLESS multiplexed UDP of chained node {:?} cannot ride a detour front",
+                    node.name
+                )
+            }
+        };
+        let header = Self::build_request_header(
+            &uuid,
+            command,
+            header_target,
+            header_domain,
+            vless.wire_flow(),
+        )?;
+        self.dial_carrier(node, uuid, header, Some(tcp), timeout, None)
+            .await
+    }
+}
+
 #[async_trait]
 impl SharedSourceOutbound for VLessHandler {
     async fn prepare_shared_source(
@@ -497,6 +541,28 @@ impl SharedSourceOutbound for VLessHandler {
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
         let _ = speculative;
         Self::prepare_shared_udp(runtime, target, target_domain, connect_timeout).await
+    }
+
+    async fn prepare_shared_source_with_tcp(
+        &self,
+        node: &Node,
+        tcp: TcpStream,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        // Mirrors `prepare_shared_udp`: only UoT v2 carries several targets.
+        let path = Self::udp_path(node, target.port())?;
+        if path != VlessUdpPath::UotV2 {
+            return Err(crate::proxy::PacketRejection::Policy.into());
+        }
+        let stream = self
+            .open_chained_udp_carrier(node, path, tcp, target, target_domain, connect_timeout)
+            .await?;
+        let request = crate::proxy::uot::request(false, target, target_domain)?;
+        let transport: Arc<dyn MultiTargetTransport> =
+            Arc::new(VlessUotTransport::new(stream, target, target_domain, request));
+        Ok(PreparedUdpTransport::ready(transport))
     }
 }
 
@@ -521,6 +587,30 @@ impl PacketOutbound for VLessHandler {
             )
             .await?;
         Ok(crate::proxy::packet_transport_with_owner(transport, owner))
+    }
+
+    async fn dial_udp_transport_with_tcp(
+        &self,
+        node: &Node,
+        tcp: TcpStream,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let path = Self::udp_path(node, target.port())?;
+        let stream = self
+            .open_chained_udp_carrier(node, path, tcp, target, target_domain, connect_timeout)
+            .await?;
+        Ok(match path {
+            VlessUdpPath::Xudp => {
+                cool::connect_single_xudp(stream, target, target_domain, [0; 8]).await?
+            }
+            VlessUdpPath::UotV2 => {
+                let request = crate::proxy::uot::request(false, target, target_domain)?;
+                Arc::new(VlessUotTransport::new(stream, target, target_domain, request))
+            }
+            _ => Arc::new(VlessConnectedTransport::new(stream, target)),
+        })
     }
 
     async fn dial_udp_transport_runtime(

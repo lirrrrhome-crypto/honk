@@ -1140,7 +1140,7 @@ async fn native_udp_landings_ride_the_front_udp_relay() {
     }
 }
 
-/// Front down, a front without a UDP relay, or a VLESS front: a clear error,
+/// Front down, a front without a UDP relay, or an HTTP front: a clear error,
 /// and nothing reaches the landing server directly.
 #[tokio::test]
 async fn native_udp_landing_fails_closed() {
@@ -1158,11 +1158,10 @@ async fn native_udp_landing_fails_closed() {
     let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
         &format!(
             "node {{\n fa: 'socks5://{a_addr}'\n ft: 'socks5://{tcp_only}'\n\
-             fv: 'vless://{}@127.0.0.1:9?encryption=none'\n\
+             fv: 'http://127.0.0.1:9'\n\
              ldown: 'ss://YWVzLTEyOC1nY206cHc=@{ss_real}?detour=fa'\n\
              ltcp: 'ss://YWVzLTEyOC1nY206cHcy@{ss_real}?detour=ft'\n\
-             lv: 'ss://YWVzLTEyOC1nY206cHcz@{ss_real}?detour=fv'\n}}\n",
-            Uuid::nil()
+             lv: 'ss://YWVzLTEyOC1nY206cHcz@{ss_real}?detour=fv'\n}}\n"
         ),
         &mut Vec::new(),
     )
@@ -1313,4 +1312,16 @@ fn quic_landings_ride_fronts_except_port_hopping_hysteria2() {
         assert_eq!(node.supports_detour(), chained, "{link}");
         assert_eq!(crate::descriptor::chained_udp_supported(&node), chained, "{link}");
     }
+}
+
+#[test]
+fn vless_udp_rides_fronts_and_vless_fronts_relay_udp() {
+    use honk_config::node::Node;
+    let id = "00000000-0000-0000-0000-000000000001";
+    let mut landing =
+        Node::from_share_link(&format!("vless://{id}@1.2.3.4:443?encryption=none")).unwrap();
+    assert!(super::front_relays_udp(&landing), "unchained vless front relays UDP");
+    landing.detour = Some("front".into());
+    assert!(crate::descriptor::chained_udp_supported(&landing));
+    assert!((crate::descriptor::descriptor(landing.protocol()).supports_udp)(&landing));
 }

@@ -57,7 +57,7 @@ trap cleanup EXIT
 python3 -m http.server 18080 --bind 127.0.0.4 --directory www > http.log 2>&1 & pids+=($!)
 sleep 1
 
-(cd "$ROOT" && cargo build -q -p honk-outbound --example chain_probe)
+(cd "$ROOT" && cargo build -q -p honk-outbound --features rprx --example chain_probe)
 PROBE="$ROOT/target/debug/examples/chain_probe"
 
 "$PROBE" nodes.dae B 127.0.0.4:18080 /index.html | tee probe.out
@@ -222,8 +222,8 @@ done
 
 # Native-UDP landings: B (shadowsocks) and S (socks5) send their own UDP
 # datagrams through the front's UDP relay (socks5 UDP ASSOCIATE, ss UDP,
-# trojan UDP-over-TCP, nested chains, groups). A vless front cannot relay
-# UDP and must be refused; nothing is ever sent direct.
+# trojan UDP-over-TCP, vless UDP, nested chains, groups); nothing is ever
+# sent direct.
 cat > s.json <<JSON
 {"log":{"level":"debug","output":"$WORK/s.log"},
  "inbounds":[{"type":"socks","tag":"S-socks","listen":"127.0.0.7","listen_port":21082}],
@@ -274,10 +274,9 @@ for pick in A1 A2; do
   echo "PASS: ss landing UDP via group front $pick"
 done
 clr
-if "$PROBE" bv.dae B $E --udp 2> udp_v.err; then echo "FAIL: vless front relayed UDP" >&2; exit 1; fi
-grep -q 'cannot relay UDP' udp_v.err || { cat udp_v.err >&2; echo "FAIL: unclear vless refusal" >&2; exit 1; }
-nopkt B-ss b.log
-echo "PASS: vless front -> clear UDP refusal, nothing sent"
+"$PROBE" bv.dae B $E --udp 64 1350 | tee udp.out; echo_ok 2
+pkt V-vless 127.0.0.3:28388 v.log; pkt B-ss $E b.log
+echo "PASS: ss landing UDP via vless front V"
 kill "$a_pid"; wait "$a_pid" 2>/dev/null || true
 clr
 if "$PROBE" ba.dae B $E --udp 2> udp_down.err; then echo "FAIL: ss UDP with front down" >&2; exit 1; fi
@@ -545,3 +544,32 @@ qclr
 if "$PROBE" qm.dae Q 127.0.0.4:18080 /index.html > qm.out 2>&1; then echo "FAIL: port hopping chained" >&2; exit 1; fi
 if grep -q 'inbound' q.log; then echo "FAIL: hopping hy2 reached" >&2; exit 1; fi
 echo "PASS: hysteria2 port hopping behind a front refused"
+
+# VLESS landings carry UDP inside the chained stream (native UDP command,
+# single XUDP, UoT v2), so any TCP-capable front works.
+VL='vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.8:24444?type=tcp&security=none'
+for enc in none xudp uot-v2; do
+  nudp "vl_$enc" "A1: 'socks5://127.0.0.2:21080'" "VL: '$VL&packetEncoding=$enc&dialer-proxy=A1#VL'"
+  clr; "$PROBE" "vl_$enc.dae" VL $E --udp 64 1350 | tee udp.out; echo_ok 2
+  grep -q 'A-socks.*inbound connection to 127.0.0.8:24444' a.log || { echo "FAIL: vless $enc skipped A1" >&2; exit 1; }
+  nopkt A-socks a.log
+  grep -q "V-vless.*$E" v.log || { echo "FAIL: vless $enc no landing hop" >&2; exit 1; }
+  echo "PASS: vless landing UDP ($enc) via socks5 front A1"
+done
+nudp vlh "H: 'http://hu:hp@127.0.0.9:28080#H'" "VL: '$VL&packetEncoding=none&dialer-proxy=H#VL'"
+clr; : > h.log; "$PROBE" vlh.dae VL $E --udp 64 | tee udp.out; echo_ok 1
+grep -q 'H-http.*127.0.0.8:24444' h.log || { echo "FAIL: vless UDP skipped http front" >&2; exit 1; }
+echo "PASS: vless landing UDP via http front H (UDP inside the CONNECT stream)"
+nudp vln "A1: 'socks5://127.0.0.2:21080'" "S: 'socks5://127.0.0.7:21082?dialer-proxy=A1#S'" "VL: '$VL&packetEncoding=xudp&dialer-proxy=S#VL'"
+clr; "$PROBE" vln.dae VL $E --udp 64 | tee udp.out; echo_ok 1
+grep -q 'A-socks.*inbound connection to 127.0.0.7' a.log && grep -q 'S-socks.*inbound connection to 127.0.0.8:24444' s.log \
+  || { echo "FAIL: nested vless UDP hops" >&2; exit 1; }
+echo "PASS: vless landing UDP via nested A1 -> S"
+nudp vlg "A1: 'socks5://127.0.0.2:21080'" "A2: 'socks5://127.0.0.5:21081'" "VL: '$VL&dialer-proxy=fronts#VL'"
+printf 'group {\n    fronts {\n        filter: name(A1, A2)\n        policy: selector\n    }\n}\n' >> vlg.dae
+for pick in A1 A2; do
+  clr; CHAIN_SELECT=fronts=$pick "$PROBE" vlg.dae VL $E --udp 64 | tee udp.out; echo_ok 1
+  if [ $pick = A1 ]; then grep -q 'A-socks.*127.0.0.8' a.log; ! grep -q 127.0.0.8 a2.log
+  else grep -q 'A2-socks.*127.0.0.8' a2.log; ! grep -q 127.0.0.8 a.log; fi
+  echo "PASS: vless landing UDP via group front $pick"
+done

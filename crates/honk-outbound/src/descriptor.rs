@@ -42,7 +42,8 @@ fn network_lists_udp(node: &Node) -> bool {
 }
 
 /// Whether a node carrying a detour can carry UDP. Trojan frames UDP inside
-/// its own stream and rides the front's TCP chain; Shadowsocks and SOCKS5
+/// its own stream and rides the front's TCP chain, as does VLESS (native
+/// UDP, single XUDP or UoT v2 inside the chained stream); Shadowsocks and SOCKS5
 /// send their native datagrams through the front's UDP relay, and QUIC
 /// landings (hysteria2 without port hopping, tuic, juicity) run their whole
 /// QUIC connection over that relay (refused at dial time when the front has
@@ -53,6 +54,7 @@ pub fn chained_udp_supported(node: &Node) -> bool {
         && match node.protocol() {
             NodeProtocol::Trojan => network_lists_udp(node),
             NodeProtocol::SS | NodeProtocol::Socks5 => true,
+            NodeProtocol::VLess => node.vless().is_some_and(|vless| vless.udp_enabled()),
             NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity => true,
             _ => false,
         }
@@ -124,7 +126,7 @@ fn vless_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
 }
 
 fn vless_supports_udp(node: &Node) -> bool {
-    unchained(node) && node.vless().unwrap().udp_enabled()
+    (unchained(node) || chained_udp_supported(node)) && node.vless().unwrap().udp_enabled()
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
