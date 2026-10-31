@@ -203,10 +203,13 @@ pub(super) fn parse_section_indexed(
         if depth != 0 {
             continue;
         }
-        ordinal += 1;
         let statement = Expression::new(&lines[start..=end]).trim();
         start = end + 1;
-        diagnostics.entry_text(statement.parts().next().unwrap(), ordinal);
+        let Some(first) = statement.parts().next() else {
+            continue;
+        };
+        ordinal += 1;
+        diagnostics.entry_text(first, ordinal);
         if let Some(prefix) = ["fallback:", "default:"]
             .into_iter()
             .find(|prefix| statement.starts_with(prefix))
