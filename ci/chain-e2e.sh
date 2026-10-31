@@ -143,14 +143,26 @@ done
 echo "PASS: group switch -> new connection via A2, open one kept via A1"
 
 kill "$a2_pid"; wait "$a2_pid" 2>/dev/null || true
+: > a.log; : > b.log
+# Same-dial failover: the selected A2 is down, so this very dial moves on to
+# the next member A1 instead of failing or going direct.
+CHAIN_SELECT=fronts=A2 "$PROBE" group.dae B 127.0.0.4:18080 /index.html | tee probe.out
+grep -q hello-through-chain probe.out
+[ "$(hops A-socks a.log)" = 1 ] \
+  || { echo "FAIL: failover hops A1=$(hops A-socks a.log)" >&2; exit 1; }
+echo "PASS: selected group front down -> same dial fails over to A1"
+
+# Every member down (A2 and an unused port): the dial fails, no bypass.
+sed -e 's/name(A1, A2)/name(A2, A3)/' \
+    -e "s|    A2: 'socks5://127.0.0.5:21081'|&\n    A3: 'socks5://127.0.0.5:21099'|" group.dae > dead.dae
 : > b.log
-if CHAIN_SELECT=fronts=A2 "$PROBE" group.dae B 127.0.0.4:18080 /index.html; then
-  echo "FAIL: dial succeeded with the selected front down" >&2; exit 1
+if CHAIN_SELECT=fronts=A2 "$PROBE" dead.dae B 127.0.0.4:18080 /index.html; then
+  echo "FAIL: dial succeeded with every group front down" >&2; exit 1
 fi
 if grep -q 'inbound connection' b.log; then
-  echo "FAIL: landing node reached without the selected front" >&2; exit 1
+  echo "FAIL: landing node reached without any front" >&2; exit 1
 fi
-echo "PASS: selected group front down -> dial fails, no bypass"
+echo "PASS: all group fronts down -> dial fails, no bypass"
 
 # UDP through the chain. T is a trojan landing (UDP framed inside its TCP
 # stream, so the front only has to carry TCP); its front is A, then the

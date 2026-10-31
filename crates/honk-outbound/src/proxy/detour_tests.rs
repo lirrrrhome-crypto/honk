@@ -1325,3 +1325,28 @@ fn vless_udp_rides_fronts_and_vless_fronts_relay_udp() {
     assert!(crate::descriptor::chained_udp_supported(&landing));
     assert!((crate::descriptor::descriptor(landing.protocol()).supports_udp)(&landing));
 }
+
+#[test]
+fn group_front_candidates_put_selection_first_and_skip_landing() {
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        "node {\n c1: 'socks5://127.0.0.1:1'\n c2: 'socks5://127.0.0.1:2'\n c3: 'socks5://127.0.0.1:3'\n c4: 'socks5://127.0.0.1:4'\n c5: 'socks5://127.0.0.1:5'\n c6: 'socks5://127.0.0.1:6'\n}\n",
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let by = |n: &str| config.nodes.iter().find(|x| x.name == n).unwrap().clone();
+    let members: Vec<_> = ["c1", "c2", "c3", "c4", "c5", "c6"].map(by).into();
+    let names = |v: Vec<honk_config::node::Node>| v.into_iter().map(|n| n.name).collect::<Vec<_>>();
+    // Selection first, no duplicate, landing excluded, capped.
+    assert_eq!(
+        names(super::front_candidate_order(Some(by("c3")), members.clone(), by("c2").id)),
+        ["c3", "c1", "c4", "c5"]
+    );
+    assert_eq!(super::MAX_FRONT_CANDIDATES, 4);
+    // No live selection: members are still tried in order.
+    assert_eq!(
+        names(super::front_candidate_order(None, members[..2].to_vec(), Uuid::nil())),
+        ["c1", "c2"]
+    );
+    // A selection equal to the landing is dropped, never dialed.
+    assert!(super::front_candidate_order(Some(by("c1")), vec![by("c1")], by("c1").id).is_empty());
+}

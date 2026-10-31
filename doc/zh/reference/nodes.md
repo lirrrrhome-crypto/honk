@@ -715,6 +715,7 @@ group {
 - 经前置转发 UDP 支持 `trojan` 与 `vless` 落地（UDP 封装在链式流内：Trojan UDP-over-TCP；VLESS 按 `packetEncoding` 使用原生 UDP、单路 XUDP 或 UoT v2，因此连 HTTP/HTTPS 前置也能承载；UDP 走连接池 mux（Xray `mux` 独立 UDP）的链式 VLESS 节点会在拨号时被拒绝）以及 `shadowsocks`/`socks5` 落地（原生 UDP：发往落地服务器的数据报走前置自身的 UDP 通道，即 SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP，或递归经过链式/分组前置）。VMess 落地，以及没有 UDP 通道的前置（HTTP/HTTPS、VMess、关闭 UDP 的 VLESS）下的原生 UDP 落地会以明确错误拒绝；开启 UDP 的 VLESS 前置会经自身 UDP 通道转发落地的数据报；UDP 绝不会绕过前置发出。AnyTLS 不能被链（但可以作为前置）。
 - QUIC 落地（`hysteria2`、`tuic`、`juicity`）可以被链：整条 QUIC 连接（TCP 与 UDP 流）通过私有回环 UDP 桥走前置的 UDP 通道，因此前置必须能转发 UDP（SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP、QUIC 前置，或具备 UDP 的链式/分组前置）。没有 UDP 的前置（HTTP/HTTPS、VMess、VLESS）会以明确的 `cannot relay UDP` 错误拒绝，且不发送任何数据。Hysteria2 端口跳跃（`mport`/`ports`）不能被链，会被拒绝（`unsupported-detour-protocol`）；salamander 混淆可用。每次链式拨号新建 QUIC 连接（不复用 QUIC 会话），每个流多一次握手；Juicity 链式仅有单元测试覆盖（无端到端测试服务器）。
 - detour 节点不使用连接池、预连接与 warm 会话，每条流都会重新拨前置。前置流通过私有回环 socket 交给落地处理器，多一次本地拷贝。
+- 分组前置的故障切换：前置为分组时，同一次拨号先尝试分组当前选择（包括手动 selector 选择），经该前置失败（TCP 拨号、UDP 中继或 QUIC 桥接）后，再按声明顺序尝试最多三个其他普通成员。内置 `direct`/`block` 成员与落地节点自身不会作为备选；只有全部候选都失败才报错，流量绝不绕过前置。落地自身的握手在前置选定后进行，失败时不会换成员重试。
 - 落地节点的健康探测与延迟测试仍为直连，分组选择反映的是直连路径。
 - 经 detour 时不支持 REALITY 伪装证书重试。
 - `detour` 不参与[节点身份](#节点身份)：仅 `detour` 不同的两个节点会被视为重复节点。

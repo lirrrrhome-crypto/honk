@@ -215,6 +215,71 @@ fn group_front(name: &str) -> Option<Option<Node>> {
     Some(manager.select_node(name).cloned())
 }
 
+/// Most fronts tried for one dial when the front is a group: its current
+/// selection, then other members in declaration order.
+pub(crate) const MAX_FRONT_CANDIDATES: usize = 4;
+
+/// Front candidates for one dial, in try order. A group yields its current
+/// selection first and then its other ordinary member leaves, so a dead
+/// selection fails over within the same dial; built-in direct/block members
+/// and the landing itself are never added as fallbacks (no bypass). A plain
+/// node yields itself.
+pub(crate) fn resolve_front_candidates(
+    name: &str,
+    scope: Option<uuid::Uuid>,
+    generation: Option<&OutboundRuntimeRegistry>,
+    landing: uuid::Uuid,
+) -> anyhow::Result<Vec<Node>> {
+    let group = GROUP_MANAGER
+        .get()
+        .and_then(|cell| cell.read().clone())
+        .map(|shared| Arc::clone(&shared.read()))
+        .filter(|manager| manager.get_group_policy(name).is_some());
+    let Some(manager) = group else {
+        let front = resolve_front(name, scope, generation)?;
+        anyhow::ensure!(front.id != landing, "node detour resolves to itself");
+        return Ok(vec![front]);
+    };
+    let selected = manager.select_node(name).cloned();
+    let members: Vec<Node> = manager
+        .leaf_nodes_in_group(name)
+        .into_iter()
+        .cloned()
+        .collect();
+    let candidates = front_candidate_order(selected, members, landing);
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "detour front group {name:?} has no available selection"
+    );
+    Ok(candidates)
+}
+
+/// Selection first, then members; no duplicates, never the landing, and no
+/// built-in direct/block member as a fallback.
+pub(crate) fn front_candidate_order(
+    selected: Option<Node>,
+    members: Vec<Node>,
+    landing: uuid::Uuid,
+) -> Vec<Node> {
+    let mut out: Vec<Node> = Vec::new();
+    if let Some(selected) = selected.filter(|node| node.id != landing) {
+        out.push(selected);
+    }
+    for member in members {
+        if out.len() >= MAX_FRONT_CANDIDATES {
+            break;
+        }
+        if member.id == landing
+            || matches!(member.protocol(), NodeProtocol::Direct | NodeProtocol::Block)
+            || out.iter().any(|node| node.id == member.id)
+        {
+            continue;
+        }
+        out.push(member);
+    }
+    out
+}
+
 /// Resolve a front name at connect time, matching configuration validation:
 /// a group name wins and yields the group's *current* TCP selection (select,
 /// url-test, fallback, ... — whatever the policy picks right now), so a
@@ -376,8 +441,50 @@ pub(crate) fn dial_front_tcp<'a>(
             node.protocol().as_str()
         );
         let generation = generation.or_else(caller_generation);
-        let front = resolve_front(&front_name, node.subscription_id, generation.as_deref())?;
-        anyhow::ensure!(front.id != node.id, "node detour resolves to itself");
+        let fronts = resolve_front_candidates(
+            &front_name,
+            node.subscription_id,
+            generation.as_deref(),
+            node.id,
+        )?;
+        let mut last = None;
+        for front in fronts {
+            let name = front.name.clone();
+            match dial_front_once(
+                table,
+                packet,
+                generation.clone(),
+                node,
+                front,
+                connect_timeout,
+                depth,
+            )
+            .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    tracing::warn!(
+                        "detour front {name} of {} failed: {error:#}; trying next member",
+                        node.name
+                    );
+                    last = Some(error);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("detour front {front_name:?} has no candidates")))
+    })
+}
+
+/// One front attempt of [`dial_front_tcp`].
+async fn dial_front_once(
+    table: &TcpTable,
+    packet: &PacketTable,
+    generation: Option<Arc<OutboundRuntimeRegistry>>,
+    node: &Node,
+    front: Node,
+    connect_timeout: Duration,
+    depth: usize,
+) -> anyhow::Result<TcpStream> {
         let (server, server_domain) = server_target(node, &front).await?;
         tracing::debug!("Dialing {} server through detour {}", node.name, front.name);
         let front_stream = if front.detour.is_some() {
@@ -420,7 +527,6 @@ pub(crate) fn dial_front_tcp<'a>(
             }
         };
         bridge(front_stream, connect_timeout).await
-    })
 }
 
 /// QUIC landings (hysteria2, tuic, juicity) reach their server through the
@@ -653,7 +759,7 @@ impl FrontCarrier {
         }
     }
 
-    fn front(&self) -> anyhow::Result<Node> {
+    fn fronts(&self) -> anyhow::Result<Vec<Node>> {
         let name = self
             .node
             .detour
@@ -663,9 +769,12 @@ impl FrontCarrier {
             self.depth < MAX_DETOUR_DEPTH,
             "detour chain exceeds {MAX_DETOUR_DEPTH} hops (cycle?)"
         );
-        let front = resolve_front(name, self.node.subscription_id, self.generation.as_deref())?;
-        anyhow::ensure!(front.id != self.node.id, "node detour resolves to itself");
-        Ok(front)
+        resolve_front_candidates(
+            name,
+            self.node.subscription_id,
+            self.generation.as_deref(),
+            self.node.id,
+        )
     }
 
     async fn front_transport(
@@ -746,7 +855,7 @@ impl UdpCarrier for FrontCarrier {
     }
 
     async fn server(&self) -> anyhow::Result<(SocketAddr, Option<String>)> {
-        let front = self.front()?;
+        let front = self.fronts()?.swap_remove(0);
         server_target(&self.node, &front).await
     }
 
@@ -756,21 +865,36 @@ impl UdpCarrier for FrontCarrier {
         server_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::datagram_pipe::DatagramPipe> {
-        let front = self.front()?;
-        tracing::debug!(
-            "UDP of chained node {} to {} via front {}",
-            self.node.name,
-            server_domain.unwrap_or(&server.to_string()),
-            front.name
-        );
-        let transport = self
-            .front_transport(front, server, server_domain, connect_timeout)
-            .await?;
-        Ok(super::datagram_pipe::DatagramPipe::relay(
-            transport,
-            server,
-            server_domain,
-        ))
+        let mut last = None;
+        for front in self.fronts()? {
+            let name = front.name.clone();
+            tracing::debug!(
+                "UDP of chained node {} to {} via front {}",
+                self.node.name,
+                server_domain.unwrap_or(&server.to_string()),
+                name
+            );
+            match self
+                .front_transport(front, server, server_domain, connect_timeout)
+                .await
+            {
+                Ok(transport) => {
+                    return Ok(super::datagram_pipe::DatagramPipe::relay(
+                        transport,
+                        server,
+                        server_domain,
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "UDP detour front {name} of {} failed: {error:#}; trying next member",
+                        self.node.name
+                    );
+                    last = Some(error);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("detour front has no candidates")))
     }
 }
 
