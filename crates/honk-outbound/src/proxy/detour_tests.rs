@@ -1326,7 +1326,14 @@ async fn quic_udp_bridge_stops_when_guard_drops() {
     let (n, _) = server.recv_from(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"one");
     drop(guard);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Within the close grace the client's CONNECTION_CLOSE still gets out.
+    owner.send_to(b"close", bridge).await.unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"close");
+    tokio::time::sleep(super::QUIC_BRIDGE_CLOSE_GRACE + Duration::from_millis(200)).await;
     // The bridge socket is closed: further datagrams go nowhere.
     let _ = owner.send_to(b"two", bridge).await;
     assert!(

@@ -598,9 +598,22 @@ pub(crate) async fn quic_bridged_node(
 #[derive(Debug)]
 pub(crate) struct BridgeGuard(tokio::task::AbortHandle);
 
+/// Time the bridge keeps relaying after its owner drops, so the dropped QUIC
+/// client's CONNECTION_CLOSE still reaches the landing server.
+pub(crate) const QUIC_BRIDGE_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
 impl Drop for BridgeGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        let task = self.0.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    tokio::time::sleep(QUIC_BRIDGE_CLOSE_GRACE).await;
+                    task.abort();
+                });
+            }
+            Err(_) => task.abort(),
+        }
     }
 }
 
