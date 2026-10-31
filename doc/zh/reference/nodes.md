@@ -66,6 +66,8 @@ protocol|host|port|credential-fingerprint|dial-shape
 | 非空 | 以基础 ID 为命名空间、JSON 元组 `["tls-alpn", <ordered list>]` 为名称派生子 UUID v5。这将 ALPN 与任意凭据文本分离。 |
 | 空值 | 保留基础 ID。 |
 
+带 `detour` 的节点再以上述 ID 为命名空间、JSON 元组 `["detour", <前置名称>]` 为名称派生一次子 UUID v5，因此经不同前置（或直连）到达同一服务器的节点是不同节点；无 detour 的节点 ID 不变。前置按配置中的名称（节点或分组）识别，因此重命名前置、或用 `->` 链（生成的中继名称）代替具名前置，都会改变落地节点 ID；按 ID 固定该落地节点的 selector 会回到默认选择。
+
 调优参数与显示元数据不参与派生，但改变物理路径的 VLESS 多路复用上限除外。
 
 XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的规范 XHTTP 参数，包括标头、填充和 POST 间隔。输入别名、标头名称大小写与等价范围表示会在派生前规范化。新增 XHTTP 不改变已有 TCP/WS/gRPC 身份材料。
@@ -218,6 +220,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC/XHTTP 与 REALITY；handler 需要 `rprx` |
 | `vless` | — | 是 | 可配置* | 原生 UDP、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
 | `socks5` | — | 是 | 是 | CONNECT 与 UDP ASSOCIATE |
+| `http` | `https` | 是 | 否 | HTTP `CONNECT` 代理，可选 TLS（`https`）与 Basic 认证 |
 | `hysteria2` | — | 是 | 是 | QUIC/H3、salamander、brutal/BBR 与端口跳跃 |
 | `tuic` | — | 是 | 是 | QUIC 上的 TUIC v5 |
 | `juicity` | — | 是 | 是 | QUIC 上的 Juicity |
@@ -477,6 +480,12 @@ node {
 
 **升级注意：** 依赖此前 `tuic` 回退的导入节点须显式设置 `alpn: [tuic]` 才能保留旧行为。协议专用 ALPN 不改变节点 UUID，但有效配置变化会为新请求重建运行时；已有流继续遵循正常的代际退休机制。
 
+### HTTP / HTTPS 代理
+
+`http://[user:pass@]host[:port]` 拨号普通 HTTP 代理（默认端口 80）；`https://` 外包 TLS（默认端口 443，接受 `sni`、`allowInsecure`/`insecure` 等通用 TLS 参数）。用户信息转为 `Proxy-Authorization: Basic`。每个 TCP 流发送一次 `CONNECT host:port HTTP/1.1`，必须收到 2xx 响应，否则拨号失败。Clash `type: http`（HTTPS 用 `tls: true`）和 sing-box `type: http` 出站导入为同一协议；sing-box 的 `path` 与 `headers` 会被拒绝。
+
+HTTP 节点只承载 TCP，既可作落地（`http://...?dialer-proxy=front`），也可作任意 TCP 链的前置。经 HTTP 前置或发往 HTTP 落地的 UDP 会在拨号时被拒绝，绝不会绕出链路发送。
+
 ### AnyTLS
 
 | 链接输入 | 节点字段 / 行为 |
@@ -665,9 +674,77 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。目标 TLS 记录的缓冲�
 | `hysteria2://` | 上述 Hysteria2 查询参数映射；也接受 `hysteria://` |
 | `tuic://` | 上述 TUIC 用户信息与 QUIC 调优 |
 | `juicity://` | Juicity 用户信息与共用 QUIC/TLS 查询参数 |
+| `http://`、`https://` | HTTP CONNECT 代理；`https` 启用 TLS |
 | `socks5://` | SOCKS 用户信息；`socks4://` 与 `socks4a://` 也导入同一种节点协议 |
 
 对于写成 `a -> b` 的链，只解析 `a`。自动名称只来自解码后的 `#fragment`、VMess `ps` 或 `{scheme}-{host}`；解析器绝不以原始 URI 或用户信息作为回退，因此生成名称不会泄漏凭据。显式标签、片段与 `ps` 值仍由用户控制。
+
+## 链式代理（`detour` / `dialer-proxy`）
+
+TCP 节点可以先经过另一个节点或分组再连接自己的服务器。在分享链接中添加 `dialer-proxy` 查询参数（别名 `dialer_proxy`、`detour`），或在结构化节点中写 `detour` 字段（别名 `dialer-proxy`）：
+
+```dae
+node {
+    front: 'socks5://10.0.0.1:1080'
+    # 先经 front 连到 land，流量最终从 land 出口。
+    land: 'trojan://secret@land.example:443?sni=land.example&dialer-proxy=front'
+    # 也可以写分组名：前置跳为该分组当前的 TCP 选择。
+    land2: 'ss://YWVzLTI1Ni1nY206cHc@203.0.113.5:8388?detour=fronts'
+}
+group {
+    fronts { filter: name(front) policy: min_moving_avg }
+}
+```
+
+该参数在解析前从链接中移除（大小写不敏感，支持百分号解码），在 `a -> b` 链中只有最后一跳（最右侧）可以携带它。前置节点自身也可以再有前置（最多 8 跳）。名称优先匹配分组，其次匹配节点名：来自订阅的节点先在同一订阅内查找，同订阅内唯一即采用；否则在全部节点中查找，必须全局唯一。
+
+校验会拒绝：
+
+| 代码 | 含义 |
+|---|---|
+| `unknown-detour-target` | 不存在该名称的分组或节点 |
+| `ambiguous-detour-target` | 同一订阅内没有唯一匹配，且全局有多个同名节点（或同一订阅内本身重名）；请改用分组或重命名 |
+| `detour-cycle` | 链路回到自身，包括经由包含该节点的分组 |
+| `unsupported-detour-protocol` | 被链节点不是基于 TCP 的协议（见下文） |
+| `invalid-detour` | 内置 `direct`/`block` 不能设置 detour |
+
+**订阅中的无效 detour。** 来自订阅的节点若 detour 指向自身、成环、或找不到唯一的目标（`detour-cycle`、`unknown-detour-target`、`ambiguous-detour-target`），只丢弃该节点（依赖它作前置的同订阅节点随之被丢弃），每个被丢弃的节点记录一条 `dropped-invalid-detour` 警告诊断，其余节点照常加载。若订阅的全部节点都无效，则整次订阅更新仍被拒绝。手写配置中的同类错误仍然直接报错。
+
+支持作为落地（被链）节点的协议：`socks5`、`shadowsocks`、`trojan`、`hysteria2`（不含端口跳跃）、`tuic`、`juicity`、`vmess`，以及直连 TCP 路径的 `vless`（不含 XHTTP、H2 或共享载体 mux）。任何节点或分组都可以作为前置。
+
+限制（MVP）：
+
+- 经前置转发 UDP 支持 `trojan` 与 `vless` 落地（UDP 封装在链式流内：Trojan UDP-over-TCP；VLESS 按 `packetEncoding` 使用原生 UDP、单路 XUDP 或 UoT v2，因此连 HTTP/HTTPS 前置也能承载；UDP 走连接池 mux（Xray `mux` 独立 UDP）的链式 VLESS 节点会在拨号时被拒绝）以及 `shadowsocks`/`socks5` 落地（原生 UDP：发往落地服务器的数据报走前置自身的 UDP 通道，即 SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP，或递归经过链式/分组前置）。VMess 落地，以及没有 UDP 通道的前置（HTTP/HTTPS、VMess、关闭 UDP 的 VLESS）下的原生 UDP 落地会以明确错误拒绝；开启 UDP 的 VLESS 前置会经自身 UDP 通道转发落地的数据报；UDP 绝不会绕过前置发出。AnyTLS 不能被链（但可以作为前置）。
+- QUIC 落地（`hysteria2`、`tuic`、`juicity`）可以被链：整条 QUIC 连接（TCP 与 UDP 流）通过私有回环 UDP 桥走前置的 UDP 通道，因此前置必须能转发 UDP（SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP、QUIC 前置，或具备 UDP 的链式/分组前置）。没有 UDP 的前置（HTTP/HTTPS、VMess、VLESS）会以明确的 `cannot relay UDP` 错误拒绝，且不发送任何数据。Hysteria2 端口跳跃（`mport`/`ports`）不能被链，会被拒绝（`unsupported-detour-protocol`）；salamander 混淆可用。每次链式拨号新建 QUIC 连接（不复用 QUIC 会话），每个流多一次握手；Juicity 链式仅有单元测试覆盖（无端到端测试服务器）。
+- detour 节点不使用连接池、预连接与 warm 会话，每条流都会重新拨前置。前置流通过私有回环 socket 交给落地处理器，多一次本地拷贝。
+- 分组到分组链：落地分组的成员可以经由分组前置，前置分组还可以嵌套其他分组（`filter: group(...)`）；每次拨号先解析落地分组的选择，再解析前置分组的选择（含嵌套选择），并按上述规则故障切换。经由任何分组形成的环（例如前置分组嵌套了落地分组）会以 `detour-cycle` 拒绝。不存在分组级 `detour` 键，前置写在每个成员节点上。
+- 分组前置的故障切换：前置为分组时，同一次拨号先尝试分组当前选择（包括手动 selector 选择），经该前置失败（TCP 拨号、UDP 中继或 QUIC 桥接）后，再按声明顺序尝试最多三个其他普通成员。内置 `direct`/`block` 成员与落地节点自身不会作为备选；只有全部候选都失败才报错，流量绝不绕过前置。落地自身的握手在前置选定后进行，失败时不会换成员重试。
+- 落地节点的健康探测与延迟测试仍为直连，分组选择反映的是直连路径。
+- 经 detour 时不支持 REALITY 伪装证书重试。
+- `detour` 按前置名称参与[节点身份](#节点身份)：仅 `detour` 不同的两个节点是不同节点；升级后每个链式节点的 ID 会变化一次。
+- 运行时分组成员变化才可能形成静态检查未发现的环，由拨号时的 8 跳上限兜底。
+- base64 形式的 `vmess://` 链接无法携带该参数，请改用 `->` 链、裸名称声明或结构化节点。
+
+### 同一条链的三种写法
+
+同一条链可以用三种语法表达，内部都设置相同的 `detour`（测试会比较解析后的链）。落地节点始终是你所选择的节点，前置节点最先被拨号。
+
+| | sing-box / Clash | dae `->` | 分享链接 |
+|---|---|---|---|
+| 位置 | sing-box outbound `"detour": "front"`；Clash/mihomo 代理 `dialer-proxy: front`（订阅与导入文件） | `node { }` 条目或订阅行，左边为落地，右边最先拨号 | 查询参数 `dialer-proxy=`（别名 `dialer_proxy`、`detour`） |
+| 前置为节点 | `{"tag":"land",...,"detour":"front"}` | `land: 'trojan://...@land:443 -> front'` | `trojan://...@land:443?dialer-proxy=front#land` |
+| 前置为分组 | `"detour": "fronts"`（selector/urltest 标签，见下文） | `land: 'trojan://... -> fronts'` | `?dialer-proxy=fronts` |
+| 已有节点 | 不适用 | `land -> front`（两侧都是裸名称） | 不适用 |
+| 内联中继 | 不适用 | `land: 'trojan://... -> ss://... -> socks5://...'` | 不适用 |
+
+**`->` 中裸名称与链接的区分。** 一跳当且仅当包含 `://` 时视为分享链接；否则视为节点或分组名称，解析规则与 `detour` 相同（先匹配分组，再匹配唯一的节点名）。
+
+- 名称只能作为**最后一跳**（最右侧），它成为其左侧链接的 detour。位于链接之间的名称（`a -> name -> b`）会被拒绝，因为那会改变另一个节点的链。
+- 名称作为**第一跳**（`my_node -> proxy_group`）可出现在 `node { }` 条目或 URI 列表订阅的一行中。它不新增节点，而是为同一节（或同一订阅，任意行，可在节点之前）中的节点 `my_node` 声明 detour；其后的中继可以是链接，也可以以名称结尾。`node { }` 中条目标签必须为空或等于 `my_node`。订阅中若名称不存在、匹配多个节点、或与已有 detour 冲突，该行以警告忽略，其余节点照常导入。
+
+**重复与冲突。** 同一节点的 detour 可以来自多处：自身的 `dialer-proxy=`、自身的 `->` 链以及裸名称声明。完全相同的声明会被接受，不同的声明报错 `conflicting-detour`。同一链接或 Clash 代理中的 `dialer-proxy`、`dialer_proxy`、`detour` 必须一致；导入的代理若写法不一致，会被丢弃并给出诊断。
+
+**导入。** sing-box outbound 的 tag 与 Clash 代理的 name 会成为节点名，因此指向同一文件中其他 outbound 的 `detour`/`dialer-proxy` 能保留链关系。sing-box 的 `selector`/`urltest` 与 Clash 的 `proxy-groups` **不会**作为分组导入：指向它们的 detour 只有在你的配置中存在同名分组时才能解析，否则校验报 `unknown-detour-target`。带 detour 且启用端口跳跃的导入 Hysteria2 代理会被丢弃并给出诊断；其他 QUIC 代理保留 detour。
 
 ## 相关文档
 

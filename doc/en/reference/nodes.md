@@ -66,6 +66,8 @@ Plaintext VLESS has a different identity from TLS. A REALITY key selects the aut
 | Nonempty | Derive a child UUID v5 with the base ID as namespace and the JSON tuple `["tls-alpn", <ordered list>]` as name. This separates ALPN from arbitrary credential text. |
 | Empty | Retain the base ID. |
 
+A node with a `detour` derives one more child UUID v5 from that ID with the JSON tuple `["detour", <front name>]` as name, so the same server reached through different fronts (or directly) is a different node; nodes without a detour keep their IDs. The front is identified by its configured name (node or group), so renaming a front, or writing a chain with `->` (generated relay names) instead of named fronts, changes the landing's ID; a selector that pinned that landing by ID falls back to its default.
+
 Tuning and display metadata do not participate, except VLESS multiplex limits that change a physical path.
 
 For XHTTP, identity also includes the effective TLS/plaintext posture and every accepted canonical XHTTP option, including headers, padding and POST pacing. Input aliases, header-name casing and equivalent range representations normalize before derivation. Existing TCP/WS/gRPC identity material is unchanged by adding XHTTP.
@@ -218,6 +220,7 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | `vmess` | — | Yes | No | AEAD; TCP/WS/gRPC/XHTTP and REALITY; handler requires `rprx` |
 | `vless` | — | Yes | Configurable* | Native UDP, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
 | `socks5` | — | Yes | Yes | CONNECT and UDP ASSOCIATE |
+| `http` | `https` | Yes | No | HTTP `CONNECT` proxy, optional TLS (`https`) and Basic auth |
 | `hysteria2` | — | Yes | Yes | QUIC/H3, salamander, brutal/BBR, and port hopping |
 | `tuic` | — | Yes | Yes | TUIC v5 over QUIC |
 | `juicity` | — | Yes | Yes | Juicity over QUIC |
@@ -480,6 +483,12 @@ Original Clash/Mihomo `proxies` entries materialize `h3` when TUIC `alpn` is mis
 
 **Upgrade:** imported TUIC nodes that relied on the previous `tuic` fallback must specify `alpn: [tuic]` to retain it. The protocol-specific ALPN does not change the node UUID, but an effective configuration change replaces its runtime for new work; existing flows retain the normal generation-retirement behavior.
 
+### HTTP / HTTPS proxy
+
+`http://[user:pass@]host[:port]` dials a plain HTTP proxy (default port 80); `https://` wraps it in TLS (default port 443, accepts `sni`, `allowInsecure`/`insecure` and the common TLS parameters). Userinfo becomes `Proxy-Authorization: Basic`. Each TCP flow sends one `CONNECT host:port HTTP/1.1` and needs a 2xx reply; anything else fails the dial. Clash `type: http` (with `tls: true` for HTTPS) and sing-box `type: http` outbounds import into the same protocol; sing-box `path` and `headers` are rejected.
+
+HTTP nodes carry TCP only. They work as a landing (`http://...?dialer-proxy=front`) and as a front for any TCP chain. UDP through an HTTP front, or to an HTTP landing, is refused at dial time; it is never sent outside the chain.
+
 ### AnyTLS
 
 | Link input | Node field / behavior |
@@ -668,9 +677,77 @@ A static config offers real ECH and ECH rejection fails the handshake closed. Di
 | `hysteria2://` | Hysteria2 query mapping above; `hysteria://` is also accepted |
 | `tuic://` | TUIC userinfo and QUIC tuning above |
 | `juicity://` | Juicity userinfo and shared QUIC/TLS queries |
+| `http://`, `https://` | HTTP CONNECT proxy; `https` enables TLS |
 | `socks5://` | SOCKS userinfo; `socks4://` and `socks4a://` are accepted into the same node protocol |
 
 For a chain written as `a -> b`, only `a` is parsed. Automatic names come only from a decoded `#fragment`, VMess `ps`, or `{scheme}-{host}`; the parser never uses the raw URI or userinfo as a fallback, so credentials do not leak into generated names. Explicit tags, fragments, and `ps` values remain user-controlled.
+
+## Chained proxies (`detour` / `dialer-proxy`)
+
+A TCP node can open its server connection *through* another node or a group. Add a `dialer-proxy` (aliases: `dialer_proxy`, `detour`) query parameter to the share link, or a `detour` (alias `dialer-proxy`) field to a structured node:
+
+```dae
+node {
+    front: 'socks5://10.0.0.1:1080'
+    # land is reached through front; traffic then leaves from land.
+    land: 'trojan://secret@land.example:443?sni=land.example&dialer-proxy=front'
+    # A group name works too: the group's current TCP selection is the front.
+    land2: 'ss://YWVzLTI1Ni1nY206cHc@203.0.113.5:8388?detour=fronts'
+}
+group {
+    fronts { filter: name(front) policy: min_moving_avg }
+}
+```
+
+The parameter is removed from the link before parsing (case-insensitive, percent-decoded) and in an `a -> b` chain only the last (rightmost) hop may carry it. A front may itself have a front (up to 8 hops). Names resolve to a group first, then to a node name: a subscription node first looks inside its own subscription and takes a unique match there; otherwise the name must be unique across all nodes.
+
+Validation rejects:
+
+| Code | Meaning |
+|---|---|
+| `unknown-detour-target` | No group or node has that name |
+| `ambiguous-detour-target` | No unique match in the node's own subscription and several nodes share the name globally (or it is duplicated inside the subscription); use a group or rename |
+| `detour-cycle` | A chain returns to a node, including through a group that contains the node |
+| `unsupported-detour-protocol` | The chained node is not TCP-carried (see below) |
+| `invalid-detour` | Builtin `direct`/`block` cannot carry a detour |
+
+**Invalid detours in subscriptions.** A subscription node whose detour names itself, forms a cycle, or names no unique target (`detour-cycle`, `unknown-detour-target`, `ambiguous-detour-target`) is dropped alone (same-subscription nodes fronted by it are dropped in turn), with one `dropped-invalid-detour` warning diagnostic per dropped node; the rest load normally. If every node of the subscription is invalid, the update is still rejected. The same errors in hand-written configuration still fail validation.
+
+Supported chained (landing) protocols: `socks5`, `shadowsocks`, `trojan`, `hysteria2` (without port hopping), `tuic`, `juicity`, `vmess`, and `vless` over a direct TCP path (no XHTTP, H2 or shared-carrier mux). Any node or group can be the front.
+
+Limitations (MVP):
+
+- UDP through a front is supported for `trojan` and `vless` landings (UDP inside the chained stream: Trojan UDP-over-TCP; VLESS native UDP, single XUDP or UoT v2 per `packetEncoding`, so even an HTTP/HTTPS front carries it; a chained VLESS node whose UDP would use a pooled mux (Xray `mux` separate UDP) is refused at dial time) and for `shadowsocks`/`socks5` landings (native UDP: their datagrams to the landing server ride the front's own UDP path, i.e. SOCKS5 UDP ASSOCIATE, Shadowsocks UDP, Trojan UDP-over-TCP, or a chained/group front recursively). VMess landings and fronts without a UDP path (HTTP/HTTPS, VMess, or VLESS with UDP disabled) refuse native-UDP landings with a clear error; a VLESS front with UDP enabled relays the landing's datagrams over its own UDP path; UDP is never sent around the front. AnyTLS cannot be chained (it may still be the front).
+- QUIC landings (`hysteria2`, `tuic`, `juicity`) can be chained: the whole QUIC connection (TCP and UDP flows) runs over the front's UDP path through a private loopback UDP bridge, so the front must relay UDP (SOCKS5 UDP ASSOCIATE, Shadowsocks UDP, Trojan UDP-over-TCP, a QUIC front, or a chained/group front with one). A front without UDP (HTTP/HTTPS, VMess, VLESS) is refused with a clear `cannot relay UDP` error and nothing is sent. Hysteria2 port hopping (`mport`/`ports`) cannot be chained and is rejected (`unsupported-detour-protocol`); salamander obfuscation works. Each chained dial builds a fresh QUIC connection (no QUIC session reuse), adding a handshake per flow; Juicity chaining is covered by unit tests only (no end-to-end test server).
+- Detour nodes skip connection pooling, preconnect and warm sessions; each flow dials its front fresh. The front stream is bridged to the landing handler through a private loopback socket, costing one local copy.
+- Group-to-group chains: a landing group's members may detour through a group, and that front group may nest other groups (`filter: group(...)`); each dial resolves the landing group's selection, then the front group's selection (nested selections included) with the failover above. A cycle through any group (for example a front group nesting the landing group) is rejected as `detour-cycle`. There is no group-level `detour` key: the detour is set on each member node.
+- Group front failover: when the front is a group, one dial tries the group's current selection first (an explicit selector choice included), then up to three other ordinary members in declaration order, if the attempt through the front fails (TCP dial, UDP relay or QUIC bridge). Built-in `direct`/`block` members and the landing itself are never used as fallbacks, and the dial fails only after every candidate failed, so traffic never bypasses the front. The landing's own handshake runs after the front is chosen and is not retried on another member.
+- Health probes and latency tests of the landing node still connect directly, so group selection reflects the direct path.
+- The REALITY mask-certificate retry is not available through a detour.
+- `detour` is part of [node identity](#node-identity) by front name: two nodes that differ only in `detour` are distinct; upgrading changes the ID of every chained node once.
+- Group membership that changes at runtime can only form a cycle the static check missed; the 8-hop limit stops it at dial time.
+- Base64 `vmess://` links cannot carry the parameter; use a `->` chain, a bare-name declaration or a structured node instead.
+
+### One chain, three syntaxes
+
+The same chain can be written three ways; all of them set the same internal `detour` (tests compare the resolved chains). The landing is always the node you select; the front is dialed first.
+
+| | sing-box / Clash | dae `->` | Share link |
+|---|---|---|---|
+| Where | sing-box outbound `"detour": "front"`; Clash/mihomo proxy `dialer-proxy: front` (subscriptions and imported files) | `node { }` entry or subscription line, left = landing, right = dialed first | query parameter `dialer-proxy=` (aliases `dialer_proxy`, `detour`) |
+| Node front | `{"tag":"land",...,"detour":"front"}` | `land: 'trojan://...@land:443 -> front'` | `trojan://...@land:443?dialer-proxy=front#land` |
+| Group front | `"detour": "fronts"` (a selector/urltest tag, see below) | `land: 'trojan://... -> fronts'` | `?dialer-proxy=fronts` |
+| Existing node | n/a | `land -> front` (bare names on both sides; `node { }` or subscription line) | n/a |
+| Inline relays | n/a | `land: 'trojan://... -> ss://... -> socks5://...'` | n/a |
+
+**Bare names versus links in `->`.** A hop is a share link exactly when it contains `://`; anything else is a name of a node or group, resolved like `detour` (group first, then a unique node name).
+
+- A name may only be the **last** (rightmost) hop. It becomes the detour of the link to its left. A name between links (`a -> name -> b`) is rejected because it would change another node's chain.
+- A name as the **first** hop (`my_node -> proxy_group`) is allowed as a `node { }` entry or as a line of a URI-list subscription. It adds no node; it declares the detour of the node `my_node` from the same section (or the same subscription, on any line, also before the node). The relays after it may be links or end with a name. In `node { }` the entry tag must be empty or equal `my_node`. In a subscription, a line whose name is missing, matches several nodes or conflicts with an existing detour is ignored with a warning; the other nodes still load.
+
+**Duplicates and conflicts.** One node may receive its detour from several places: its own `dialer-proxy=`, its own `->` chain, and bare-name declarations. Identical declarations are accepted. Different ones fail with `conflicting-detour`. Within one link or Clash proxy, `dialer-proxy`, `dialer_proxy` and `detour` must agree; an imported proxy whose spellings disagree is dropped with a diagnostic.
+
+**Imports.** sing-box outbound tags and Clash proxy names become node names, so a `detour`/`dialer-proxy` that names another outbound in the same file keeps the chain. sing-box `selector`/`urltest` outbounds and Clash `proxy-groups` are **not** imported as groups. A detour naming one resolves only if your configuration has a group with that name; otherwise validation reports `unknown-detour-target`. Imported Hysteria2 proxies with port hopping and a detour are dropped with a diagnostic; other QUIC proxies keep their detour.
 
 ## Related docs
 
