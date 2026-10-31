@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::transport_quality::TransportQuality;
 
-use super::endpoint::{clamp_quic_payload_size, client_endpoint_with_mtu};
+use super::endpoint::{clamp_quic_payload_size, client_endpoint_for_server};
 use super::metrics::{QuicClientConnectionMonitor, spawn_quic_client_connection_monitor};
 use super::{
     AdaptiveFlowProfiles, QUIC_SAMPLE_INTERVAL, QuicClient, QuicConnState, State, TrackedConnection,
@@ -261,7 +261,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 let endpoint =
                     crate::runtime::new_owned_quic_endpoint(|| match &self.endpoint_factory {
                         Some(factory) => factory(ipv6),
-                        None => client_endpoint_with_mtu(ipv6, self.mtu),
+                        None => client_endpoint_for_server(server_addr, self.mtu),
                     })
                     .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?;
                 if let Some(selection) = selection {
