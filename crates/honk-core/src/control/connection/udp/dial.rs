@@ -197,6 +197,12 @@ impl ControlPlaneHandle {
                             flow_transport.await
                         }
                     };
+                    // Chained fronts share out the time this UDP dial is
+                    // actually allowed, not a single connect_timeout.
+                    let operation = honk_outbound::proxy::detour::with_chain_deadline(
+                        transport_deadline,
+                        operation,
+                    );
                     #[cfg(feature = "native-api")]
                     let result = match native_attempt
                         .as_ref()

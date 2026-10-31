@@ -1769,3 +1769,57 @@ async fn last_front_candidate_is_not_starved_by_the_caller_bound() {
     );
     drop(result);
 }
+
+/// Forwards TCP to `to` after holding each new connection for `delay`.
+async fn slow_relay(to: SocketAddr, delay: Duration) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let mut outbound = tokio::net::TcpStream::connect(to).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    addr
+}
+
+/// A slow but healthy front needs more than `connect_timeout`: the 1×T
+/// default cuts it, while a caller that allows longer (UDP connection
+/// dials allow `overall_dial_timeout`) passes its deadline and succeeds.
+#[tokio::test]
+async fn caller_deadline_extends_the_chain_budget_for_slow_fronts() {
+    let _serial = SERIAL.lock().await;
+    let land = Arc::new(Log::default());
+    let land_real = socks_server(Arc::new(AtomicBool::new(true)), None, Arc::clone(&land)).await;
+    let land_alias = SocketAddr::from(([192, 0, 2, 1], land_real.port()));
+    let good = socks_server(
+        Arc::new(AtomicBool::new(true)),
+        Some((land_alias, land_real)),
+        Arc::new(Log::default()),
+    )
+    .await;
+    let timeout = Duration::from_millis(300);
+    let slow = slow_relay(good, timeout * 2).await;
+    let http = http_server().await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n slowf: 'socks5://{slow}'\n slowl: 'socks5://{land_alias}?detour=slowf'\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let land_id = node_id(&config, "slowl");
+    let dial = || registry.dial_runtime(Arc::clone(&generation), land_id, http, None, timeout);
+    assert!(dial().await.is_err(), "1×T default cuts the slow front");
+    let deadline = tokio::time::Instant::now() + timeout * 4;
+    let mut stream = super::with_chain_deadline(deadline, dial())
+        .await
+        .expect("the caller's longer deadline lets the slow front finish");
+    http_204(&mut stream).await;
+}
