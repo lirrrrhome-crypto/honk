@@ -1588,3 +1588,53 @@ async fn hanging_group_front_still_fails_over_in_order() {
     assert_eq!(good_log.targets.lock().len(), 1);
     assert!(started.elapsed() < timeout * super::CHAIN_BUDGET_FACTOR + Duration::from_millis(300));
 }
+
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|dir| dir.count())
+        .unwrap_or(0)
+}
+
+/// Churning QUIC bridges at a high rate: each dropped bridge lingers only
+/// for the close grace, so live sockets stay bounded by rate × grace and
+/// all of them are released shortly after the churn stops.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_bridge_churn_releases_sockets_after_the_grace() {
+    let _serial = SERIAL.lock().await;
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = server.local_addr().unwrap();
+    let baseline = open_fds();
+    let started = tokio::time::Instant::now();
+    let mut peak = 0;
+    for _ in 0..1000 {
+        let pipe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        pipe.connect(target).await.unwrap();
+        let (_addr, guard) =
+            super::udp_bridge(crate::proxy::datagram_pipe::DatagramPipe::Socket(pipe))
+                .await
+                .unwrap();
+        drop(guard);
+        peak = peak.max(open_fds());
+    }
+    let churn = started.elapsed();
+    tokio::time::sleep(super::QUIC_BRIDGE_CLOSE_GRACE + Duration::from_millis(700)).await;
+    let after = open_fds();
+    eprintln!("CHURN churn={churn:?} baseline={baseline} peak={peak} after={after}");
+    assert!(
+        after <= baseline + 40,
+        "bridges leaked: {baseline} -> {after}"
+    );
+}
+
+#[tokio::test]
+async fn chain_deadline_saturates_on_absurd_connect_timeouts() {
+    for timeout in [
+        Duration::ZERO,
+        Duration::MAX,
+        Duration::from_secs(u64::MAX / 2),
+    ] {
+        let deadline = super::chain_deadline(timeout);
+        assert!(deadline >= tokio::time::Instant::now() - Duration::from_secs(1));
+    }
+}

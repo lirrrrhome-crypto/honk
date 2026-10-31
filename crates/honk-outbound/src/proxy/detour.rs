@@ -236,7 +236,17 @@ tokio::task_local! {
 fn chain_deadline(connect_timeout: Duration) -> tokio::time::Instant {
     CHAIN_DEADLINE
         .try_with(|deadline| *deadline)
-        .unwrap_or_else(|_| tokio::time::Instant::now() + connect_timeout * CHAIN_BUDGET_FACTOR)
+        .unwrap_or_else(|_| {
+            let now = tokio::time::Instant::now();
+            // An absurd configured timeout saturates rather than overflowing.
+            let far = Duration::from_secs(u32::MAX.into());
+            let budget = connect_timeout
+                .checked_mul(CHAIN_BUDGET_FACTOR)
+                .unwrap_or(far);
+            now.checked_add(budget)
+                .or_else(|| now.checked_add(far))
+                .unwrap_or(now)
+        })
 }
 
 /// Run `dial` under the chain deadline (inherited or fresh), failing with a
