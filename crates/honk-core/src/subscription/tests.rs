@@ -1069,5 +1069,121 @@ proxies:
     assert_eq!(j.detour.as_deref(), Some("K"));
 
     let bad = r#"{"outbounds":[{"type":"http","tag":"P","server":"10.0.0.5","server_port":80,"path":"/x"}]}"#;
-    assert!(parse(SubscriptionType::Simple, bad).map(|n| n.is_empty()).unwrap_or(true));
+    assert!(
+        parse(SubscriptionType::Simple, bad)
+            .map(|n| n.is_empty())
+            .unwrap_or(true)
+    );
+}
+
+/// Seeded mutation fuzz of every subscription shape: parsing never panics and
+/// every accepted chained node can actually ride its front (a node that kept
+/// a detour it cannot honour would fail open or be refused at dial time).
+#[test]
+fn mutated_subscriptions_never_accept_unchainable_detours() {
+    use rand::{RngExt, SeedableRng};
+    let id = "00000000-0000-0000-0000-000000000001";
+    let seeds = [
+        "trojan://pw@1.2.3.4:443?sni=a&dialer-proxy=Mid#Land\nsocks5://5.6.7.8:1080?detour=Front#Mid\nsocks5://9.9.9.9:1080#Front\nLand -> Front\n".to_string(),
+        format!(
+            "vless://{id}@1.2.3.4:443?encryption=none#V -> ss://YWVzLTI1Ni1nY206cHc@9.9.9.9:8388#S\nhysteria2://pw@1.2.3.4:443?sni=a&mport=443-450#H\nanytls://pw@1.2.3.4:443#A\nH -> S\nA -> S\n"
+        ),
+        "proxies:\n  - {name: Land, type: trojan, server: l.example, port: 443, password: pw, dialer-proxy: Front}\n  - {name: Front, type: socks5, server: 1.1.1.1, port: 1080}\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, ports: 443-450, dialer-proxy: Front}\n  - {name: X, type: vless, server: x.example, port: 443, uuid: 00000000-0000-0000-0000-000000000001, network: xhttp, dialer-proxy: Front}\n".to_string(),
+        r#"{"version":1,"servers":[{"server":"1.2.3.4","server_port":8388,"password":"pw","method":"aes-256-gcm","remarks":"s"}]}"#.to_string(),
+    ];
+    let tokens: [&[u8]; 12] = [
+        b" -> ",
+        b"->",
+        b"&dialer-proxy=Front",
+        b"?detour=Mid",
+        b"#Front",
+        b"\n",
+        b"dialer-proxy: Land",
+        b"&mport=1-9",
+        b"&type=xhttp",
+        b"anytls://p@h:1#Mid",
+        b"Front -> Land\n",
+        b"\x00",
+    ];
+    let types = [
+        SubscriptionType::Simple,
+        SubscriptionType::Clash,
+        SubscriptionType::Sip008,
+        SubscriptionType::Custom,
+    ];
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_cafe);
+    for round in 0..6000 {
+        let mut data = seeds[round % seeds.len()].clone().into_bytes();
+        for _ in 0..rng.random_range(1..6) {
+            let at = rng.random_range(0..=data.len());
+            match rng.random_range(0..3) {
+                0 => {
+                    let token = tokens[rng.random_range(0..tokens.len())];
+                    data.splice(at..at, token.iter().copied());
+                }
+                1 if !data.is_empty() => {
+                    let end = (at + rng.random_range(1..16)).min(data.len());
+                    data.drain(at.min(data.len() - 1)..end.max(at.min(data.len() - 1)));
+                }
+                _ => data.insert(at, rng.random()),
+            }
+        }
+        let Ok(text) = String::from_utf8(data) else {
+            continue;
+        };
+        for sub_type in types {
+            let sub = Subscription {
+                sub_type,
+                ..Default::default()
+            };
+            let mut diagnostics = Vec::new();
+            let Ok(nodes) =
+                parse_subscription_content_with_diagnostics(&sub, &text, &mut diagnostics)
+            else {
+                continue;
+            };
+            for node in &nodes {
+                assert!(!node.id.is_nil(), "{text:?}");
+                assert_eq!(node.id, node.derive_id(), "{sub_type:?} {text:?}");
+                if node.detour.is_some() {
+                    assert!(
+                        node.supports_detour(),
+                        "{sub_type:?} accepted unchainable {:?} {:?}: {text:?}",
+                        node.protocol(),
+                        node.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One share-link line whose own `dialer-proxy` its protocol cannot ride is
+/// ignored with a warning; the rest of the subscription still loads.
+#[test]
+fn unchainable_dialer_proxy_line_is_ignored_not_fatal() {
+    for bad in [
+        "anytls://pw@1.2.3.4:443?dialer-proxy=Front#Bad",
+        "hysteria2://pw@1.2.3.4:443?mport=443-450&dialer-proxy=Front#Bad",
+    ] {
+        let body = format!(
+            "socks5://9.9.9.9:1080#Front\n{bad}\nsocks5://8.8.8.8:1080?dialer-proxy=Front#Good\n"
+        );
+        let sub = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        let mut diagnostics = Vec::new();
+        let nodes =
+            parse_subscription_content_with_diagnostics(&sub, &body, &mut diagnostics).unwrap();
+        let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["Front", "Good"], "{bad}");
+        let config = honk_config::Config {
+            nodes,
+            ..Default::default()
+        };
+        config
+            .validate_detailed()
+            .expect("remaining nodes validate");
+    }
 }

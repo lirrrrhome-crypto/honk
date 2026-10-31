@@ -845,7 +845,23 @@ fn parse_uri_subscription(
             });
         // dae `->` chains: relays get generated names that avoid every name
         // seen so far in this subscription, or reuse an identical node.
+        // A line whose own `dialer-proxy`/`detour` names a front its protocol
+        // cannot ride is ignored like any other bad entry; kept, it would
+        // fail validation of the whole merged subscription.
         let result = result.and_then(|chain| {
+            if std::iter::once(&chain.landing)
+                .chain(&chain.relays)
+                .any(|node| node.detour.is_some() && !node.supports_detour())
+            {
+                return Err(honk_config::error::DetailedConfigError::new(
+                    ErrorCategory::Validation,
+                    "unsupported-detour-protocol",
+                    honk_config::diagnostic::DiagnosticSources::new(None).root(),
+                    honk_config::diagnostic::SettingPath::new("nodes").field("detour"),
+                    "dialer-proxy/detour is unsupported for this protocol (anytls, xhttp, \
+                     hysteria2 port hopping); line ignored",
+                ));
+            }
             namer.link(chain).map_err(|message| {
                 honk_config::error::DetailedConfigError::new(
                     ErrorCategory::Validation,
@@ -884,7 +900,8 @@ fn parse_uri_subscription(
         }
     }
     for (ordinal, hops) in declarations {
-        if let Err(message) = apply_subscription_declaration(&hops, &mut namer, &mut outcomes, ordinal)
+        if let Err(message) =
+            apply_subscription_declaration(&hops, &mut namer, &mut outcomes, ordinal)
         {
             let mut diagnostic = honk_config::error::DetailedConfigError::new(
                 ErrorCategory::Validation,
@@ -927,12 +944,16 @@ fn apply_subscription_declaration(
     let index = match (matches.next(), matches.next()) {
         (Some((index, _)), None) => index,
         (Some(_), Some(_)) => {
-            return Err("node chain (->): the bare-name landing matches several nodes \
-                        of this subscription; line ignored");
+            return Err(
+                "node chain (->): the bare-name landing matches several nodes \
+                        of this subscription; line ignored",
+            );
         }
         _ => {
-            return Err("node chain (->): the bare-name landing is not a node of this \
-                        subscription; line ignored");
+            return Err(
+                "node chain (->): the bare-name landing is not a node of this \
+                        subscription; line ignored",
+            );
         }
     };
     let rest = &hops[1..];
@@ -940,8 +961,10 @@ fn apply_subscription_declaration(
         (Vec::new(), Some(rest[0].clone()))
     } else {
         if honk_config::share_link::is_bare_name(&rest[0]) {
-            return Err("node chain (->): a bare node/group name hop must be the last \
-                        (rightmost) hop; line ignored");
+            return Err(
+                "node chain (->): a bare node/group name hop must be the last \
+                        (rightmost) hop; line ignored",
+            );
         }
         let chain = Node::from_share_link_chain_with_detailed_diagnostics_emit(
             &rest.join(" -> "),
@@ -967,8 +990,10 @@ fn apply_subscription_declaration(
     let mut linked = namer.link(honk_config::share_link::ShareLinkChain { landing, relays })?;
     let landing = linked.remove(0);
     if previous.is_some() && landing.detour != previous {
-        return Err("node chain (->): conflicting detour declarations for the same node \
-                    (identical repeats are fine); line ignored");
+        return Err(
+            "node chain (->): conflicting detour declarations for the same node \
+                    (identical repeats are fine); line ignored",
+        );
     }
     outcomes[index].kind = IndexedOutcomeKind::Node(landing);
     for mut relay in linked {
