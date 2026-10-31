@@ -36,6 +36,17 @@ for arg in "$@"; do
         # rustc passes these for aarch64-linux-gnu; zig's linker driver
         # rejects them (lld handles the errata workarounds itself).
         -Wl,--fix-cortex-a53-843419 | -Wl,--fix-cortex-a53-835769) ;;
+        # Under RUSTFLAGS=-Zsanitizer=..., cc/cmake forward -fsanitize to C
+        # code, but zig ships no sanitizer runtime, so CMake's try-compile
+        # links fail on __asan_init. Build C/C++ uninstrumented; Rust code
+        # stays instrumented and rustc links its own runtime.
+        -fsanitize=* | -fsanitize-*=* | -fno-sanitize=*) ;;
+        # rustc passes its sanitizer runtime as `-Wl,<path>.a` (inside
+        # --whole-archive); zig only accepts archives as plain inputs.
+        -Wl,*.a)
+            kept="$kept
+${arg#-Wl,}"
+            ;;
         *)
             kept="$kept
 $arg"

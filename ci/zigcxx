@@ -18,6 +18,14 @@ for arg in "$@"; do
         # rustc passes these for aarch64-linux-gnu; zig's linker driver
         # rejects them (lld handles the errata workarounds itself).
         -Wl,--fix-cortex-a53-843419 | -Wl,--fix-cortex-a53-835769) ;;
+        # zig ships no sanitizer runtime: build C++ uninstrumented (see zigcc).
+        -fsanitize=* | -fsanitize-*=* | -fno-sanitize=*) ;;
+        # rustc passes its sanitizer runtime as `-Wl,<path>.a` (inside
+        # --whole-archive); zig only accepts archives as plain inputs.
+        -Wl,*.a)
+            kept="$kept
+${arg#-Wl,}"
+            ;;
         *)
             kept="$kept
 $arg"
