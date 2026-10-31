@@ -533,3 +533,13 @@ Cargo 依赖已缓存时，`just fuzz-replay` 只需要 stable Rust。它使用�
 | 上传的产物 | 发现的问题与语料文件 |
 
 将保留的问题输入放在 `fuzz/artifacts/<target>/` 下，即可在 stable 上重放。仅由 sanitizer 检出的问题仍需使用 nightly 模糊测试目标。
+
+## AddressSanitizer 测试
+
+使用 nightly 工具链运行带 AddressSanitizer 的测试：
+
+```bash
+ci/asan.sh -p honk-outbound --lib   # 或不带参数运行整个 workspace
+```
+
+Rust 代码会被插桩；C/C++ 依赖（boring-sys 中的 BoringSSL）不插桩，因为 zig 不带 sanitizer 运行时。`ci/zigcc`/`ci/zigcxx` 会去掉 `-fsanitize*` 参数，并把 rustc 的 `-Wl,<runtime>.a` 改为普通输入。默认 `detect_leaks=0`，可通过 `ASAN_OPTIONS` 覆盖。产物默认在 `target/asan`。

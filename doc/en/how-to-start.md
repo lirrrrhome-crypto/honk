@@ -533,3 +533,13 @@ The weekly fuzz job uses:
 | Uploaded artifacts | Findings and corpus files |
 
 Place a retained finding under `fuzz/artifacts/<target>/` to replay it on stable. Sanitizer-only findings still require the nightly fuzz target.
+
+## AddressSanitizer tests
+
+Run the test suite under AddressSanitizer with the nightly toolchain:
+
+```bash
+ci/asan.sh -p honk-outbound --lib   # or no arguments for the whole workspace
+```
+
+Rust code is instrumented; C/C++ dependencies (BoringSSL in boring-sys) are not, because zig ships no sanitizer runtime. `ci/zigcc`/`ci/zigcxx` drop `-fsanitize*` flags and turn rustc's `-Wl,<runtime>.a` into a plain input. Leak detection is off by default (`detect_leaks=0`); override with `ASAN_OPTIONS`. Artifacts go to `target/asan` by default.
