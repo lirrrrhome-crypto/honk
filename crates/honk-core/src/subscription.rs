@@ -801,9 +801,14 @@ fn parse_structured_subscription(
 fn parse_uri_subscription(
     text: &str,
     subscription_id: Option<uuid::Uuid>,
-    mut emit: impl FnMut(IndexedOutcome),
+    mut sink: impl FnMut(IndexedOutcome),
 ) -> anyhow::Result<()> {
     let mut namer = honk_config::share_link::ChainNamer::default();
+    // Outcomes are buffered so `name -> front` lines can set the detour of a
+    // node declared on any line of this subscription.
+    let mut outcomes: Vec<IndexedOutcome> = Vec::new();
+    let mut declarations: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut emit = |outcome: IndexedOutcome| outcomes.push(outcome);
     for (index, uri) in text.lines().enumerate() {
         let uri = uri.trim();
         if uri.is_empty()
@@ -822,6 +827,11 @@ fn parse_uri_subscription(
                 IndexedOutcome::profile(ordinal, "entries", "subscription profile metadata");
             outcome.line = Some(ordinal);
             emit(outcome);
+            continue;
+        }
+        let hops = honk_config::share_link::chain_hops(uri);
+        if hops.len() > 1 && honk_config::share_link::is_bare_name(hops[0]) {
+            declarations.push((ordinal, hops.iter().map(|hop| (*hop).to_owned()).collect()));
             continue;
         }
         let result =
@@ -872,6 +882,100 @@ fn parse_uri_subscription(
                 });
             }
         }
+    }
+    for (ordinal, hops) in declarations {
+        if let Err(message) = apply_subscription_declaration(&hops, &mut namer, &mut outcomes, ordinal)
+        {
+            let mut diagnostic = honk_config::error::DetailedConfigError::new(
+                ErrorCategory::Validation,
+                "invalid-chain",
+                honk_config::diagnostic::DiagnosticSources::new(None).root(),
+                honk_config::diagnostic::SettingPath::new("nodes").field("chain"),
+                message,
+            )
+            .diagnostic;
+            diagnostic.code = "malformed-subscription-entry";
+            diagnostic.terminal = false;
+            diagnostic.severity = Severity::Warning;
+            outcomes.push(IndexedOutcome {
+                ordinal,
+                line: Some(ordinal),
+                path: "entries",
+                kind: IndexedOutcomeKind::Diagnostic(*diagnostic),
+            });
+        }
+    }
+    for outcome in outcomes {
+        sink(outcome);
+    }
+    Ok(())
+}
+
+/// A subscription line `name -> front...`: sets the detour of the node named
+/// `name` declared by another line of the same subscription. The hops after
+/// the name may be links (relays) and may end with a bare node/group name.
+fn apply_subscription_declaration(
+    hops: &[String],
+    namer: &mut honk_config::share_link::ChainNamer,
+    outcomes: &mut Vec<IndexedOutcome>,
+    ordinal: usize,
+) -> Result<(), &'static str> {
+    let name = &hops[0];
+    let mut matches = outcomes.iter().enumerate().filter(|(_, outcome)| {
+        matches!(&outcome.kind, IndexedOutcomeKind::Node(node) if node.name == *name)
+    });
+    let index = match (matches.next(), matches.next()) {
+        (Some((index, _)), None) => index,
+        (Some(_), Some(_)) => {
+            return Err("node chain (->): the bare-name landing matches several nodes \
+                        of this subscription; line ignored");
+        }
+        _ => {
+            return Err("node chain (->): the bare-name landing is not a node of this \
+                        subscription; line ignored");
+        }
+    };
+    let rest = &hops[1..];
+    let (relays, target) = if rest.len() == 1 && honk_config::share_link::is_bare_name(&rest[0]) {
+        (Vec::new(), Some(rest[0].clone()))
+    } else {
+        if honk_config::share_link::is_bare_name(&rest[0]) {
+            return Err("node chain (->): a bare node/group name hop must be the last \
+                        (rightmost) hop; line ignored");
+        }
+        let chain = Node::from_share_link_chain_with_detailed_diagnostics_emit(
+            &rest.join(" -> "),
+            &mut |_| {},
+        )
+        .map_err(|_| "node chain (->): a relay link after the bare-name landing is invalid; line ignored")?;
+        let mut relays = vec![chain.landing];
+        relays.extend(chain.relays);
+        (relays, None)
+    };
+    let IndexedOutcomeKind::Node(node) = &outcomes[index].kind else {
+        unreachable!("matched a node outcome");
+    };
+    let mut landing = node.clone();
+    let subscription_id = landing.subscription_id;
+    let previous = landing.detour.take();
+    if relays.is_empty() {
+        landing.detour = target;
+    }
+    if !landing.supports_detour() {
+        return Err("node chain (->): this landing protocol cannot ride a front; line ignored");
+    }
+    let mut linked = namer.link(honk_config::share_link::ShareLinkChain { landing, relays })?;
+    let landing = linked.remove(0);
+    if previous.is_some() && landing.detour != previous {
+        return Err("node chain (->): conflicting detour declarations for the same node \
+                    (identical repeats are fine); line ignored");
+    }
+    outcomes[index].kind = IndexedOutcomeKind::Node(landing);
+    for mut relay in linked {
+        relay.subscription_id = subscription_id;
+        let mut outcome = IndexedOutcome::node(ordinal, "entries", relay);
+        outcome.line = Some(ordinal);
+        outcomes.push(outcome);
     }
     Ok(())
 }

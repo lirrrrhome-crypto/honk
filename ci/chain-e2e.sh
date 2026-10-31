@@ -400,3 +400,14 @@ group {
 }
 DAE
 imported "dae bare-name hops (node -> node -> group)" "$PROBE" names.dae NC
+# Subscription lines `name -> front`: plain share links plus bare-name
+# declarations (one later than the node it chains), imported as a URI list.
+cat > sub-names.txt <<'TXT'
+UC -> UB
+trojan://chainpw@127.0.0.6:24443?sni=localhost&allowInsecure=1#UC
+ss://YWVzLTEyOC1nY206Y2hhaW5wdw@127.0.0.3:28388#UB
+socks5://127.0.0.2:21080#UA
+UB -> UA
+TXT
+"$IMPORT" auto sub-names.txt > sub-names.nodes.json
+imported "subscription bare-name lines (UC -> UB -> UA)" "$PROBE" sub-names.nodes.json UC

@@ -724,13 +724,13 @@ The same chain can be written three ways; all of them set the same internal `det
 | Where | sing-box outbound `"detour": "front"`; Clash/mihomo proxy `dialer-proxy: front` (subscriptions and imported files) | `node { }` entry or subscription line, left = landing, right = dialed first | query parameter `dialer-proxy=` (aliases `dialer_proxy`, `detour`) |
 | Node front | `{"tag":"land",...,"detour":"front"}` | `land: 'trojan://...@land:443 -> front'` | `trojan://...@land:443?dialer-proxy=front#land` |
 | Group front | `"detour": "fronts"` (a selector/urltest tag, see below) | `land: 'trojan://... -> fronts'` | `?dialer-proxy=fronts` |
-| Existing node | n/a | `land -> front` (bare names on both sides) | n/a |
+| Existing node | n/a | `land -> front` (bare names on both sides; `node { }` or subscription line) | n/a |
 | Inline relays | n/a | `land: 'trojan://... -> ss://... -> socks5://...'` | n/a |
 
 **Bare names versus links in `->`.** A hop is a share link exactly when it contains `://`; anything else is a name of a node or group, resolved like `detour` (group first, then a unique node name).
 
 - A name may only be the **last** (rightmost) hop. It becomes the detour of the link to its left. A name between links (`a -> name -> b`) is rejected because it would change another node's chain.
-- A name as the **first** hop (`my_node -> proxy_group`) is allowed only as a `node { }` entry. It adds no node; it declares the detour of the node `my_node` from the same section. The relays after it may be links or end with a name. The entry tag must be empty or equal `my_node`. Known limitation: subscription lines do not accept this bare-name first hop; a subscription node gets its detour only from its own link's `dialer-proxy=` or a `link -> front` chain.
+- A name as the **first** hop (`my_node -> proxy_group`) is allowed as a `node { }` entry or as a line of a URI-list subscription. It adds no node; it declares the detour of the node `my_node` from the same section (or the same subscription, on any line, also before the node). The relays after it may be links or end with a name. In `node { }` the entry tag must be empty or equal `my_node`. In a subscription, a line whose name is missing, matches several nodes or conflicts with an existing detour is ignored with a warning; the other nodes still load.
 
 **Duplicates and conflicts.** One node may receive its detour from several places: its own `dialer-proxy=`, its own `->` chain, and bare-name declarations. Identical declarations are accepted. Different ones fail with `conflicting-detour`. Within one link or Clash proxy, `dialer-proxy`, `dialer_proxy` and `detour` must agree; an imported proxy whose spellings disagree is dropped with a diagnostic.
 

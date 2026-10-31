@@ -163,6 +163,41 @@ fn base64_subscription_chains_become_detour_hops() {
 }
 
 #[test]
+fn subscription_bare_name_lines_declare_detours() {
+    // `name -> front` sets the detour of a node from another line, even one
+    // declared after it; relays and trailing names work like in `node {}`.
+    let lines = [
+        "Land -> Front",
+        "trojan://pw@land.example:443?sni=land.example#Land",
+        "socks5://10.0.0.1:1080#Front",
+        "socks5://192.0.2.7:1080#Land2",
+        "Land2 -> ss://YWVzLTEyOC1nY206cHc@10.0.0.2:8388 -> Front",
+        "Land3 -> Front",
+        "socks5://192.0.2.8:1080?dialer-proxy=Other#Conflict",
+        "Conflict -> Front",
+        "Conflict -> Other",
+        "Front -> Front2 -> x",
+    ];
+    let nodes = parse_subscription_content(
+        &Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        },
+        &lines.join("\n"),
+    )
+    .unwrap();
+    let by_name = |name: &str| nodes.iter().find(|n| n.name == name).unwrap();
+    assert_eq!(by_name("Land").detour.as_deref(), Some("Front"));
+    let relay = by_name("Land2").detour.clone().unwrap();
+    assert_eq!(by_name(&relay).host, "10.0.0.2");
+    assert_eq!(by_name(&relay).detour.as_deref(), Some("Front"));
+    assert_eq!(by_name("Conflict").detour.as_deref(), Some("Other"));
+    assert!(by_name("Front").detour.is_none());
+    assert!(nodes.iter().all(|n| n.name != "Land3"));
+    assert_eq!(nodes.len(), 5);
+}
+
+#[test]
 fn uri_subscription_with_empty_vmess_remark_remains_usable() {
     let payload = r#"{"ps":"","add":"vmess.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}"#;
     let uri = format!(
