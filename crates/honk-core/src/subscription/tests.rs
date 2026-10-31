@@ -885,14 +885,14 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
     assert_eq!(error.diagnostic.as_ref(), &diagnostics[0]);
 }
 
-/// Follow a node's detour chain by name, as validation resolves it: node
+/// Follow a node's detour chain by name, as validation resolves it: detour-free node
 /// identities in dial-order reverse (landing first), ending with the group
 /// name when the chain leaves for a group.
 fn resolved_chain(nodes: &[Node], start: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = nodes.iter().find(|node| node.name == start);
     while let Some(node) = current {
-        out.push(format!("{}:{}", node.protocol().as_str(), node.id));
+        out.push(format!("{}:{}", node.protocol().as_str(), node.base_id()));
         current = match node.detour.as_deref() {
             Some(next) => {
                 let found = nodes.iter().find(|node| node.name == next);

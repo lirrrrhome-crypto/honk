@@ -181,6 +181,7 @@ impl Node {
                 ));
             }
             tail.detour = Some(target);
+            tail.id = tail.derive_id();
         }
         let landing = nodes.remove(0);
         Ok(ShareLinkChain {
@@ -212,7 +213,7 @@ impl ChainNamer {
     pub fn reserve(&mut self, node: &Node) {
         self.names.insert(node.name.clone());
         self.by_id
-            .entry(node.id)
+            .entry(node.base_id())
             .or_insert_with(|| (node.name.clone(), node.detour.clone()));
     }
 
@@ -225,6 +226,7 @@ impl ChainNamer {
             relays,
         } = chain;
         if relays.is_empty() {
+            landing.id = landing.derive_id();
             self.reserve(&landing);
             return Ok(vec![landing]);
         }
@@ -243,7 +245,7 @@ impl ChainNamer {
             if offset > 0 {
                 relay.detour = onward.take();
             }
-            if let Some((name, detour)) = self.by_id.get(&relay.id) {
+            if let Some((name, detour)) = self.by_id.get(&relay.base_id()) {
                 if *detour != relay.detour {
                     return Err("node chain (->) relay duplicates another node's identity \
                          with a different onward chain");
@@ -251,12 +253,14 @@ impl ChainNamer {
                 onward = Some(name.clone());
                 continue;
             }
-            relay.name = self.unique(&landing.name, position, &relay.id);
+            relay.name = self.unique(&landing.name, position, &relay.base_id());
+            relay.id = relay.derive_id();
             onward = Some(relay.name.clone());
             self.reserve(&relay);
             added.push(relay);
         }
         landing.detour = onward;
+        landing.id = landing.derive_id();
         self.reserve(&landing);
         added.reverse();
         let mut out = vec![landing];

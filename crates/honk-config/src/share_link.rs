@@ -129,8 +129,8 @@ impl Node {
             error.diagnostic.source = source.clone();
             error
         })?;
-        node.id = node.derive_id();
         node.detour = detour;
+        node.id = node.derive_id();
         Ok(node)
     }
 

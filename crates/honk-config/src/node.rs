@@ -373,7 +373,24 @@ impl Node {
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
     /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
+    /// A detour derives a further child UUID from the front name, so the same
+    /// server reached through different fronts is a different node; nodes
+    /// without a detour keep their IDs.
     pub fn derive_id(&self) -> uuid::Uuid {
+        let id = self.base_id();
+        match self.detour.as_deref() {
+            Some(detour) => {
+                let detour = serde_json::to_vec(&("detour", detour))
+                    .expect("detour names are JSON serializable");
+                uuid::Uuid::new_v5(&id, &detour)
+            }
+            None => id,
+        }
+    }
+
+    /// The identity without the detour: what [`Self::derive_id`] yields for
+    /// the same node dialed directly.
+    pub fn base_id(&self) -> uuid::Uuid {
         let material = self.identity_material();
         let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
         if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {

@@ -66,6 +66,8 @@ Plaintext VLESS has a different identity from TLS. A REALITY key selects the aut
 | Nonempty | Derive a child UUID v5 with the base ID as namespace and the JSON tuple `["tls-alpn", <ordered list>]` as name. This separates ALPN from arbitrary credential text. |
 | Empty | Retain the base ID. |
 
+A node with a `detour` derives one more child UUID v5 from that ID with the JSON tuple `["detour", <front name>]` as name, so the same server reached through different fronts (or directly) is a different node; nodes without a detour keep their IDs. The front is identified by its configured name (node or group), so renaming a front, or writing a chain with `->` (generated relay names) instead of named fronts, changes the landing's ID; a selector that pinned that landing by ID falls back to its default.
+
 Tuning and display metadata do not participate, except VLESS multiplex limits that change a physical path.
 
 For XHTTP, identity also includes the effective TLS/plaintext posture and every accepted canonical XHTTP option, including headers, padding and POST pacing. Input aliases, header-name casing and equivalent range representations normalize before derivation. Existing TCP/WS/gRPC identity material is unchanged by adding XHTTP.
@@ -722,7 +724,7 @@ Limitations (MVP):
 - Group front failover: when the front is a group, one dial tries the group's current selection first (an explicit selector choice included), then up to three other ordinary members in declaration order, if the attempt through the front fails (TCP dial, UDP relay or QUIC bridge). Built-in `direct`/`block` members and the landing itself are never used as fallbacks, and the dial fails only after every candidate failed, so traffic never bypasses the front. The landing's own handshake runs after the front is chosen and is not retried on another member.
 - Health probes and latency tests of the landing node still connect directly, so group selection reflects the direct path.
 - The REALITY mask-certificate retry is not available through a detour.
-- `detour` is not part of [node identity](#node-identity): two nodes that differ only in `detour` collide as a duplicate node.
+- `detour` is part of [node identity](#node-identity) by front name: two nodes that differ only in `detour` are distinct; upgrading changes the ID of every chained node once.
 - Group membership that changes at runtime can only form a cycle the static check missed; the 8-hop limit stops it at dial time.
 - Base64 `vmess://` links cannot carry the parameter; use a `->` chain, a bare-name declaration or a structured node instead.
 

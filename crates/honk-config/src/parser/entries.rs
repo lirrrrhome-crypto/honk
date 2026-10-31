@@ -99,12 +99,15 @@ fn link_chains(
         };
         let mut landing = landings[index].take().expect("landing present");
         let previous = if declared.is_some() {
-            landing.detour.take()
+            let previous = landing.detour.take();
+            landing.id = landing.derive_id();
+            previous
         } else {
             None
         };
         if chain.relays.is_empty() {
             landing.detour = chain.target.clone();
+            landing.id = landing.derive_id();
         }
         let original = landing.clone();
         match namer.link(crate::share_link::ShareLinkChain {
@@ -137,6 +140,7 @@ fn link_chains(
                 if declared.is_some() {
                     let mut original = original;
                     original.detour = previous;
+                    original.id = original.derive_id();
                     landings[index] = Some(original);
                 }
                 push_chain_warning(diagnostics, chain.entry, message);

@@ -29,9 +29,9 @@ fn share_link_detour_param_is_stripped_and_kept() {
         "land: 'trojan://pw@land.example:443?sni=land.example#land'",
         "",
     );
-    assert_eq!(
+    assert_ne!(
         plain.nodes[0].id, land.id,
-        "detour is not part of node identity"
+        "detour is part of node identity"
     );
     assert_eq!(code(&config), None);
 }
@@ -340,4 +340,28 @@ fn group_to_group_chains_validate_and_cycles_through_them_are_rejected() {
         "lands {\n filter: name(b1, b2)\n policy: selector\n}\nouter {\n filter: group(lands)\n policy: selector\n}",
     );
     assert_eq!(code(&cyclic), Some("detour-cycle"));
+}
+
+#[test]
+fn detour_is_part_of_node_identity_and_unchained_ids_are_stable() {
+    let config = parse(
+        "f1: 'socks5://10.0.0.1:1080'\n f2: 'socks5://10.0.0.2:1080'\n via1: 'socks5://10.0.0.9:1080?dialer-proxy=f1'\n via2: 'socks5://10.0.0.9:1080?dialer-proxy=f2'\n plain: 'socks5://10.0.0.9:1080'",
+        "",
+    );
+    let id = |name: &str| config.nodes.iter().find(|n| n.name == name).unwrap().id;
+    // Same server through different fronts (or none) are distinct nodes.
+    assert_ne!(id("via1"), id("via2"));
+    assert_ne!(id("via1"), id("plain"));
+    assert_eq!(code(&config), None);
+    // Unchained identity is unchanged and the chained one is reproducible.
+    let mut node = config.nodes.iter().find(|n| n.name == "via1").unwrap().clone();
+    assert_eq!(node.id, node.derive_id());
+    node.detour = None;
+    assert_eq!(node.derive_id(), id("plain"));
+    // The `->` syntax derives the same identity as the parameter.
+    let arrow = parse(
+        "f1: 'socks5://10.0.0.1:1080'\n via1: 'socks5://10.0.0.9:1080 -> f1'",
+        "",
+    );
+    assert_eq!(arrow.nodes.iter().find(|n| n.name == "via1").unwrap().id, id("via1"));
 }
