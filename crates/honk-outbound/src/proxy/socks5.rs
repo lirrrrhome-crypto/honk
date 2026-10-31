@@ -424,7 +424,7 @@ impl Socks5Handler {
             socket: DatagramPipe::Socket(socket),
             relay: relay_addr,
             control: tokio::sync::Mutex::new(control),
-            recv_buf: tokio::sync::Mutex::new(vec![0u8; u16::MAX as usize]),
+            recv_buf: tokio::sync::Mutex::new(None),
             target_addr: target,
             target_domain: target_domain.map(Box::from),
         })
@@ -476,7 +476,7 @@ impl Socks5Handler {
             socket,
             relay,
             control: tokio::sync::Mutex::new(control),
-            recv_buf: tokio::sync::Mutex::new(vec![0u8; u16::MAX as usize]),
+            recv_buf: tokio::sync::Mutex::new(None),
             target_addr: target,
             target_domain: target_domain.map(Box::from),
         })
@@ -495,6 +495,9 @@ enum WireSource<'a> {
     Domain(&'a str, u16),
 }
 
+/// Largest relay datagram (header included) a connected UDP socket can deliver.
+const RELAY_DATAGRAM_MAX: usize = u16::MAX as usize;
+
 /// One UDP association (control TCP + UDP socket connected to the relay) that
 /// carries every destination of a client source.
 #[derive(Debug)]
@@ -503,8 +506,10 @@ struct Socks5UdpTransport {
     /// The relay datagrams are addressed to (reported for reuse).
     relay: SocketAddr,
     control: tokio::sync::Mutex<TcpStream>,
-    /// Reused connected-UDP receive scratch; never reallocated per packet.
-    recv_buf: tokio::sync::Mutex<Vec<u8>>,
+    /// Reused connected-UDP receive scratch, allocated on first use and only
+    /// for callers whose buffer cannot hold a whole relay datagram; core
+    /// passes a full-size buffer and is parsed in place.
+    recv_buf: tokio::sync::Mutex<Option<Vec<u8>>>,
     /// Default destination of `send_packet`, and the only name a domain
     /// source may project to.
     target_addr: SocketAddr,
@@ -646,12 +651,18 @@ impl PacketTransport for Socks5UdpTransport {
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let mut control = self.control.lock().await;
-        let mut packet = self.recv_buf.lock().await;
+        let mut scratch = self.recv_buf.lock().await;
+        let in_place = buf.len() >= RELAY_DATAGRAM_MAX;
         let mut control_probe = [0u8; 1];
 
         loop {
+            let packet: &mut [u8] = if in_place {
+                &mut *buf
+            } else {
+                scratch.get_or_insert_with(|| vec![0u8; RELAY_DATAGRAM_MAX])
+            };
             tokio::select! {
-                received = self.socket.recv(&mut packet) => {
+                received = self.socket.recv(packet) => {
                     let n = received?;
                     let Some((source, payload_start)) = Self::parse_packet(&packet[..n])? else {
                         continue;
@@ -672,12 +683,17 @@ impl PacketTransport for Socks5UdpTransport {
                             peer
                         }
                     };
-                    let payload = &packet[payload_start..n];
-                    if payload.len() > buf.len() {
+                    let len = n - payload_start;
+                    if in_place {
+                        buf.copy_within(payload_start..n, 0);
+                        return Ok((len, peer));
+                    }
+                    if len > buf.len() {
                         return Err(Self::invalid_packet("SOCKS5 UDP: payload exceeds receive buffer"));
                     }
-                    buf[..payload.len()].copy_from_slice(payload);
-                    return Ok((payload.len(), peer));
+                    let payload = &scratch.as_deref().expect("scratch allocated above")[payload_start..n];
+                    buf[..len].copy_from_slice(payload);
+                    return Ok((len, peer));
                 }
                 control_result = control.read(&mut control_probe) => {
                     match control_result? {
