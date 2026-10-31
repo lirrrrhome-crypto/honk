@@ -1275,7 +1275,7 @@ async fn quic_udp_bridge_relays_owner_and_drops_foreign_peers() {
     let server_addr = server.local_addr().unwrap();
     let pipe_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     pipe_socket.connect(server_addr).await.unwrap();
-    let bridge = super::udp_bridge(crate::proxy::datagram_pipe::DatagramPipe::Socket(
+    let (bridge, _guard) = super::udp_bridge(crate::proxy::datagram_pipe::DatagramPipe::Socket(
         pipe_socket,
     ))
     .await
@@ -1302,6 +1302,38 @@ async fn quic_udp_bridge_relays_owner_and_drops_foreign_peers() {
         &buf[..n],
         b"again",
         "foreign datagram must not reach the front"
+    );
+}
+
+/// Dropping the dialed stream/transport's guard stops the bridge at once
+/// (releasing the front relay) rather than after `QUIC_BRIDGE_IDLE`.
+#[tokio::test]
+async fn quic_udp_bridge_stops_when_guard_drops() {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let pipe_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    pipe_socket
+        .connect(server.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (bridge, guard) = super::udp_bridge(crate::proxy::datagram_pipe::DatagramPipe::Socket(
+        pipe_socket,
+    ))
+    .await
+    .unwrap();
+    let owner = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    owner.send_to(b"one", bridge).await.unwrap();
+    let mut buf = [0u8; 64];
+    let (n, _) = server.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"one");
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The bridge socket is closed: further datagrams go nowhere.
+    let _ = owner.send_to(b"two", bridge).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "bridge kept relaying after its guard dropped"
     );
 }
 

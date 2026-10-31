@@ -395,10 +395,11 @@ pub(crate) fn dial_chained<'a>(
                 node.clone(),
                 depth,
             );
-            let bridged = quic_bridged_node(&node, &carrier, connect_timeout).await?;
+            let (bridged, bridge) = quic_bridged_node(&node, &carrier, connect_timeout).await?;
             return inner_handler(table, node.protocol())?
                 .dial(&bridged, target, target_domain.as_deref(), connect_timeout)
                 .await
+                .map(|stream| stream.with_owner(bridge))
                 .with_context(|| {
                     format!(
                         "QUIC landing {:?} through detour failed (front path only; nothing sent direct)",
@@ -555,7 +556,7 @@ pub(crate) async fn quic_bridged_node(
     node: &Node,
     carrier: &dyn UdpCarrier,
     connect_timeout: Duration,
-) -> anyhow::Result<Node> {
+) -> anyhow::Result<(Node, BridgeGuard)> {
     anyhow::ensure!(
         node.hysteria2()
             .is_none_or(|config| config.port_hopping.as_deref().is_none_or(str::is_empty)),
@@ -572,7 +573,7 @@ pub(crate) async fn quic_bridged_node(
         "QUIC landing {:?}: front did not provide a UDP relay; refusing instead of sending direct",
         node.name
     );
-    let local = udp_bridge(pipe).await?;
+    let (local, guard) = udp_bridge(pipe).await?;
     let mut bridged = node.clone();
     let real_host = node
         .host()
@@ -588,7 +589,19 @@ pub(crate) async fn quic_bridged_node(
     bridged.host = local.ip().to_string();
     bridged.address = local.to_string();
     bridged.port = local.port();
-    Ok(bridged)
+    Ok((bridged, guard))
+}
+
+/// Stops a loopback QUIC bridge (and releases its front relay) when the
+/// stream or transport dialed over it is dropped, instead of after
+/// [`QUIC_BRIDGE_IDLE`] of silence.
+#[derive(Debug)]
+pub(crate) struct BridgeGuard(tokio::task::AbortHandle);
+
+impl Drop for BridgeGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Serve `pipe` on a fresh loopback UDP socket: the first local peer owns the
@@ -596,7 +609,7 @@ pub(crate) async fn quic_bridged_node(
 /// to the front relay and relayed replies come back to that peer.
 pub(crate) async fn udp_bridge(
     pipe: super::datagram_pipe::DatagramPipe,
-) -> anyhow::Result<SocketAddr> {
+) -> anyhow::Result<(SocketAddr, BridgeGuard)> {
     let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
     let local = socket.local_addr()?;
     let pipe = Arc::new(pipe);
@@ -636,13 +649,13 @@ pub(crate) async fn udp_bridge(
             }
         }
     };
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         tokio::select! {
             () = up => {}
             () = down => {}
         }
     });
-    Ok(local)
+    Ok((local, BridgeGuard(task.abort_handle())))
 }
 
 /// Chained UDP of `node` through `carrier`: QUIC landings over a loopback
@@ -656,10 +669,11 @@ async fn dial_udp_chained(
     connect_timeout: Duration,
 ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
     if is_quic(node) {
-        let bridged = quic_bridged_node(node, carrier, connect_timeout).await?;
+        let (bridged, bridge) = quic_bridged_node(node, carrier, connect_timeout).await?;
         return handler
             .dial_udp_transport(&bridged, target, target_domain, connect_timeout)
-            .await;
+            .await
+            .map(|transport| super::packet_transport_with_owner(transport, bridge));
     }
     handler
         .dial_udp_transport_chained(node, carrier, target, target_domain, connect_timeout)
