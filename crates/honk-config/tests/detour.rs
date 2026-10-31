@@ -84,7 +84,7 @@ fn invalid_detours_are_rejected() {
             "detour-cycle",
         ),
         (
-            "f: 'socks5://1.1.1.1:1080'\n h: 'hysteria2://pw@2.2.2.2:443?detour=f'",
+            "f: 'socks5://1.1.1.1:1080'\n h: 'hysteria2://pw@2.2.2.2:443?mport=443-450&detour=f'",
             "",
             "unsupported-detour-protocol",
         ),

@@ -43,14 +43,17 @@ fn network_lists_udp(node: &Node) -> bool {
 
 /// Whether a node carrying a detour can carry UDP. Trojan frames UDP inside
 /// its own stream and rides the front's TCP chain; Shadowsocks and SOCKS5
-/// send their native datagrams through the front's UDP relay (refused at
-/// dial time when the front has none). Nothing is ever sent directly.
+/// send their native datagrams through the front's UDP relay, and QUIC
+/// landings (hysteria2 without port hopping, tuic, juicity) run their whole
+/// QUIC connection over that relay (refused at dial time when the front has
+/// none). Nothing is ever sent directly.
 pub fn chained_udp_supported(node: &Node) -> bool {
     node.detour.is_some()
         && node.supports_detour()
         && match node.protocol() {
             NodeProtocol::Trojan => network_lists_udp(node),
             NodeProtocol::SS | NodeProtocol::Socks5 => true,
+            NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity => true,
             _ => false,
         }
 }
@@ -205,7 +208,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     // would poison the first flow).
     ProtocolDescriptor {
         protocol: NodeProtocol::Hysteria2,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         supports_warm: pooled_supports_warm,
@@ -214,7 +217,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Tuic,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         supports_warm: pooled_supports_warm,
@@ -223,7 +226,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Juicity,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         supports_warm: pooled_supports_warm,

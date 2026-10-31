@@ -760,7 +760,7 @@ pub(super) fn parse_clash_proxy(
     }
     node.detour = clash_detour(mapping)?;
     if node.detour.is_some() && !node.supports_detour() {
-        return Err("dialer-proxy/detour is unsupported for QUIC/UDP-native protocols");
+        return Err("dialer-proxy/detour is unsupported for this protocol (anytls, xhttp, hysteria2 port hopping)");
     }
     validate_imported_node(&node)?;
     node.validate()

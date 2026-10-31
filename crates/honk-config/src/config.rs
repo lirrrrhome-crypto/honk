@@ -944,9 +944,9 @@ impl Config {
                 return Err(error(
                     index,
                     "unsupported-detour-protocol",
-                    "detour is only supported for TCP-carried protocols \
-                     (socks5, shadowsocks, trojan, vmess, vless without xhttp); \
-                     UDP/QUIC protocols (hysteria2, tuic, juicity) and anytls cannot be chained",
+                    "detour is supported for socks5, http, shadowsocks, trojan, vmess, vless \
+                     without xhttp, and QUIC landings (hysteria2 without port hopping, tuic, \
+                     juicity) whose front relays UDP; anytls cannot be chained",
                 ));
             }
             if let Some(&group) = group_by_name.get(target) {

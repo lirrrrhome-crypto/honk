@@ -708,11 +708,12 @@ group {
 
 **订阅中的无效 detour。** 来自订阅的节点若 detour 指向自身、成环、或找不到唯一的目标（`detour-cycle`、`unknown-detour-target`、`ambiguous-detour-target`），只丢弃该节点（依赖它作前置的同订阅节点随之被丢弃），每个被丢弃的节点记录一条 `dropped-invalid-detour` 警告诊断，其余节点照常加载。若订阅的全部节点都无效，则整次订阅更新仍被拒绝。手写配置中的同类错误仍然直接报错。
 
-支持作为落地（被链）节点的协议：`socks5`、`shadowsocks`、`trojan`、`vmess`，以及直连 TCP 路径的 `vless`（不含 XHTTP、H2 或共享载体 mux）。任何节点或分组都可以作为前置。
+支持作为落地（被链）节点的协议：`socks5`、`shadowsocks`、`trojan`、`hysteria2`（不含端口跳跃）、`tuic`、`juicity`、`vmess`，以及直连 TCP 路径的 `vless`（不含 XHTTP、H2 或共享载体 mux）。任何节点或分组都可以作为前置。
 
 限制（MVP）：
 
-- 经前置转发 UDP 支持 `trojan` 落地（在链式流内做 UDP-over-TCP）以及 `shadowsocks`/`socks5` 落地（原生 UDP：发往落地服务器的数据报走前置自身的 UDP 通道，即 SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP，或递归经过链式/分组前置）。VMess/VLESS 落地以及没有 UDP 通道的前置（如 VLESS）会以明确错误拒绝 UDP；UDP 绝不会绕过前置发出。Hysteria2/TUIC/Juicity（QUIC）与 AnyTLS 不能被链（但可以作为前置）。
+- 经前置转发 UDP 支持 `trojan` 落地（在链式流内做 UDP-over-TCP）以及 `shadowsocks`/`socks5` 落地（原生 UDP：发往落地服务器的数据报走前置自身的 UDP 通道，即 SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP，或递归经过链式/分组前置）。VMess/VLESS 落地以及没有 UDP 通道的前置（如 VLESS）会以明确错误拒绝 UDP；UDP 绝不会绕过前置发出。AnyTLS 不能被链（但可以作为前置）。
+- QUIC 落地（`hysteria2`、`tuic`、`juicity`）可以被链：整条 QUIC 连接（TCP 与 UDP 流）通过私有回环 UDP 桥走前置的 UDP 通道，因此前置必须能转发 UDP（SOCKS5 UDP ASSOCIATE、Shadowsocks UDP、Trojan UDP-over-TCP、QUIC 前置，或具备 UDP 的链式/分组前置）。没有 UDP 的前置（HTTP/HTTPS、VMess、VLESS）会以明确的 `cannot relay UDP` 错误拒绝，且不发送任何数据。Hysteria2 端口跳跃（`mport`/`ports`）不能被链，会被拒绝（`unsupported-detour-protocol`）；salamander 混淆可用。每次链式拨号新建 QUIC 连接（不复用 QUIC 会话），每个流多一次握手；Juicity 链式仅有单元测试覆盖（无端到端测试服务器）。
 - detour 节点不使用连接池、预连接与 warm 会话，每条流都会重新拨前置。前置流通过私有回环 socket 交给落地处理器，多一次本地拷贝。
 - 落地节点的健康探测与延迟测试仍为直连，分组选择反映的是直连路径。
 - 经 detour 时不支持 REALITY 伪装证书重试。
@@ -739,7 +740,7 @@ group {
 
 **重复与冲突。** 同一节点的 detour 可以来自多处：自身的 `dialer-proxy=`、自身的 `->` 链以及裸名称声明。完全相同的声明会被接受，不同的声明报错 `conflicting-detour`。同一链接或 Clash 代理中的 `dialer-proxy`、`dialer_proxy`、`detour` 必须一致；导入的代理若写法不一致，会被丢弃并给出诊断。
 
-**导入。** sing-box outbound 的 tag 与 Clash 代理的 name 会成为节点名，因此指向同一文件中其他 outbound 的 `detour`/`dialer-proxy` 能保留链关系。sing-box 的 `selector`/`urltest` 与 Clash 的 `proxy-groups` **不会**作为分组导入：指向它们的 detour 只有在你的配置中存在同名分组时才能解析，否则校验报 `unknown-detour-target`。带 detour 的 QUIC 原生导入代理（Hysteria2/TUIC/Juicity）会被丢弃并给出诊断。
+**导入。** sing-box outbound 的 tag 与 Clash 代理的 name 会成为节点名，因此指向同一文件中其他 outbound 的 `detour`/`dialer-proxy` 能保留链关系。sing-box 的 `selector`/`urltest` 与 Clash 的 `proxy-groups` **不会**作为分组导入：指向它们的 detour 只有在你的配置中存在同名分组时才能解析，否则校验报 `unknown-detour-target`。带 detour 且启用端口跳跃的导入 Hysteria2 代理会被丢弃并给出诊断；其他 QUIC 代理保留 detour。
 
 ## 相关文档
 

@@ -164,8 +164,8 @@ impl Node {
                 return Err(chain_error(
                     source,
                     "unsupported-detour-protocol",
-                    "node chain (->): only TCP-carried protocols can ride a relay; \
-                     QUIC/UDP-native hops (hysteria2, tuic, juicity) must be the rightmost hop",
+                    "node chain (->): this protocol cannot ride a relay (anytls, xhttp, \
+                     hysteria2 port hopping); it must be the rightmost hop",
                 ));
             }
             nodes.push(node);

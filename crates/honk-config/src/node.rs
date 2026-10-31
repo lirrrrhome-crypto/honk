@@ -76,7 +76,7 @@ pub struct Node {
     /// `dialer-proxy`): the name of another node or a group. The node's own
     /// TCP connection to its server is opened *through* that front instead of
     /// a direct socket. Dial-path metadata only: it does not take part in
-    /// [`Node::derive_id`]. Only TCP-carried protocols accept it; see
+    /// [`Node::derive_id`]. Protocols that can ride a front accept it; see
     /// [`Node::supports_detour`].
     pub detour: Option<String>,
     pub tags: Vec<String>,
@@ -128,6 +128,12 @@ impl Node {
                         .vless()
                         .is_some_and(|config| config.tcp_path() == VlessTcpPath::Direct)
             }
+            // QUIC landings ride the front's UDP relay; a hopping port
+            // set has no single relay target.
+            NodeProtocol::Hysteria2 => self
+                .hysteria2()
+                .is_none_or(|config| config.port_hopping.as_deref().is_none_or(str::is_empty)),
+            NodeProtocol::Tuic | NodeProtocol::Juicity => true,
             _ => false,
         }
     }

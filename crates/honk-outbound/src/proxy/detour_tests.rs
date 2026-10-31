@@ -1266,3 +1266,51 @@ async fn native_udp_group_front_follows_the_selection() {
         assert!(relays.contains(peer), "direct datagram from {peer}");
     }
 }
+
+/// The QUIC loopback bridge forwards the owning peer's datagrams to the
+/// front pipe and the replies back, and drops datagrams from any other
+/// local source.
+#[tokio::test]
+async fn quic_udp_bridge_relays_owner_and_drops_foreign_peers() {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let pipe_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    pipe_socket.connect(server_addr).await.unwrap();
+    let bridge = super::udp_bridge(crate::proxy::datagram_pipe::DatagramPipe::Socket(pipe_socket))
+        .await
+        .unwrap();
+    assert!(bridge.ip().is_loopback());
+
+    let owner = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    owner.send_to(b"hello", bridge).await.unwrap();
+    let mut buf = [0u8; 64];
+    let (n, from) = server.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello");
+    server.send_to(b"world", from).await.unwrap();
+    let (n, reply_from) = tokio::time::timeout(Duration::from_secs(2), owner.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((&buf[..n], reply_from), (&b"world"[..], bridge));
+
+    let foreign = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    foreign.send_to(b"intruder", bridge).await.unwrap();
+    owner.send_to(b"again", bridge).await.unwrap();
+    let (n, _) = server.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"again", "foreign datagram must not reach the front");
+}
+
+#[test]
+fn quic_landings_ride_fronts_except_port_hopping_hysteria2() {
+    use honk_config::node::Node;
+    for (link, chained) in [
+        ("hysteria2://pw@1.2.3.4:443?sni=a.example", true),
+        ("hysteria2://pw@1.2.3.4:443?mport=443-450", false),
+        ("tuic://00000000-0000-0000-0000-000000000001:p@1.2.3.4:443", true),
+    ] {
+        let mut node = Node::from_share_link(link).unwrap();
+        node.detour = Some("front".into());
+        assert_eq!(node.supports_detour(), chained, "{link}");
+        assert_eq!(crate::descriptor::chained_udp_supported(&node), chained, "{link}");
+    }
+}

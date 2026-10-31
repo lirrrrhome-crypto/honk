@@ -157,9 +157,9 @@ fn rejected_chains_drop_the_entry_with_a_clear_code() {
             "socks5://h.example:6999 -> wss://h.example:6999/path".to_owned(),
             "unsupported-chain-transport",
         ),
-        // QUIC landing over a TCP relay.
+        // A port-hopping hysteria2 landing has no single relay target.
         (
-            format!("tuic://00000000-0000-0000-0000-000000000001:p@t.example:443 -> {FRONT}"),
+            format!("hysteria2://p@t.example:443?mport=443-450 -> {FRONT}"),
             "unsupported-detour-protocol",
         ),
         // Only the rightmost hop may name a further front.

@@ -121,7 +121,7 @@ fn base64_subscription_chains_become_detour_hops() {
         "trojan://pw@land.example:443?sni=land.example#Land -> socks5://10.0.0.1:1080",
         "ss://YWVzLTEyOC1nY206cHc@10.0.0.9:8388#Land2 -> ss://YWVzLTEyOC1nY206cHc@10.0.0.2:8388 -> socks5://10.0.0.1:1080",
         "socks5://192.0.2.1:1080#Plain",
-        "tuic://00000000-0000-0000-0000-000000000001:p@t.example:443#Bad -> socks5://10.0.0.1:1080",
+        "hysteria2://p@t.example:443?mport=443-450#Bad -> socks5://10.0.0.1:1080",
     ];
     let encoded = base64::engine::general_purpose::STANDARD.encode(lines.join("\n"));
     let nodes = parse_subscription_content(
@@ -153,7 +153,7 @@ fn base64_subscription_chains_become_detour_hops() {
         nodes
             .iter()
             .all(|n| n.name != "Bad" && n.host != "t.example"),
-        "QUIC landing chain dropped"
+        "port-hopping QUIC landing chain dropped"
     );
     let mut names: Vec<_> = nodes.iter().map(|n| &n.name).collect();
     names.sort();
@@ -1016,9 +1016,17 @@ fn imported_conflicting_detours_are_rejected_identical_ones_kept() {
     assert!(conflict.iter().any(|n| n.name == "Ok"));
     let quic = parse_as(
         SubscriptionType::Clash,
-        "proxies:\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, dialer-proxy: a}\n  - {name: Ok, type: socks5, server: 192.0.2.8, port: 1080}\n",
+        "proxies:\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, ports: 443-450, dialer-proxy: a}\n  - {name: Ok, type: socks5, server: 192.0.2.8, port: 1080}\n",
     );
     assert!(quic.iter().all(|n| n.name != "Q"));
+    let chained_quic = parse_as(
+        SubscriptionType::Clash,
+        "proxies:\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, dialer-proxy: a}\n  - {name: T, type: tuic, server: t.example, port: 443, uuid: 00000000-0000-0000-0000-000000000001, password: p, dialer-proxy: a}\n",
+    );
+    for name in ["Q", "T"] {
+        let node = chained_quic.iter().find(|n| n.name == name).unwrap();
+        assert_eq!(node.detour.as_deref(), Some("a"), "{name}");
+    }
 }
 
 #[test]

@@ -219,6 +219,7 @@ impl ProxyRegistry {
         entry.tcp = Arc::new(super::detour::ChainAware {
             inner,
             table: Arc::clone(&self.tcp_table),
+            packet: Arc::clone(&self.packet_table),
         });
         use super::detour::DetourGuard;
         if let Some(packet) = &entry.packet {
@@ -273,6 +274,7 @@ impl ProxyRegistry {
         if node.detour.is_some() {
             return super::detour::dial_chained(
                 &self.tcp_table,
+                &self.packet_table,
                 None,
                 node.clone(),
                 target,
@@ -318,6 +320,7 @@ impl ProxyRegistry {
         {
             return super::detour::dial_chained(
                 &self.tcp_table,
+                &self.packet_table,
                 Some(generation),
                 node,
                 target,

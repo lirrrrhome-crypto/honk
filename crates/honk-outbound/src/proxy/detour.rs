@@ -30,7 +30,7 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -119,6 +119,7 @@ fn inner_handler(table: &TcpTable, protocol: NodeProtocol) -> anyhow::Result<Arc
 pub(crate) struct ChainAware {
     pub(crate) inner: Arc<dyn TcpOutbound>,
     pub(crate) table: TcpTable,
+    pub(crate) packet: PacketTable,
 }
 
 #[async_trait]
@@ -133,6 +134,7 @@ impl TcpOutbound for ChainAware {
         if node.detour.is_some() {
             return dial_chained(
                 &self.table,
+                &self.packet,
                 caller_generation(),
                 node.clone(),
                 target,
@@ -170,6 +172,7 @@ impl TcpOutbound for ChainAware {
         if runtime.node.detour.is_some() {
             return dial_chained(
                 &self.table,
+                &self.packet,
                 caller_generation(),
                 runtime.node.as_ref().clone(),
                 target,
@@ -303,8 +306,10 @@ pub(crate) async fn bridge(
 }
 
 /// Dial `node` (which carries a detour) to `target` through its front chain.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dial_chained<'a>(
     table: &'a TcpTable,
+    packet: &'a PacketTable,
     generation: Option<Arc<OutboundRuntimeRegistry>>,
     node: Node,
     target: SocketAddr,
@@ -314,7 +319,26 @@ pub(crate) fn dial_chained<'a>(
 ) -> BoxFuture<'a, anyhow::Result<ProxyStream>> {
     Box::pin(async move {
         tracing::debug!("Dialing {} via chained node {}", target, node.name);
-        let tcp = dial_front_tcp(table, generation, &node, connect_timeout, depth).await?;
+        if is_quic(&node) {
+            let carrier = FrontCarrier::new(
+                Arc::clone(table),
+                Arc::clone(packet),
+                generation.or_else(caller_generation),
+                node.clone(),
+                depth,
+            );
+            let bridged = quic_bridged_node(&node, &carrier, connect_timeout).await?;
+            return inner_handler(table, node.protocol())?
+                .dial(&bridged, target, target_domain.as_deref(), connect_timeout)
+                .await
+                .with_context(|| {
+                    format!(
+                        "QUIC landing {:?} through detour failed (front path only; nothing sent direct)",
+                        node.name
+                    )
+                });
+        }
+        let tcp = dial_front_tcp(table, packet, generation, &node, connect_timeout, depth).await?;
         inner_handler(table, node.protocol())?
             .dial_with_tcp(
                 &node,
@@ -331,6 +355,7 @@ pub(crate) fn dial_chained<'a>(
 /// carrier handed to the landing protocol, for TCP and UDP-over-TCP alike).
 pub(crate) fn dial_front_tcp<'a>(
     table: &'a TcpTable,
+    packet: &'a PacketTable,
     generation: Option<Arc<OutboundRuntimeRegistry>>,
     node: &'a Node,
     connect_timeout: Duration,
@@ -358,6 +383,7 @@ pub(crate) fn dial_front_tcp<'a>(
         let front_stream = if front.detour.is_some() {
             dial_chained(
                 table,
+                packet,
                 generation.clone(),
                 front,
                 server,
@@ -397,12 +423,141 @@ pub(crate) fn dial_front_tcp<'a>(
     })
 }
 
+/// QUIC landings (hysteria2, tuic, juicity) reach their server through the
+/// front's UDP relay: a loopback UDP bridge stands in for the server, so the
+/// QUIC stack runs unchanged and never sends a datagram from this host.
+pub(crate) fn is_quic(node: &Node) -> bool {
+    matches!(
+        node.protocol(),
+        NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
+    )
+}
+
+/// How long a QUIC bridge survives without an uplink datagram. Every QUIC
+/// landing sends keep-alives far more often, so only a closed connection
+/// lets it expire.
+const QUIC_BRIDGE_IDLE: Duration = Duration::from_secs(90);
+
+/// A copy of the chained QUIC `node` whose server is a loopback UDP bridge
+/// relayed by the front: no detour, the TLS server name pinned to the real
+/// server, and no port hopping (refused, a relay has one fixed target).
+pub(crate) async fn quic_bridged_node(
+    node: &Node,
+    carrier: &dyn UdpCarrier,
+    connect_timeout: Duration,
+) -> anyhow::Result<Node> {
+    anyhow::ensure!(
+        node.hysteria2()
+            .is_none_or(|config| config.port_hopping.as_deref().is_none_or(str::is_empty)),
+        "hysteria2 node {:?}: port hopping cannot run through a detour (the front relays one \
+         fixed server port); refusing instead of sending direct",
+        node.name
+    );
+    let (server, server_domain) = carrier.server().await?;
+    let pipe = carrier
+        .datagrams(server, server_domain.as_deref(), connect_timeout)
+        .await?;
+    anyhow::ensure!(
+        pipe.is_relayed(),
+        "QUIC landing {:?}: front did not provide a UDP relay; refusing instead of sending direct",
+        node.name
+    );
+    let local = udp_bridge(pipe).await?;
+    let mut bridged = node.clone();
+    let real_host = node
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    if let Some(tls) = bridged.tls_mut()
+        && tls.sni.as_deref().is_none_or(str::is_empty)
+    {
+        tls.sni = Some(real_host);
+    }
+    bridged.detour = None;
+    bridged.host = local.ip().to_string();
+    bridged.address = local.to_string();
+    bridged.port = local.port();
+    Ok(bridged)
+}
+
+/// Serve `pipe` on a fresh loopback UDP socket: the first local peer owns the
+/// bridge (datagrams from any other source are dropped), uplink datagrams go
+/// to the front relay and relayed replies come back to that peer.
+pub(crate) async fn udp_bridge(
+    pipe: super::datagram_pipe::DatagramPipe,
+) -> anyhow::Result<SocketAddr> {
+    let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+    let local = socket.local_addr()?;
+    let pipe = Arc::new(pipe);
+    let peer = Arc::new(OnceLock::<SocketAddr>::new());
+    let up = {
+        let (socket, pipe, peer) = (Arc::clone(&socket), Arc::clone(&pipe), Arc::clone(&peer));
+        async move {
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                let (n, from) =
+                    match tokio::time::timeout(QUIC_BRIDGE_IDLE, socket.recv_from(&mut buf)).await {
+                        Ok(Ok(received)) => received,
+                        _ => return,
+                    };
+                if *peer.get_or_init(|| from) != from {
+                    tracing::debug!("QUIC detour bridge: dropping datagram from foreign {from}");
+                    continue;
+                }
+                if pipe.send(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let down = async move {
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let Ok(n) = pipe.recv(&mut buf).await else {
+                return;
+            };
+            if let Some(peer) = peer.get() {
+                let _ = socket.send_to(&buf[..n], peer).await;
+            }
+        }
+    };
+    tokio::spawn(async move {
+        tokio::select! {
+            () = up => {}
+            () = down => {}
+        }
+    });
+    Ok(local)
+}
+
+/// Chained UDP of `node` through `carrier`: QUIC landings over a loopback
+/// bridge, every other landing through its own chained implementation.
+async fn dial_udp_chained(
+    handler: &dyn super::PacketOutbound,
+    node: &Node,
+    carrier: &dyn UdpCarrier,
+    target: SocketAddr,
+    target_domain: Option<&str>,
+    connect_timeout: Duration,
+) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
+    if is_quic(node) {
+        let bridged = quic_bridged_node(node, carrier, connect_timeout).await?;
+        return handler
+            .dial_udp_transport(&bridged, target, target_domain, connect_timeout)
+            .await;
+    }
+    handler
+        .dial_udp_transport_chained(node, carrier, target, target_domain, connect_timeout)
+        .await
+}
+
 /// Why `node` (which carries a detour) cannot carry UDP through its front.
 pub(crate) fn chained_udp_refusal(node: &Node) -> String {
     format!(
         "UDP not supported through detour for node {:?}: protocol {} has no chained \
-         UDP path (only trojan, shadowsocks and socks5 landings carry UDP through a \
-         front); refusing instead of sending direct",
+         UDP path (only trojan, shadowsocks, socks5 and QUIC landings carry UDP \
+         through a front); refusing instead of sending direct",
         node.name,
         node.protocol().as_str()
     )
@@ -534,15 +689,15 @@ impl FrontCarrier {
                 front.clone(),
                 self.depth + 1,
             );
-            return handler
-                .dial_udp_transport_chained(
-                    &front,
-                    &carrier,
-                    server,
-                    server_domain,
-                    connect_timeout,
-                )
-                .await;
+            return dial_udp_chained(
+                handler.as_ref(),
+                &front,
+                &carrier,
+                server,
+                server_domain,
+                connect_timeout,
+            )
+            .await;
         }
         anyhow::ensure!(
             front_relays_udp(&front),
@@ -582,6 +737,7 @@ impl UdpCarrier for FrontCarrier {
     async fn stream(&self, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
         dial_front_tcp(
             &self.tcp,
+            &self.packet,
             self.generation.clone(),
             &self.node,
             connect_timeout,
@@ -657,11 +813,16 @@ impl super::PacketOutbound for DetourGuard<dyn super::PacketOutbound> {
     ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
         if node.detour.is_some() {
             let carrier = self.chained_udp_carrier(node)?;
-            return self
-                .0
-                .dial_udp_transport_chained(node, &carrier, target, target_domain, connect_timeout)
-                .await
-                .with_context(|| chained_udp_failure(node));
+            return dial_udp_chained(
+                self.0.as_ref(),
+                node,
+                &carrier,
+                target,
+                target_domain,
+                connect_timeout,
+            )
+            .await
+            .with_context(|| chained_udp_failure(node));
         }
         self.0
             .dial_udp_transport(node, target, target_domain, connect_timeout)

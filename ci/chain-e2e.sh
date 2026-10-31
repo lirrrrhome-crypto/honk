@@ -476,3 +476,72 @@ for pair in "sub-http.clash.json KHS" "sub-http.sb.json JHS"; do
     || { echo "FAIL: imported http chain $1" >&2; exit 1; }
   echo "PASS: imported http/https chain ($1)"
 done
+# QUIC landings behind fronts: Q (hysteria2), QO (hysteria2 + salamander) and
+# U (tuic) reach their server only through the front's UDP relay (socks5 UDP
+# ASSOCIATE, ss UDP, trojan UDP-over-TCP, nested and group fronts). TCP and
+# UDP both ride QUIC. An http front has no UDP path: refused, nothing sent.
+cat > q.json <<JSON
+{"log":{"level":"debug","output":"$WORK/q.log"},
+ "inbounds":[
+  {"type":"hysteria2","tag":"Q-hy2","listen":"127.0.0.11","listen_port":24600,"users":[{"password":"hy2pw"}],
+   "tls":{"enabled":true,"server_name":"localhost","alpn":["h3"],"certificate_path":"$WORK/t.crt","key_path":"$WORK/t.key"}},
+  {"type":"hysteria2","tag":"QO-hy2","listen":"127.0.0.11","listen_port":24601,"users":[{"password":"hy2pw"}],
+   "obfs":{"type":"salamander","password":"salamander-secret"},
+   "tls":{"enabled":true,"server_name":"localhost","alpn":["h3"],"certificate_path":"$WORK/t.crt","key_path":"$WORK/t.key"}},
+  {"type":"tuic","tag":"U-tuic","listen":"127.0.0.12","listen_port":24602,
+   "users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"tuicpw"}],"congestion_control":"bbr",
+   "tls":{"enabled":true,"server_name":"localhost","alpn":["h3"],"certificate_path":"$WORK/t.crt","key_path":"$WORK/t.key"}}],
+ "outbounds":[{"type":"direct","tag":"Q-direct"}]}
+JSON
+: > q.log
+./sing-box run -c q.json > q.out 2>&1 & pids+=($!)
+sleep 1
+HY="hysteria2://hy2pw@127.0.0.11:24600?sni=localhost&insecure=1"
+HYO="hysteria2://hy2pw@127.0.0.11:24601?sni=localhost&insecure=1&obfs=salamander&obfs-password=salamander-secret"
+TU="tuic://b831381d-6324-4d53-ad4f-8cda48b30811:tuicpw@127.0.0.12:24602?sni=localhost&alpn=h3&congestion_control=bbr&allow_insecure=1"
+nudp qa "A1: 'socks5://127.0.0.2:21080'" "Q: '$HY&dialer-proxy=A1#Q'"
+nudp qob "B0: '$SSU#B0'" "QO: '$HYO&dialer-proxy=B0#QO'"
+nudp ut "T: 'trojan://chainpw@127.0.0.6:24443?sni=localhost&allowInsecure=1#T'" "U: '$TU&dialer-proxy=T#U'"
+nudp qn "A1: 'socks5://127.0.0.2:21080'" "S: 'socks5://127.0.0.7:21082?dialer-proxy=A1#S'" "Q: '$HY&dialer-proxy=S#Q'"
+nudp qg "A1: 'socks5://127.0.0.2:21080'" "A2: 'socks5://127.0.0.5:21081'" "U: '$TU&dialer-proxy=fronts#U'"
+printf 'group {\n    fronts {\n        filter: name(A1, A2)\n        policy: selector\n    }\n}\n' >> qg.dae
+nudp qh "H: 'http://hu:hp@127.0.0.9:28080'" "Q: '$HY&dialer-proxy=H#Q'"
+nudp bq "Q: '$HY#Q'" "B: '$SSU?dialer-proxy=Q#B'"
+qclr() { clr; : > q.log; : > h.log; }
+quic_case() { # label dae node front-tag front-log quic-tag quic-server
+  qclr
+  "$PROBE" "$2.dae" "$3" 127.0.0.4:18080 /index.html | tee probe.out; grep -q hello-through-chain probe.out \
+    || { echo "FAIL: $1 TCP" >&2; exit 1; }
+  "$PROBE" "$2.dae" "$3" $E --udp 64 1200 | tee udp.out; echo_ok 2
+  pkt "$4" "$7" "$5"
+  grep -q "$6.*inbound connection to 127.0.0.4:18080" q.log || { echo "FAIL: $1 no QUIC TCP hop" >&2; exit 1; }
+  pkt "$6" $E q.log
+  echo "PASS: $1 (TCP + UDP over QUIC via front)"
+}
+quic_case "hysteria2 landing via socks5 front" qa Q A-socks a.log Q-hy2 127.0.0.11:24600
+quic_case "hysteria2+salamander landing via ss front" qob QO B-ss b.log QO-hy2 127.0.0.11:24601
+quic_case "tuic landing via trojan front (UoT)" ut U T-trojan t.log U-tuic 127.0.0.12:24602
+quic_case "hysteria2 landing via nested A1 -> S" qn Q S-socks s.log Q-hy2 127.0.0.11:24600
+grep -q 'A-socks.*packet connection to 127.0.0.7' a.log || { echo "FAIL: nested QUIC skipped A1" >&2; exit 1; }
+for pick in A1 A2; do
+  qclr; CHAIN_SELECT=fronts=$pick "$PROBE" qg.dae U $E --udp 64 | tee udp.out; echo_ok 1
+  if [ $pick = A1 ]; then pkt A-socks 127.0.0.12:24602 a.log; nopkt A2-socks a2.log
+  else pkt A2-socks 127.0.0.12:24602 a2.log; nopkt A-socks a.log; fi
+  pkt U-tuic $E q.log
+  echo "PASS: tuic landing via group front $pick"
+done
+qclr
+if "$PROBE" qh.dae Q 127.0.0.4:18080 /index.html > qh.out 2>&1 && grep -q hello-through-chain qh.out; then
+  echo "FAIL: QUIC landing through http front" >&2; exit 1; fi
+grep -q 'cannot relay UDP' qh.out || { cat qh.out >&2; echo "FAIL: unclear http-front QUIC refusal" >&2; exit 1; }
+if grep -q 'inbound' q.log; then echo "FAIL: QUIC landing reached without a UDP front" >&2; exit 1; fi
+echo "PASS: QUIC landing via http front -> clear refusal, nothing sent"
+qclr
+"$PROBE" bq.dae B 127.0.0.4:18080 /index.html | tee probe.out; grep -q hello-through-chain probe.out
+grep -q 'Q-hy2.*inbound connection to 127.0.0.3:28388' q.log || { echo "FAIL: hy2 front" >&2; exit 1; }
+echo "PASS: ss landing via hysteria2 front (regression)"
+nudp qm "A1: 'socks5://127.0.0.2:21080'" "Q: '$HY&mport=24600-24605&dialer-proxy=A1#Q'"
+qclr
+if "$PROBE" qm.dae Q 127.0.0.4:18080 /index.html > qm.out 2>&1; then echo "FAIL: port hopping chained" >&2; exit 1; fi
+if grep -q 'inbound' q.log; then echo "FAIL: hopping hy2 reached" >&2; exit 1; fi
+echo "PASS: hysteria2 port hopping behind a front refused"
