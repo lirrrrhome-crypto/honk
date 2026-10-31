@@ -51,7 +51,7 @@ where
     T: Send + Sync + 'static,
 {
     let runtime = OwnedTaskRuntime::new(tasks, parent)?;
-    client_endpoint_with_mtu_and_owner(ipv6, 1252, owner, Some(runtime))
+    client_endpoint_with_mtu_and_owner(ipv6, 1252, true, owner, Some(runtime))
 }
 
 pub(super) fn clamp_quic_payload_size(mtu: u16) -> u16 {
@@ -77,12 +77,63 @@ pub(super) fn gso_transmit_segments(enabled: bool, kernel_max: usize) -> usize {
 /// the operator has already declared that the path carries larger datagrams.
 /// `HONK_QUIC_GSO=0|1` overrides that policy process-wide.
 pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Result<Endpoint> {
-    client_endpoint_with_mtu_and_owner(ipv6, max_udp_payload_size, (), None)
+    client_endpoint_with_mtu_and_owner(ipv6, max_udp_payload_size, true, (), None)
+}
+
+/// [`client_endpoint_with_mtu`] for a QUIC server at a loopback address: the
+/// local UDP bridge of a chained QUIC landing. Such endpoints are created per
+/// flow, and quinn sizes its receive buffer as payload x GRO segments x batch
+/// (about 2.5 MiB with GRO on), so loopback endpoints receive without GRO.
+pub fn client_endpoint_for_server(
+    server: std::net::SocketAddr,
+    max_udp_payload_size: u16,
+) -> io::Result<Endpoint> {
+    client_endpoint_with_mtu_and_owner(
+        server.is_ipv6(),
+        max_udp_payload_size,
+        !server.ip().is_loopback(),
+        (),
+        None,
+    )
+}
+
+/// Undo the UDP_GRO that `UdpSocketState::new` enables, so the kernel never
+/// coalesces datagrams beyond the one-segment receive buffer.
+#[cfg(target_os = "linux")]
+fn disable_udp_gro(io: &tokio::net::UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let off: libc::c_int = 0;
+    // SAFETY: valid fd and a c_int option value of the right size.
+    unsafe {
+        libc::setsockopt(
+            io.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            (&raw const off).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disable_udp_gro(_io: &tokio::net::UdpSocket) {}
+
+const LOOPBACK_RECEIVE_SEGMENTS: usize = 2;
+
+pub(super) fn gro_receive_segments(enabled: bool, kernel: usize) -> usize {
+    // Without GRO each slot still needs room for one full datagram: peers such as
+    // quic-go send 1280-1452 byte packets even when 1252 is advertised.
+    if enabled {
+        kernel
+    } else {
+        LOOPBACK_RECEIVE_SEGMENTS
+    }
 }
 
 fn client_endpoint_with_mtu_and_owner<T>(
     ipv6: bool,
     max_udp_payload_size: u16,
+    gro: bool,
     owner: T,
     runtime: Option<Arc<dyn quinn::Runtime>>,
 ) -> io::Result<Endpoint>
@@ -96,6 +147,9 @@ where
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let io = tokio::net::UdpSocket::from_std(socket)?;
     let inner = quinn::udp::UdpSocketState::new((&io).into())?;
+    if !gro {
+        disable_udp_gro(&io);
+    }
     static GSO_OVERRIDE: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         std::env::var("HONK_QUIC_GSO")
             .ok()
@@ -106,6 +160,7 @@ where
         io,
         inner,
         gso,
+        gro,
         _owner: owner,
     });
     Endpoint::new_with_abstract_socket(
@@ -200,6 +255,7 @@ struct NoGsoUdpSocket<T> {
     io: tokio::net::UdpSocket,
     inner: quinn::udp::UdpSocketState,
     gso: bool,
+    gro: bool,
     _owner: T,
 }
 
@@ -255,7 +311,7 @@ impl<T: Send + Sync + 'static> quinn::AsyncUdpSocket for NoGsoUdpSocket<T> {
     }
 
     fn max_receive_segments(&self) -> usize {
-        self.inner.gro_segments()
+        gro_receive_segments(self.gro, self.inner.gro_segments())
     }
 }
 
@@ -305,6 +361,7 @@ mod tests {
             io,
             inner,
             gso: false,
+            gro: true,
             _owner: SocketOwner {
                 local_addr,
                 _permit: capacity.clone().acquire_owned().await.unwrap(),
@@ -340,5 +397,22 @@ mod tests {
             .unwrap();
         drop(poller);
         assert_eq!(capacity.available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod gro_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_quic_servers_receive_without_gro() {
+        assert_eq!(gro_receive_segments(false, 64), 2);
+        assert_eq!(gro_receive_segments(true, 64), 64);
+    }
+
+    #[tokio::test]
+    async fn loopback_endpoint_builds_for_both_families() {
+        client_endpoint_for_server("127.0.0.1:443".parse().unwrap(), 1252).unwrap();
+        client_endpoint_for_server("192.0.2.1:443".parse().unwrap(), 1252).unwrap();
     }
 }

@@ -30,6 +30,10 @@ impl ProtocolDescriptor {
 /// paths: no `network` restriction means UDP is allowed; otherwise the list
 /// must contain "udp".
 pub(crate) fn network_allows_udp(node: &Node) -> bool {
+    unchained(node) && network_lists_udp(node)
+}
+
+fn network_lists_udp(node: &Node) -> bool {
     node.network().is_none_or(|network| {
         network
             .split(',')
@@ -37,26 +41,65 @@ pub(crate) fn network_allows_udp(node: &Node) -> bool {
     })
 }
 
+/// Whether a node carrying a detour can carry UDP. Trojan frames UDP inside
+/// its own stream and rides the front's TCP chain, as does VLESS (native
+/// UDP, single XUDP or UoT v2 inside the chained stream); Shadowsocks and SOCKS5
+/// send their native datagrams through the front's UDP relay, and QUIC
+/// landings (hysteria2 without port hopping, tuic, juicity) run their whole
+/// QUIC connection over that relay (refused at dial time when the front has
+/// none). Nothing is ever sent directly.
+pub fn chained_udp_supported(node: &Node) -> bool {
+    node.detour.is_some()
+        && node.supports_detour()
+        && match node.protocol() {
+            NodeProtocol::Trojan => network_lists_udp(node),
+            NodeProtocol::SS | NodeProtocol::Socks5 => true,
+            NodeProtocol::VLess => node.vless().is_some_and(|vless| vless.udp_enabled()),
+            NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity => true,
+            _ => false,
+        }
+}
+
+/// Native UDP when unchained, the front's UDP relay when chained.
+fn native_or_chained_udp(node: &Node) -> bool {
+    unchained(node) || chained_udp_supported(node)
+}
+
+fn trojan_supports_udp(node: &Node) -> bool {
+    network_allows_udp(node) || chained_udp_supported(node)
+}
+
 fn never(_: &Node) -> bool {
     false
 }
 
-fn always(_: &Node) -> bool {
-    true
+/// Every capability that would open a server connection outside the
+/// per-flow dial (UDP relays, pooled bare TCP or ready streams, warm
+/// sessions) bypasses a chained front hop, so a node with a `detour` keeps
+/// none of them: it is TCP-only and dialed fresh through its front.
+fn unchained(node: &Node) -> bool {
+    node.detour.is_none()
+}
+
+fn always(node: &Node) -> bool {
+    unchained(node)
 }
 
 fn stream_pool_bare_tcp(node: &Node) -> bool {
-    !node.is_xhttp()
+    unchained(node) && !node.is_xhttp()
 }
 
 fn stream_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
-    node.is_xhttp()
+    unchained(node)
+        && node.is_xhttp()
         && (requirement == WarmRequirement::Session
             || (descriptor(node.protocol()).supports_udp)(node))
 }
 
 fn pooled_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
-    requirement == WarmRequirement::Session || (descriptor(node.protocol()).supports_udp)(node)
+    unchained(node)
+        && (requirement == WarmRequirement::Session
+            || (descriptor(node.protocol()).supports_udp)(node))
 }
 
 fn no_warm(_: &Node, _: WarmRequirement) -> bool {
@@ -64,6 +107,9 @@ fn no_warm(_: &Node, _: WarmRequirement) -> bool {
 }
 
 fn vless_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
+    if !unchained(node) {
+        return false;
+    }
     let vless = node
         .vless()
         .expect("VLESS descriptor requires VLESS config");
@@ -80,7 +126,7 @@ fn vless_supports_warm(node: &Node, requirement: WarmRequirement) -> bool {
 }
 
 fn vless_supports_udp(node: &Node) -> bool {
-    node.vless().unwrap().udp_enabled()
+    (unchained(node) || chained_udp_supported(node)) && node.vless().unwrap().udp_enabled()
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
@@ -94,13 +140,13 @@ fn vless_pool_bare_tcp(node: &Node) -> bool {
 /// framing state whose idle liveness cannot be probed at the fd level, so
 /// they stay on bare-TCP pooling. XHTTP instead owns its physical session pool.
 fn trojan_pool_ready_streams(node: &Node) -> bool {
-    matches!(node.transport().unwrap().transport.as_str(), "" | "tcp")
+    unchained(node) && matches!(node.transport().unwrap().transport.as_str(), "" | "tcp")
 }
 
 static DESCRIPTORS: &[ProtocolDescriptor] = &[
     ProtocolDescriptor {
         protocol: NodeProtocol::SS,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: always,
         supports_warm: no_warm,
@@ -109,7 +155,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Trojan,
-        supports_udp: network_allows_udp,
+        supports_udp: trojan_supports_udp,
         pool_ready_streams: trojan_pool_ready_streams,
         pool_bare_tcp: stream_pool_bare_tcp,
         supports_warm: stream_supports_warm,
@@ -140,19 +186,31 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     // stream is safe to pool and reuse directly.
     ProtocolDescriptor {
         protocol: NodeProtocol::Socks5,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: always,
         pool_bare_tcp: always,
         supports_warm: no_warm,
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["socks5", "socks4", "socks4a"],
     },
+    // HTTP CONNECT: TCP only. After a 2xx reply the tunnel is a pure data
+    // channel bound to its target, like SOCKS5; a bare TCP still owes the
+    // (optional) TLS handshake, which `dial_with_tcp` performs.
+    ProtocolDescriptor {
+        protocol: NodeProtocol::Http,
+        supports_udp: never,
+        pool_ready_streams: never,
+        pool_bare_tcp: always,
+        supports_warm: no_warm,
+        generation_runtime: GenerationRuntime::None,
+        share_link_schemes: &["http", "https"],
+    },
     // QUIC-based (hy2/tuic/juicity): a pooled bare TCP is unusable — their
     // `dial_with_tcp` fails — so preconnect warmup must not deposit one (it
     // would poison the first flow).
     ProtocolDescriptor {
         protocol: NodeProtocol::Hysteria2,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         supports_warm: pooled_supports_warm,
@@ -161,7 +219,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Tuic,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         supports_warm: pooled_supports_warm,
@@ -170,7 +228,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Juicity,
-        supports_udp: always,
+        supports_udp: native_or_chained_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         supports_warm: pooled_supports_warm,
@@ -236,6 +294,7 @@ mod tests {
             NodeProtocol::VMess,
             NodeProtocol::VLess,
             NodeProtocol::Socks5,
+            NodeProtocol::Http,
             NodeProtocol::Hysteria2,
             NodeProtocol::Tuic,
             NodeProtocol::Juicity,

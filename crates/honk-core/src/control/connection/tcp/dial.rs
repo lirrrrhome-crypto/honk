@@ -132,19 +132,21 @@ impl ControlPlaneHandle {
                         let mut dial = std::pin::pin!(dial);
                         // Poll the dial before the timer, and keep its pending
                         // acquisitions alive until the timeout is classified.
-                        tokio::time::timeout(per_dial_timeout, dial.as_mut())
-                            .await
-                            .unwrap_or_else(|_| {
-                                if scope.is_waiting_for_admission() {
-                                    return Err(
-                                        honk_outbound::proxy::PacketRejection::Capacity.into()
-                                    );
-                                }
-                                Err(anyhow::Error::new(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    format!("dial timed out after {per_dial_timeout:?}"),
-                                )))
-                            })
+                        let deadline = tokio::time::Instant::now() + per_dial_timeout;
+                        honk_outbound::proxy::detour::with_chain_deadline(
+                            deadline,
+                            tokio::time::timeout_at(deadline, dial.as_mut()),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            if scope.is_waiting_for_admission() {
+                                return Err(honk_outbound::proxy::PacketRejection::Capacity.into());
+                            }
+                            Err(anyhow::Error::new(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("dial timed out after {per_dial_timeout:?}"),
+                            )))
+                        })
                     };
                     let elapsed = start.elapsed();
                     let mut score = score.lock();
@@ -737,8 +739,8 @@ impl ControlPlaneHandle {
                     .await
                     .map(|stream| (stream, true))
             } else {
-                entry
-                    .tcp
+                // Through the registry so a node `detour` is still honoured.
+                registry
                     .dial(node, target, target_domain, connect_timeout)
                     .await
                     .map(|stream| (stream, true))

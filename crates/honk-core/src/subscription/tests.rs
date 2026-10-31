@@ -114,6 +114,90 @@ fn test_parse_base64_subscription() {
 }
 
 #[test]
+fn base64_subscription_chains_become_detour_hops() {
+    // dae: left = landing, right = relay. The second chain reuses the first
+    // relay; the plain node named like a generated relay name keeps its own.
+    let lines = [
+        "trojan://pw@land.example:443?sni=land.example#Land -> socks5://10.0.0.1:1080",
+        "ss://YWVzLTEyOC1nY206cHc@10.0.0.9:8388#Land2 -> ss://YWVzLTEyOC1nY206cHc@10.0.0.2:8388 -> socks5://10.0.0.1:1080",
+        "socks5://192.0.2.1:1080#Plain",
+        "hysteria2://p@t.example:443?mport=443-450#Bad -> socks5://10.0.0.1:1080",
+    ];
+    let encoded = base64::engine::general_purpose::STANDARD.encode(lines.join("\n"));
+    let nodes = parse_subscription_content(
+        &Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        },
+        &encoded,
+    )
+    .unwrap();
+    let by_name = |name: &str| nodes.iter().find(|n| n.name == name).unwrap();
+    let hosts = |start: &str| {
+        let mut out = Vec::new();
+        let mut current = Some(by_name(start));
+        while let Some(node) = current {
+            out.push(node.host.clone());
+            current = node.detour.as_deref().map(by_name);
+        }
+        out
+    };
+    assert_eq!(hosts("Land"), ["land.example", "10.0.0.1"]);
+    assert_eq!(hosts("Land2"), ["10.0.0.9", "10.0.0.2", "10.0.0.1"]);
+    assert_eq!(
+        by_name("Land").detour,
+        nodes.iter().find(|n| n.host == "10.0.0.2").unwrap().detour
+    );
+    assert!(by_name("Plain").detour.is_none());
+    assert!(
+        nodes
+            .iter()
+            .all(|n| n.name != "Bad" && n.host != "t.example"),
+        "port-hopping QUIC landing chain dropped"
+    );
+    let mut names: Vec<_> = nodes.iter().map(|n| &n.name).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), nodes.len());
+    assert_eq!(nodes.len(), 5);
+}
+
+#[test]
+fn subscription_bare_name_lines_declare_detours() {
+    // `name -> front` sets the detour of a node from another line, even one
+    // declared after it; relays and trailing names work like in `node {}`.
+    let lines = [
+        "Land -> Front",
+        "trojan://pw@land.example:443?sni=land.example#Land",
+        "socks5://10.0.0.1:1080#Front",
+        "socks5://192.0.2.7:1080#Land2",
+        "Land2 -> ss://YWVzLTEyOC1nY206cHc@10.0.0.2:8388 -> Front",
+        "Land3 -> Front",
+        "socks5://192.0.2.8:1080?dialer-proxy=Other#Conflict",
+        "Conflict -> Front",
+        "Conflict -> Other",
+        "Front -> Front2 -> x",
+    ];
+    let nodes = parse_subscription_content(
+        &Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        },
+        &lines.join("\n"),
+    )
+    .unwrap();
+    let by_name = |name: &str| nodes.iter().find(|n| n.name == name).unwrap();
+    assert_eq!(by_name("Land").detour.as_deref(), Some("Front"));
+    let relay = by_name("Land2").detour.clone().unwrap();
+    assert_eq!(by_name(&relay).host, "10.0.0.2");
+    assert_eq!(by_name(&relay).detour.as_deref(), Some("Front"));
+    assert_eq!(by_name("Conflict").detour.as_deref(), Some("Other"));
+    assert!(by_name("Front").detour.is_none());
+    assert!(nodes.iter().all(|n| n.name != "Land3"));
+    assert_eq!(nodes.len(), 5);
+}
+
+#[test]
 fn uri_subscription_with_empty_vmess_remark_remains_usable() {
     let payload = r#"{"ps":"","add":"vmess.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}"#;
     let uri = format!(
@@ -799,4 +883,307 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
     let error = result.unwrap_err();
     let error = error.downcast_ref::<DetailedConfigError>().unwrap();
     assert_eq!(error.diagnostic.as_ref(), &diagnostics[0]);
+}
+
+/// Follow a node's detour chain by name, as validation resolves it: detour-free node
+/// identities in dial-order reverse (landing first), ending with the group
+/// name when the chain leaves for a group.
+fn resolved_chain(nodes: &[Node], start: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = nodes.iter().find(|node| node.name == start);
+    while let Some(node) = current {
+        out.push(format!("{}:{}", node.protocol().as_str(), node.base_id()));
+        current = match node.detour.as_deref() {
+            Some(next) => {
+                let found = nodes.iter().find(|node| node.name == next);
+                if found.is_none() {
+                    out.push(format!("group:{next}"));
+                }
+                found
+            }
+            None => None,
+        };
+    }
+    out
+}
+
+fn parse_as(sub_type: SubscriptionType, content: &str) -> Vec<Node> {
+    parse_subscription_content(
+        &Subscription {
+            sub_type,
+            ..Default::default()
+        },
+        content,
+    )
+    .unwrap()
+}
+
+#[test]
+fn chain_syntaxes_resolve_to_the_same_chain() {
+    let land = "trojan://pw@land.example:443?sni=land.example";
+    let mid = "ss://YWVzLTEyOC1nY206cHc@10.0.0.2:8388";
+    let front = "socks5://10.0.0.1:1080";
+    let b64 = |text: String| base64::engine::general_purpose::STANDARD.encode(text);
+    let dae = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!("{land}#Land -> {mid} -> {front}")),
+    );
+    let links = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!(
+            "{land}&dialer-proxy=Mid#Land\n{mid}?detour=Front#Mid\n{front}#Front"
+        )),
+    );
+    let clash = parse_as(
+        SubscriptionType::Clash,
+        r#"
+proxies:
+  - {name: Land, type: trojan, server: land.example, port: 443, password: pw, sni: land.example, dialer-proxy: Mid}
+  - {name: Mid, type: ss, server: 10.0.0.2, port: 8388, cipher: aes-128-gcm, password: pw, dialer-proxy: Front}
+  - {name: Front, type: socks5, server: 10.0.0.1, port: 1080}
+"#,
+    );
+    let sing_box = parse_as(
+        SubscriptionType::Simple,
+        r#"{"outbounds":[
+  {"type":"trojan","tag":"Land","server":"land.example","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"land.example"},"detour":"Mid"},
+  {"type":"shadowsocks","tag":"Mid","server":"10.0.0.2","server_port":8388,"method":"aes-128-gcm","password":"pw","detour":"Front"},
+  {"type":"socks","tag":"Front","server":"10.0.0.1","server_port":1080}
+]}"#,
+    );
+    let expected = resolved_chain(&dae, "Land");
+    assert_eq!(expected.len(), 3, "{expected:?}");
+    for (label, nodes) in [
+        ("links", &links),
+        ("clash", &clash),
+        ("sing-box", &sing_box),
+    ] {
+        assert_eq!(resolved_chain(nodes, "Land"), expected, "{label}");
+    }
+}
+
+#[test]
+fn chain_syntaxes_agree_on_a_group_target() {
+    let land = "socks5://192.0.2.9:1080";
+    let b64 = |text: String| base64::engine::general_purpose::STANDARD.encode(text);
+    let dae = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!("{land}#Land -> relays")),
+    );
+    let link = parse_as(
+        SubscriptionType::Simple,
+        &b64(format!("{land}?dialer-proxy=relays#Land")),
+    );
+    let clash = parse_as(
+        SubscriptionType::Clash,
+        "proxies:\n  - {name: Land, type: socks5, server: 192.0.2.9, port: 1080, dialer-proxy: relays}\n",
+    );
+    let sing_box = parse_as(
+        SubscriptionType::Simple,
+        r#"{"outbounds":[{"type":"socks","tag":"Land","server":"192.0.2.9","server_port":1080,"detour":"relays"},{"type":"selector","tag":"relays","outbounds":["x"]}]}"#,
+    );
+    let expected = resolved_chain(&dae, "Land");
+    assert_eq!(expected.last().map(String::as_str), Some("group:relays"));
+    for (label, nodes) in [("link", &link), ("clash", &clash), ("sing-box", &sing_box)] {
+        assert_eq!(resolved_chain(nodes, "Land"), expected, "{label}");
+    }
+}
+
+#[test]
+fn imported_conflicting_detours_are_rejected_identical_ones_kept() {
+    let clash = |extra: &str| {
+        parse_as(
+            SubscriptionType::Clash,
+            &format!(
+                "proxies:\n  - {{name: Land, type: socks5, server: 192.0.2.9, port: 1080, dialer-proxy: a{extra}}}\n  - {{name: Ok, type: socks5, server: 192.0.2.8, port: 1080}}\n"
+            ),
+        )
+    };
+    let same = clash(", dialer_proxy: a");
+    assert_eq!(
+        same.iter()
+            .find(|n| n.name == "Land")
+            .unwrap()
+            .detour
+            .as_deref(),
+        Some("a")
+    );
+    let conflict = clash(", dialer_proxy: b");
+    assert!(
+        conflict.iter().all(|n| n.name != "Land"),
+        "conflicting node dropped"
+    );
+    assert!(conflict.iter().any(|n| n.name == "Ok"));
+    let quic = parse_as(
+        SubscriptionType::Clash,
+        "proxies:\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, ports: 443-450, dialer-proxy: a}\n  - {name: Ok, type: socks5, server: 192.0.2.8, port: 1080}\n",
+    );
+    assert!(quic.iter().all(|n| n.name != "Q"));
+    let chained_quic = parse_as(
+        SubscriptionType::Clash,
+        "proxies:\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, dialer-proxy: a}\n  - {name: T, type: tuic, server: t.example, port: 443, uuid: 00000000-0000-0000-0000-000000000001, password: p, dialer-proxy: a}\n",
+    );
+    for name in ["Q", "T"] {
+        let node = chained_quic.iter().find(|n| n.name == name).unwrap();
+        assert_eq!(node.detour.as_deref(), Some("a"), "{name}");
+    }
+}
+
+#[test]
+fn clash_and_sing_box_http_proxies_import_with_tls_and_detour() {
+    let parse = |sub_type, body: &str| {
+        parse_subscription_content(
+            &Subscription {
+                sub_type,
+                ..Default::default()
+            },
+            body,
+        )
+    };
+    let clash = r#"
+proxies:
+  - {name: H, type: http, server: 10.0.0.1, port: 3128, username: u, password: p}
+  - {name: HS, type: http, server: 10.0.0.2, port: 443, tls: true, sni: s.example, skip-cert-verify: true, dialer-proxy: H}
+"#;
+    let nodes = parse(SubscriptionType::Clash, clash).unwrap();
+    assert_eq!(nodes.len(), 2);
+    let h = nodes.iter().find(|n| n.name == "H").unwrap();
+    assert_eq!(h.protocol(), NodeProtocol::Http);
+    assert_eq!(h.http().unwrap().username.as_deref(), Some("u"));
+    assert!(!h.http().unwrap().tls.enabled);
+    let hs = nodes.iter().find(|n| n.name == "HS").unwrap();
+    let tls = &hs.http().unwrap().tls;
+    assert!(tls.enabled && tls.skip_cert_verify);
+    assert_eq!(tls.sni.as_deref(), Some("s.example"));
+    assert_eq!(hs.detour.as_deref(), Some("H"));
+
+    let sing_box = r#"{"outbounds":[
+      {"type":"http","tag":"J","server":"10.0.0.3","server_port":8080,"username":"a","password":"b",
+       "tls":{"enabled":true,"server_name":"j.example"},"detour":"K"},
+      {"type":"socks","tag":"K","server":"10.0.0.4","server_port":1080}]}"#;
+    let nodes = parse(SubscriptionType::Simple, sing_box).unwrap();
+    let j = nodes.iter().find(|n| n.name == "J").unwrap();
+    assert_eq!(j.protocol(), NodeProtocol::Http);
+    assert_eq!(j.http().unwrap().password.as_deref(), Some("b"));
+    assert!(j.http().unwrap().tls.enabled);
+    assert_eq!(j.detour.as_deref(), Some("K"));
+
+    let bad = r#"{"outbounds":[{"type":"http","tag":"P","server":"10.0.0.5","server_port":80,"path":"/x"}]}"#;
+    assert!(
+        parse(SubscriptionType::Simple, bad)
+            .map(|n| n.is_empty())
+            .unwrap_or(true)
+    );
+}
+
+/// Seeded mutation fuzz of every subscription shape: parsing never panics and
+/// every accepted chained node can actually ride its front (a node that kept
+/// a detour it cannot honour would fail open or be refused at dial time).
+#[test]
+fn mutated_subscriptions_never_accept_unchainable_detours() {
+    use rand::{RngExt, SeedableRng};
+    let id = "00000000-0000-0000-0000-000000000001";
+    let seeds = [
+        "trojan://pw@1.2.3.4:443?sni=a&dialer-proxy=Mid#Land\nsocks5://5.6.7.8:1080?detour=Front#Mid\nsocks5://9.9.9.9:1080#Front\nLand -> Front\n".to_string(),
+        format!(
+            "vless://{id}@1.2.3.4:443?encryption=none#V -> ss://YWVzLTI1Ni1nY206cHc@9.9.9.9:8388#S\nhysteria2://pw@1.2.3.4:443?sni=a&mport=443-450#H\nanytls://pw@1.2.3.4:443#A\nH -> S\nA -> S\n"
+        ),
+        "proxies:\n  - {name: Land, type: trojan, server: l.example, port: 443, password: pw, dialer-proxy: Front}\n  - {name: Front, type: socks5, server: 1.1.1.1, port: 1080}\n  - {name: Q, type: hysteria2, server: q.example, port: 443, password: pw, ports: 443-450, dialer-proxy: Front}\n  - {name: X, type: vless, server: x.example, port: 443, uuid: 00000000-0000-0000-0000-000000000001, network: xhttp, dialer-proxy: Front}\n".to_string(),
+        r#"{"version":1,"servers":[{"server":"1.2.3.4","server_port":8388,"password":"pw","method":"aes-256-gcm","remarks":"s"}]}"#.to_string(),
+    ];
+    let tokens: [&[u8]; 12] = [
+        b" -> ",
+        b"->",
+        b"&dialer-proxy=Front",
+        b"?detour=Mid",
+        b"#Front",
+        b"\n",
+        b"dialer-proxy: Land",
+        b"&mport=1-9",
+        b"&type=xhttp",
+        b"anytls://p@h:1#Mid",
+        b"Front -> Land\n",
+        b"\x00",
+    ];
+    let types = [
+        SubscriptionType::Simple,
+        SubscriptionType::Clash,
+        SubscriptionType::Sip008,
+        SubscriptionType::Custom,
+    ];
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_cafe);
+    for round in 0..6000 {
+        let mut data = seeds[round % seeds.len()].clone().into_bytes();
+        for _ in 0..rng.random_range(1..6) {
+            let at = rng.random_range(0..=data.len());
+            match rng.random_range(0..3) {
+                0 => {
+                    let token = tokens[rng.random_range(0..tokens.len())];
+                    data.splice(at..at, token.iter().copied());
+                }
+                1 if !data.is_empty() => {
+                    let end = (at + rng.random_range(1..16)).min(data.len());
+                    data.drain(at.min(data.len() - 1)..end.max(at.min(data.len() - 1)));
+                }
+                _ => data.insert(at, rng.random()),
+            }
+        }
+        let Ok(text) = String::from_utf8(data) else {
+            continue;
+        };
+        for sub_type in types {
+            let sub = Subscription {
+                sub_type,
+                ..Default::default()
+            };
+            let mut diagnostics = Vec::new();
+            let Ok(nodes) =
+                parse_subscription_content_with_diagnostics(&sub, &text, &mut diagnostics)
+            else {
+                continue;
+            };
+            for node in &nodes {
+                assert!(!node.id.is_nil(), "{text:?}");
+                assert_eq!(node.id, node.derive_id(), "{sub_type:?} {text:?}");
+                if node.detour.is_some() {
+                    assert!(
+                        node.supports_detour(),
+                        "{sub_type:?} accepted unchainable {:?} {:?}: {text:?}",
+                        node.protocol(),
+                        node.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One share-link line whose own `dialer-proxy` its protocol cannot ride is
+/// ignored with a warning; the rest of the subscription still loads.
+#[test]
+fn unchainable_dialer_proxy_line_is_ignored_not_fatal() {
+    for bad in [
+        "anytls://pw@1.2.3.4:443?dialer-proxy=Front#Bad",
+        "hysteria2://pw@1.2.3.4:443?mport=443-450&dialer-proxy=Front#Bad",
+    ] {
+        let body = format!(
+            "socks5://9.9.9.9:1080#Front\n{bad}\nsocks5://8.8.8.8:1080?dialer-proxy=Front#Good\n"
+        );
+        let sub = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        let mut diagnostics = Vec::new();
+        let nodes =
+            parse_subscription_content_with_diagnostics(&sub, &body, &mut diagnostics).unwrap();
+        let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["Front", "Good"], "{bad}");
+        let config = honk_config::Config {
+            nodes,
+            ..Default::default()
+        };
+        config
+            .validate_detailed()
+            .expect("remaining nodes validate");
+    }
 }

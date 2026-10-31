@@ -101,12 +101,16 @@ impl ProtocolEntry {
 
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
+    tcp_table: super::detour::TcpTable,
+    packet_table: super::detour::PacketTable,
 }
 
 impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            tcp_table: Default::default(),
+            packet_table: Default::default(),
         }
     }
 
@@ -120,6 +124,9 @@ impl ProxyRegistry {
                 .with_shared(socks5.clone())
                 .with_probeable(socks5),
         );
+        let http = Arc::new(super::http::HttpHandler::new());
+        registry
+            .register(ProtocolEntry::new(NodeProtocol::Http, http.clone()).with_probeable(http));
         let direct = Arc::new(DirectHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::Direct, direct.clone())
@@ -200,7 +207,53 @@ impl ProxyRegistry {
         Ok(registry)
     }
 
-    pub fn register(&mut self, entry: ProtocolEntry) {
+    /// Register a protocol. Its TCP handler is wrapped so that every dial of
+    /// a chained node, including direct handler calls, goes through the
+    /// detour front.
+    pub fn register(&mut self, mut entry: ProtocolEntry) {
+        let inner = Arc::clone(&entry.tcp);
+        self.tcp_table
+            .write()
+            .push((entry.descriptor.protocol, Arc::clone(&inner)));
+        entry.tcp = Arc::new(super::detour::ChainAware {
+            inner,
+            table: Arc::clone(&self.tcp_table),
+            packet: Arc::clone(&self.packet_table),
+        });
+        use super::detour::DetourGuard;
+        if let Some(packet) = &entry.packet {
+            self.packet_table
+                .write()
+                .push((entry.descriptor.protocol, Arc::clone(packet)));
+        }
+        entry.packet = entry.packet.take().map(|inner| {
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn PacketOutbound>
+        });
+        entry.shared = entry.shared.take().map(|inner| {
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn SharedSourceOutbound>
+        });
+        entry.warmable = entry.warmable.take().map(|inner| {
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn WarmableOutbound>
+        });
+        entry.probeable = entry.probeable.take().map(|inner| {
+            Arc::new(DetourGuard(
+                inner,
+                Arc::clone(&self.tcp_table),
+                Arc::clone(&self.packet_table),
+            )) as Arc<dyn ProbeableOutbound>
+        });
         self.entries.push(entry);
     }
 
@@ -217,6 +270,19 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        if node.detour.is_some() {
+            return super::detour::dial_chained(
+                &self.tcp_table,
+                &self.packet_table,
+                None,
+                node.clone(),
+                target,
+                target_domain.map(str::to_owned),
+                connect_timeout,
+                0,
+            )
+            .await;
+        }
         let protocol = node.protocol();
         let entry = self
             .find(protocol)
@@ -246,6 +312,23 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        if let Some(node) = generation
+            .get(&node_id)
+            .filter(|runtime| runtime.node.detour.is_some())
+            .map(|runtime| runtime.node.as_ref().clone())
+        {
+            return super::detour::dial_chained(
+                &self.tcp_table,
+                &self.packet_table,
+                Some(generation),
+                node,
+                target,
+                target_domain.map(str::to_owned),
+                connect_timeout,
+                0,
+            )
+            .await;
+        }
         self.dial_generation(generation, node_id, |runtime, entry| {
             let tcp = Arc::clone(&entry.tcp);
             Ok(async move {
@@ -406,6 +489,9 @@ impl ProxyRegistry {
         {
             return Err(PacketRejection::Policy.into());
         }
+        if node.detour.is_some() && !crate::descriptor::chained_udp_supported(node) {
+            anyhow::bail!(super::detour::chained_udp_refusal(node));
+        }
         if protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
@@ -552,6 +638,10 @@ impl ProxyRegistry {
         target_port: u16,
     ) -> anyhow::Result<&'a Arc<dyn PacketOutbound>> {
         let protocol = runtime.node.protocol();
+        if runtime.node.detour.is_some() && !crate::descriptor::chained_udp_supported(&runtime.node)
+        {
+            anyhow::bail!(super::detour::chained_udp_refusal(&runtime.node));
+        }
         if protocol != NodeProtocol::Block
             && !crate::descriptor::udp_target_allowed(&runtime.node, target_port)
         {

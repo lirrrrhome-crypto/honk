@@ -431,7 +431,6 @@ node {
         for input in [
             "node {\n    'ssr://a'\n}",
             "node {\n    'trojan-go://pw@example.com:443'\n}",
-            "node {\n    'http://proxy.example.com:8080'\n}",
         ] {
             let err = parse_dae_config(input).unwrap_err();
             assert!(matches!(err, crate::ConfigError::UnknownProtocol(_)));

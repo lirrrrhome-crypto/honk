@@ -82,6 +82,19 @@ impl ControlPlane {
         let current = Arc::clone(&config_guard);
         let incoming_len = nodes.len();
         let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
+        // A bad detour drops only that subscription node (with a warning);
+        // a subscription whose nodes are all invalid is still rejected.
+        let dropped = new_config.drop_invalid_subscription_detours(subscription_id)?;
+        let incoming_len = incoming_len - dropped.len();
+        for node in dropped {
+            warn!(
+                subscription_id = %subscription_id,
+                node = %node.name,
+                reason = node.reason,
+                "dropping subscription node with an invalid detour"
+            );
+            diagnostics.push(node.diagnostic);
+        }
         new_config.validate_assembled()?;
         if let Some(subscription) = current
             .subscriptions
@@ -181,6 +194,42 @@ mod tests {
         };
         node.id = node.derive_id();
         node
+    }
+
+    #[test]
+    fn merged_subscription_drops_only_nodes_with_bad_detours() {
+        let subscription_id = uuid::Uuid::new_v4();
+        let named = |name: &str, port: u16, detour: Option<&str>| {
+            let mut node = subscription_node(subscription_id);
+            node.name = name.into();
+            node.address = format!("127.0.0.1:{port}");
+            node.detour = detour.map(Into::into);
+            node.id = node.derive_id();
+            node
+        };
+        let nodes = vec![
+            named("front", 1080, None),
+            named("land", 1081, Some("front")),
+            named("loop", 1082, Some("loop")),
+        ];
+        let mut merged = config_with_subscription_nodes(&Config::default(), subscription_id, nodes);
+        let dropped = merged
+            .drop_invalid_subscription_detours(subscription_id)
+            .unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].name, "loop");
+        assert_eq!(dropped[0].reason, "detour-cycle");
+        let kept: Vec<_> = merged.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(kept, ["front", "land"]);
+
+        let all_bad = vec![named("loop", 1082, Some("loop"))];
+        let mut merged =
+            config_with_subscription_nodes(&Config::default(), subscription_id, all_bad);
+        assert!(
+            merged
+                .drop_invalid_subscription_detours(subscription_id)
+                .is_err()
+        );
     }
 
     #[test]

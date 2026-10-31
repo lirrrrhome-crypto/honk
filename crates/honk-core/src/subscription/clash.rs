@@ -50,6 +50,7 @@ fn supports_tls(protocol: NodeProtocol) -> bool {
         NodeProtocol::Trojan
             | NodeProtocol::VMess
             | NodeProtocol::VLess
+            | NodeProtocol::Http
             | NodeProtocol::Hysteria2
             | NodeProtocol::Tuic
             | NodeProtocol::Juicity
@@ -97,6 +98,8 @@ fn reject_active_unless(
 fn protocol_from_name(proxy_type: &str) -> Result<NodeProtocol, &'static str> {
     if proxy_type.eq_ignore_ascii_case("socks5") {
         Ok(NodeProtocol::Socks5)
+    } else if proxy_type.eq_ignore_ascii_case("http") {
+        Ok(NodeProtocol::Http)
     } else if proxy_type.eq_ignore_ascii_case("ss")
         || proxy_type.eq_ignore_ascii_case("shadowsocks")
     {
@@ -323,6 +326,10 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
             config.encryption = cipher;
         }
         OutboundConfig::Socks5(config) => {
+            config.username = username;
+            config.password = password;
+        }
+        OutboundConfig::Http(config) => {
             config.username = username;
             config.password = password;
         }
@@ -696,6 +703,29 @@ fn validate_imported_node(node: &Node) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Clash/mihomo `dialer-proxy` (sing-box `detour` is normalized to it): the
+/// node or group this proxy is dialed through, by name. Spellings that
+/// disagree are an error; identical repeats are fine.
+fn clash_detour(mapping: &Mapping) -> Result<Option<String>, &'static str> {
+    let mut detour: Option<String> = None;
+    for key in ["dialer-proxy", "dialer_proxy", "detour"] {
+        let Some(value) = yaml_text_alias(mapping, &[key])? else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match &detour {
+            Some(existing) if existing != value => {
+                return Err("conflicting dialer-proxy / detour values");
+            }
+            _ => detour = Some(value.to_owned()),
+        }
+    }
+    Ok(detour)
+}
+
 pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,
@@ -727,6 +757,12 @@ pub(super) fn parse_clash_proxy(
     node.normalize_stream_transport()?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
+    }
+    node.detour = clash_detour(mapping)?;
+    if node.detour.is_some() && !node.supports_detour() {
+        return Err(
+            "dialer-proxy/detour is unsupported for this protocol (anytls, xhttp, hysteria2 port hopping)",
+        );
     }
     validate_imported_node(&node)?;
     node.validate()

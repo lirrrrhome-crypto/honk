@@ -704,9 +704,6 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
         pool: Arc::clone(&pool),
         owner: Arc::clone(&owner),
     };
-    // Heap, not inline: an inline array adds 64 KiB to every source task.
-    let mut buf = vec![0u8; 65536];
-
     loop {
         let retired = owner.retire_notify.notified();
         let receive_started = owner.receive_notify.notified();
@@ -722,6 +719,11 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
             _ = receive_started => {}
         }
     }
+
+    // Heap, not inline: an inline array adds 64 KiB to every source task.
+    // Allocated only once receiving starts, so a source that is retired
+    // before its first send never holds it.
+    let mut buf = vec![0u8; 65536];
 
     let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
     tokio::pin!(reply_idle_timeout);

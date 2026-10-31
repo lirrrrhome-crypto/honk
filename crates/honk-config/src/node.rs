@@ -54,6 +54,9 @@ use crate::types::NodeProtocol;
 pub const NODE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x3d8f2e1a_9b4c_4d57_8f3a_2c6e1d0b9a7f);
 
+/// Longest accepted chain of `detour` hops (node → front edges).
+pub const MAX_DETOUR_HOPS: usize = 8;
+
 /// A proxy node definition. Protocol-specific state lives in [`OutboundConfig`];
 /// the outer node carries only identity, endpoint, and provenance shared by all
 /// outbounds.
@@ -69,6 +72,13 @@ pub struct Node {
     pub port: u16,
     pub outbound: OutboundConfig,
     pub mark: Option<u32>,
+    /// Front hop for chained dialing (sing-box `detour`, Clash Meta
+    /// `dialer-proxy`): the name of another node or a group. The node's own
+    /// TCP connection to its server is opened *through* that front instead of
+    /// a direct socket. Dial-path metadata only: it does not take part in
+    /// [`Node::derive_id`]. Protocols that can ride a front accept it; see
+    /// [`Node::supports_detour`].
+    pub detour: Option<String>,
     pub tags: Vec<String>,
     pub subscription_id: Option<uuid::Uuid>,
     pub group_id: Option<uuid::Uuid>,
@@ -90,6 +100,7 @@ impl Default for Node {
             port: 0,
             outbound: OutboundConfig::default(),
             mark: None,
+            detour: None,
             tags: Vec::new(),
             subscription_id: None,
             group_id: None,
@@ -100,6 +111,33 @@ impl Default for Node {
 }
 
 impl Node {
+    /// Whether this node's protocol can carry its server connection over a
+    /// chained front stream (MVP: TCP-carried protocols with a real
+    /// `dial_with_tcp` path). QUIC/UDP-native protocols (Hysteria2, TUIC,
+    /// Juicity), AnyTLS, XHTTP transports, multiplexed VLESS TCP and the
+    /// builtins cannot.
+    pub fn supports_detour(&self) -> bool {
+        match self.protocol() {
+            NodeProtocol::Socks5 | NodeProtocol::Http | NodeProtocol::SS | NodeProtocol::Trojan => {
+                !self.is_xhttp()
+            }
+            NodeProtocol::VMess => !self.is_xhttp(),
+            NodeProtocol::VLess => {
+                !self.is_xhttp()
+                    && self
+                        .vless()
+                        .is_some_and(|config| config.tcp_path() == VlessTcpPath::Direct)
+            }
+            // QUIC landings ride the front's UDP relay; a hopping port
+            // set has no single relay target.
+            NodeProtocol::Hysteria2 => self
+                .hysteria2()
+                .is_none_or(|config| config.port_hopping.as_deref().is_none_or(str::is_empty)),
+            NodeProtocol::Tuic | NodeProtocol::Juicity => true,
+            _ => false,
+        }
+    }
+
     pub fn protocol(&self) -> NodeProtocol {
         self.outbound.protocol()
     }
@@ -177,6 +215,20 @@ impl Node {
     pub fn shadowsocks_mut(&mut self) -> Option<&mut ShadowsocksConfig> {
         match &mut self.outbound {
             OutboundConfig::Shadowsocks(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn http(&self) -> Option<&HttpConfig> {
+        match &self.outbound {
+            OutboundConfig::Http(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn http_mut(&mut self) -> Option<&mut HttpConfig> {
+        match &mut self.outbound {
+            OutboundConfig::Http(config) => Some(config),
             _ => None,
         }
     }
@@ -321,7 +373,24 @@ impl Node {
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
     /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
+    /// A detour derives a further child UUID from the front name, so the same
+    /// server reached through different fronts is a different node; nodes
+    /// without a detour keep their IDs.
     pub fn derive_id(&self) -> uuid::Uuid {
+        let id = self.base_id();
+        match self.detour.as_deref() {
+            Some(detour) => {
+                let detour = serde_json::to_vec(&("detour", detour))
+                    .expect("detour names are JSON serializable");
+                uuid::Uuid::new_v5(&id, &detour)
+            }
+            None => id,
+        }
+    }
+
+    /// The identity without the detour: what [`Self::derive_id`] yields for
+    /// the same node dialed directly.
+    pub fn base_id(&self) -> uuid::Uuid {
         let material = self.identity_material();
         let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
         if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
@@ -592,3 +661,80 @@ impl GroupPolicy {
 
 #[cfg(test)]
 mod tests;
+
+/// Outcome of resolving a detour name against node candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetourNodeMatch<T> {
+    /// No candidate carries the name.
+    None,
+    /// Exactly one candidate in the preferred scope, or globally.
+    Unique(T),
+    /// Several candidates and no unique one in the referring node's subscription.
+    Ambiguous,
+}
+
+/// Resolve a detour node by name: a unique match inside the referring
+/// node's own subscription wins; otherwise the name must be unique among all
+/// candidates. `candidates` yields `(subscription_id, item)` for nodes whose
+/// name equals the detour target.
+pub fn pick_detour_node<T: Copy>(
+    scope: Option<uuid::Uuid>,
+    candidates: impl IntoIterator<Item = (Option<uuid::Uuid>, T)>,
+) -> DetourNodeMatch<T> {
+    let mut global = DetourNodeMatch::None;
+    let mut scoped = DetourNodeMatch::None;
+    let bump = |slot: &mut DetourNodeMatch<T>, item: T| {
+        *slot = match slot {
+            DetourNodeMatch::None => DetourNodeMatch::Unique(item),
+            _ => DetourNodeMatch::Ambiguous,
+        }
+    };
+    for (subscription, item) in candidates {
+        if scope.is_some() && subscription == scope {
+            bump(&mut scoped, item);
+        }
+        bump(&mut global, item);
+    }
+    match scoped {
+        DetourNodeMatch::None => global,
+        found => found,
+    }
+}
+
+#[cfg(test)]
+mod detour_pick_tests {
+    use super::{DetourNodeMatch, pick_detour_node};
+
+    #[test]
+    fn own_subscription_wins_then_global_must_be_unique() {
+        let a = Some(uuid::Uuid::from_u128(1));
+        let b = Some(uuid::Uuid::from_u128(2));
+        // Same name in two subscriptions: each resolves to its own.
+        assert_eq!(
+            pick_detour_node(a, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Unique(1)
+        );
+        assert_eq!(
+            pick_detour_node(b, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Unique(2)
+        );
+        // Inline (no subscription) or a third subscription sees a global duplicate.
+        assert_eq!(
+            pick_detour_node(None, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Ambiguous
+        );
+        let c = Some(uuid::Uuid::from_u128(3));
+        assert_eq!(
+            pick_detour_node(c, [(a, 1), (b, 2)]),
+            DetourNodeMatch::Ambiguous
+        );
+        // Falls back to a unique global match.
+        assert_eq!(pick_detour_node(a, [(None, 7)]), DetourNodeMatch::Unique(7));
+        // Duplicates inside the own subscription stay ambiguous.
+        assert_eq!(
+            pick_detour_node(a, [(a, 1), (a, 2), (None, 3)]),
+            DetourNodeMatch::Ambiguous
+        );
+        assert_eq!(pick_detour_node::<u8>(a, []), DetourNodeMatch::None);
+    }
+}

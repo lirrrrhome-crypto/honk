@@ -211,15 +211,18 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 .map(|feedback| feedback.with_probe_interval(probe_interval));
             let result = cancel
                 .run(runtime.scope_tasks(generation.scope_dials(
-                    honk_outbound::urltest::measure_http_probe(
-                        &runtime,
-                        entry.tcp.as_ref(),
-                        &request,
-                        addr,
-                        target_domain.as_deref(),
-                        connect_timeout,
-                        timeout,
-                        feedback,
+                    honk_outbound::proxy::detour::pin_generation(
+                        std::sync::Arc::clone(&generation),
+                        honk_outbound::urltest::measure_http_probe(
+                            &runtime,
+                            entry.tcp.as_ref(),
+                            &request,
+                            addr,
+                            target_domain.as_deref(),
+                            connect_timeout,
+                            timeout,
+                            feedback,
+                        ),
                     ),
                 )))
                 .await;

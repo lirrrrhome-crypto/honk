@@ -377,10 +377,16 @@ async fn plain_tcp_association_serves_every_destination() {
         ..Default::default()
     };
     node.tls_mut().unwrap().enabled = false;
-    let (transport, preparation) =
-        TrojanHandler::open_udp_stream(&node, None, first, None, std::time::Duration::from_secs(3))
-            .await
-            .unwrap();
+    let (transport, preparation) = TrojanHandler::open_udp_stream(
+        &node,
+        None,
+        None,
+        first,
+        None,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
     preparation.commit().unwrap();
     let transport: Arc<dyn MultiTargetTransport> = transport;
     transport

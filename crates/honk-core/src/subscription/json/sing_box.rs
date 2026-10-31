@@ -18,6 +18,7 @@ pub(super) fn normalize(value: Value) -> NodeResult {
     let protocol = match kind.as_str() {
         "shadowsocks" | "ss" => NodeProtocol::SS,
         "socks" | "socks5" => NodeProtocol::Socks5,
+        "http" => NodeProtocol::Http,
         "vmess" => NodeProtocol::VMess,
         "vless" => NodeProtocol::VLess,
         "trojan" => NodeProtocol::Trojan,
@@ -39,12 +40,17 @@ pub(super) fn normalize(value: Value) -> NodeResult {
     if protocol == NodeProtocol::VLess && source.contains_key("vless_mode") {
         return Err("VLESS vless_mode was removed");
     }
-    if source.remove("detour").is_some_and(|value| active(&value)) {
-        return Err("sing-box detour chaining is unsupported");
-    }
+    let detour = source.remove("detour").filter(active);
 
     let mut proxy = Mapping::new();
     put(&mut proxy, "type", Value::String(protocol.as_str().into()));
+    if let Some(detour) = detour {
+        let Value::String(detour) = detour else {
+            return Err("sing-box detour must be a string");
+        };
+        // The outbound tag this one dials through; tags become node names.
+        put(&mut proxy, "dialer-proxy", Value::String(detour));
+    }
     move_strings(
         &mut source,
         &mut proxy,
@@ -69,6 +75,7 @@ pub(super) fn normalize(value: Value) -> NodeResult {
     match protocol {
         NodeProtocol::SS => normalize_shadowsocks(source, proxy),
         NodeProtocol::Socks5 => normalize_socks5(source, proxy),
+        NodeProtocol::Http => normalize_http(source, proxy),
         NodeProtocol::VMess => normalize_vmess(source, proxy),
         NodeProtocol::VLess => normalize_vless(source, proxy),
         NodeProtocol::Trojan => normalize_trojan(source, proxy),
@@ -125,6 +132,23 @@ fn normalize_socks5(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
         "udp_over_tcp",
         "sing-box SOCKS UoT is unsupported",
     )?;
+    Ok(proxy)
+}
+
+fn normalize_http(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
+    move_credential_strings(
+        &mut source,
+        &mut proxy,
+        &[("username", "username"), ("password", "password")],
+    )?;
+    reject_packet_network(&mut source)?;
+    if source.remove("path").is_some_and(|value| active(&value)) {
+        return Err("sing-box HTTP outbound path is unsupported");
+    }
+    if source.remove("headers").is_some_and(|value| active(&value)) {
+        return Err("sing-box HTTP outbound headers are unsupported");
+    }
+    normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
 }
 

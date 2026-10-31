@@ -541,6 +541,20 @@ fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std
     .map(Some)
 }
 
+/// Set once startup downgraded a requested NFQUEUE because it was unavailable.
+static NFQUEUE_STARTUP_DOWNGRADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Reload candidates repeat the startup NFQUEUE downgrade, so an unchanged
+/// `nfqueue_enable` request is not mistaken for a restart-required change.
+pub(crate) fn apply_nfqueue_startup_downgrade(config: &mut Config) {
+    if config.global.nfqueue_enable
+        && NFQUEUE_STARTUP_DOWNGRADED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        config.global.nfqueue_enable = false;
+    }
+}
+
 fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
     if !config.global.nfqueue_enable {
         return;
@@ -568,6 +582,7 @@ fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
             "NFQUEUE is unavailable at startup; continuing with NFQUEUE staging disabled"
         );
         config.global.nfqueue_enable = false;
+        NFQUEUE_STARTUP_DOWNGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1782,6 +1797,17 @@ mod startup_lifecycle_tests {
         config.global.nfqueue_enable = true;
         prepare_nfqueue_startup(&mut config, true);
         assert!(!config.global.nfqueue_enable);
+
+        // A reload candidate that still requests NFQUEUE is downgraded the
+        // same way instead of reading as a restart-required change.
+        let mut candidate = honk_config::Config::default();
+        candidate.global.nfqueue_enable = true;
+        super::apply_nfqueue_startup_downgrade(&mut candidate);
+        assert!(!candidate.global.nfqueue_enable);
+        assert_eq!(
+            config.global.nfqueue_enable,
+            candidate.global.nfqueue_enable
+        );
     }
 
     #[cfg(not(feature = "ebpf"))]

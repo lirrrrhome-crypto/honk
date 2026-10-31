@@ -55,3 +55,48 @@ pub fn lexer(data: &[u8]) {
     assert_eq!(end, input.len());
     spans(input, &diagnostics);
 }
+
+/// Check that every accepted `->` chain wires only detour-capable nodes, keeps
+/// content-derived identities, and forms an acyclic path ending at the relay
+/// set (a detour that points outside the chain would dial an unknown front).
+pub fn share_link_chain(data: &[u8]) {
+    let Ok(input) = std::str::from_utf8(data) else {
+        return;
+    };
+    let Ok(chain) = Node::from_share_link_chain_with_detailed_diagnostics_emit(input, &mut |_| {})
+    else {
+        return;
+    };
+    let nodes: Vec<&Node> = std::iter::once(&chain.landing)
+        .chain(&chain.relays)
+        .collect();
+    for node in &nodes {
+        assert!(!node.id.is_nil());
+        assert_eq!(node.id, node.derive_id());
+        // A link's own dialer-proxy on an unchainable protocol is parsed and
+        // left for detour validation to reject; chain-built detours never are.
+        let rides_relay = node
+            .detour
+            .as_deref()
+            .is_some_and(|front| chain.relays.iter().any(|relay| relay.name == front));
+        if rides_relay {
+            assert!(
+                node.supports_detour(),
+                "chained {:?} onto a relay",
+                node.protocol()
+            );
+        }
+    }
+    let mut current = &chain.landing;
+    for _ in 0..=nodes.len() {
+        let Some(front) = current.detour.as_deref() else {
+            return;
+        };
+        let Some(next) = chain.relays.iter().find(|relay| relay.name == front) else {
+            // A detour naming a node outside the chain (dialer-proxy) is allowed.
+            return;
+        };
+        current = next;
+    }
+    panic!("detour cycle in accepted chain");
+}

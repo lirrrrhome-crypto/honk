@@ -5,7 +5,9 @@
 pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
+pub mod datagram_pipe;
 pub mod direct;
+pub mod http;
 pub mod hysteria2;
 pub mod juicity;
 pub mod shadowsocks;
@@ -19,6 +21,7 @@ pub mod vless;
 #[cfg(feature = "rprx")]
 pub mod vmess;
 
+pub mod detour;
 mod error;
 mod outbound;
 mod packet;

@@ -429,6 +429,15 @@ fn config_validation_error(
     )
 }
 
+/// A subscription node removed by [`Config::drop_invalid_subscription_detours`].
+#[derive(Debug, Clone)]
+pub struct DroppedDetourNode {
+    pub name: String,
+    /// The detour validation code that caused the drop.
+    pub reason: &'static str,
+    pub diagnostic: crate::diagnostic::DetailedDiagnostic,
+}
+
 impl Config {
     /// The built-in `direct` node name (usable as a group member without
     /// being declared in the config).
@@ -886,6 +895,201 @@ impl Config {
             || self.groups.iter().any(|group| group.name == detour)
     }
 
+    /// Validate node-level chained dialing (`detour` / `dialer-proxy`):
+    /// the carrying protocol must support a front stream, every front must
+    /// name exactly one node or a group, and the node → front / group →
+    /// member graph must be acyclic. A group containing the detouring node
+    /// itself (directly or nested) is rejected as a potential cycle.
+    fn validate_detours_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
+        use std::collections::HashMap;
+        if self.nodes.iter().all(|node| node.detour.is_none()) {
+            return Ok(());
+        }
+        let setting = |index: usize| SettingPath::new("nodes").index(index + 1).field("detour");
+        let error = |index: usize, code: &'static str, message: &'static str| {
+            let mut error = config_validation_error(source, setting(index), code, message);
+            error.diagnostic.entry_index = Some(index + 1);
+            error
+        };
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Vertex {
+            Node(usize),
+            Group(usize),
+        }
+        let user_node =
+            |node: &crate::node::Node| node.id != DIRECT_NODE_ID && node.id != BLOCK_NODE_ID;
+        let mut node_by_id = HashMap::with_capacity(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            node_by_id.insert(node.id, index);
+        }
+        let group_by_name: HashMap<&str, usize> = self
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| (group.name.as_str(), index))
+            .collect();
+        let mut front = vec![None; self.nodes.len()];
+        for (index, node) in self.nodes.iter().enumerate() {
+            let Some(target) = node.detour.as_deref() else {
+                continue;
+            };
+            if !user_node(node) {
+                return Err(error(
+                    index,
+                    "invalid-detour",
+                    "builtin nodes cannot use a detour",
+                ));
+            }
+            if !node.supports_detour() {
+                return Err(error(
+                    index,
+                    "unsupported-detour-protocol",
+                    "detour is supported for socks5, http, shadowsocks, trojan, vmess, vless \
+                     without xhttp, and QUIC landings (hysteria2 without port hopping, tuic, \
+                     juicity) whose front relays UDP; anytls cannot be chained",
+                ));
+            }
+            if let Some(&group) = group_by_name.get(target) {
+                front[index] = Some(Vertex::Group(group));
+                continue;
+            }
+            let picked = crate::node::pick_detour_node(
+                node.subscription_id,
+                self.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| user_node(candidate) && candidate.name == target)
+                    .map(|(candidate, found)| (found.subscription_id, candidate)),
+            );
+            match picked {
+                crate::node::DetourNodeMatch::Ambiguous => {
+                    return Err(error(
+                        index,
+                        "ambiguous-detour-target",
+                        "detour names a node name shared by several nodes outside its own \
+                         subscription; use a group",
+                    ));
+                }
+                crate::node::DetourNodeMatch::Unique(candidate) if candidate == index => {
+                    return Err(error(index, "detour-cycle", "node detour names itself"));
+                }
+                crate::node::DetourNodeMatch::Unique(candidate) => {
+                    front[index] = Some(Vertex::Node(candidate));
+                }
+                crate::node::DetourNodeMatch::None => {
+                    return Err(error(
+                        index,
+                        "unknown-detour-target",
+                        "detour is not a declared node or group",
+                    ));
+                }
+            }
+        }
+        // Edges: node → its front; group → every member node, nested group
+        // and `final_outbound` (any of which the policy may pick at connect
+        // time, so cycles and depth are checked against the worst member). Iterative three-color DFS; a back edge is a cycle.
+        let edges = |vertex: Vertex| -> Vec<Vertex> {
+            match vertex {
+                Vertex::Node(index) => front[index].into_iter().collect(),
+                Vertex::Group(index) => {
+                    let group = &self.groups[index];
+                    group
+                        .nodes
+                        .iter()
+                        .filter_map(|id| node_by_id.get(id).copied().map(Vertex::Node))
+                        .chain(
+                            group
+                                .groups
+                                .iter()
+                                .filter_map(|name| group_by_name.get(name.as_str()))
+                                .map(|&nested| Vertex::Group(nested)),
+                        )
+                        // `final_outbound` is selected when the policy has
+                        // nothing available, so it is a member too (a node
+                        // name wins over a group, as in the resolver).
+                        .chain(group.final_outbound.as_deref().and_then(|name| {
+                            self.nodes
+                                .iter()
+                                .position(|node| user_node(node) && node.name == name)
+                                .map(Vertex::Node)
+                                .or_else(|| group_by_name.get(name).map(|&g| Vertex::Group(g)))
+                        }))
+                        .collect()
+                }
+            }
+        };
+        #[derive(Clone, Copy, PartialEq)]
+        enum Color {
+            White,
+            Grey,
+            Black,
+        }
+        let mut color: HashMap<Vertex, Color> = HashMap::new();
+        for (start, target) in front.iter().enumerate() {
+            if target.is_none() || color.contains_key(&Vertex::Node(start)) {
+                continue;
+            }
+            let mut stack = vec![(Vertex::Node(start), edges(Vertex::Node(start)), 0usize)];
+            color.insert(Vertex::Node(start), Color::Grey);
+            while let Some((vertex, next, cursor)) = stack.last_mut() {
+                if let Some(&child) = next.get(*cursor) {
+                    *cursor += 1;
+                    match color.get(&child).copied().unwrap_or(Color::White) {
+                        Color::Grey => {
+                            return Err(error(
+                                start,
+                                "detour-cycle",
+                                "detour chain forms a cycle (possibly through a group member)",
+                            ));
+                        }
+                        Color::Black => {}
+                        Color::White => {
+                            color.insert(child, Color::Grey);
+                            let child_edges = edges(child);
+                            stack.push((child, child_edges, 0));
+                        }
+                    }
+                } else {
+                    color.insert(*vertex, Color::Black);
+                    stack.pop();
+                }
+            }
+        }
+        // The graph is acyclic now: bound the longest detour chain so a
+        // config the dialer would refuse at runtime fails validation instead.
+        // Group edges cost nothing; each node → front edge is one hop.
+        fn hops(
+            vertex: Vertex,
+            edges: &dyn Fn(Vertex) -> Vec<Vertex>,
+            memo: &mut HashMap<Vertex, usize>,
+        ) -> usize {
+            if let Some(&known) = memo.get(&vertex) {
+                return known;
+            }
+            let cost = usize::from(matches!(vertex, Vertex::Node(_)));
+            let longest = edges(vertex)
+                .into_iter()
+                .map(|child| cost + hops(child, edges, memo))
+                .max()
+                .unwrap_or(0);
+            memo.insert(vertex, longest);
+            longest
+        }
+        let mut memo = HashMap::new();
+        for (index, target) in front.iter().enumerate() {
+            if target.is_some()
+                && hops(Vertex::Node(index), &edges, &mut memo) > crate::node::MAX_DETOUR_HOPS
+            {
+                return Err(error(
+                    index,
+                    "detour-chain-too-deep",
+                    "detour chain is longer than 8 hops",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_references_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         const MAX_USER_GROUPS: usize = 0xFC - 2;
         if !self.valid_download_detour(&self.assets.route) {
@@ -1032,13 +1236,76 @@ impl Config {
             .map_err(DetailedConfigError::into_legacy)
     }
 
+    /// Drop nodes of `subscription_id` whose detour is invalid (names
+    /// itself, forms a cycle, or names an unknown target), one at a time
+    /// until the detour graph validates, and return one warning per dropped
+    /// node. Errors on hand-written (non-subscription) nodes or other
+    /// detour errors are returned unchanged, and so is the error that would
+    /// drop the subscription's last node: a subscription whose nodes are
+    /// all invalid is rejected as a whole.
+    pub fn drop_invalid_subscription_detours(
+        &mut self,
+        subscription_id: uuid::Uuid,
+    ) -> Result<Vec<DroppedDetourNode>, DetailedConfigError> {
+        const DROPPABLE: [&str; 3] = [
+            "detour-cycle",
+            "unknown-detour-target",
+            "ambiguous-detour-target",
+        ];
+        let source = DiagnosticSources::new(None).root();
+        let mut dropped = Vec::new();
+        loop {
+            let Err(error) = self.validate_detours_detailed(&source) else {
+                return Ok(dropped);
+            };
+            let Some(index) = error
+                .diagnostic
+                .entry_index
+                .and_then(|ordinal| ordinal.checked_sub(1))
+            else {
+                return Err(error);
+            };
+            let owned = self
+                .nodes
+                .get(index)
+                .is_some_and(|node| node.subscription_id == Some(subscription_id));
+            let remaining = self
+                .nodes
+                .iter()
+                .filter(|node| node.subscription_id == Some(subscription_id))
+                .count();
+            if !DROPPABLE.contains(&error.diagnostic.code) || !owned || remaining <= 1 {
+                return Err(error);
+            }
+            let node = self.nodes.remove(index);
+            for group in &mut self.groups {
+                group.nodes.retain(|id| *id != node.id);
+            }
+            let mut warning = crate::diagnostic::DetailedDiagnostic::warning(
+                "dropped-invalid-detour",
+                source.clone(),
+                SettingPath::new("nodes").index(index + 1).field("detour"),
+                crate::diagnostic::SafeValue::Ordinal(index + 1),
+                "subscription node dropped: its detour names itself, forms a cycle, \
+                 or names no unique node or group",
+            );
+            warning.entry_index = Some(index + 1);
+            dropped.push(DroppedDetourNode {
+                name: node.name,
+                reason: error.diagnostic.code,
+                diagnostic: warning,
+            });
+        }
+    }
+
     /// Validate operator configuration while retaining typed diagnostics.
     pub fn validate_detailed(&self) -> Result<(), DetailedConfigError> {
         let source = DiagnosticSources::new(None).root();
         self.validate_globals_detailed(&source)?;
         crate::node::validate_node_collection(&self.nodes)?;
         self.validate_reserved_names_detailed(&source)?;
-        self.validate_references_detailed(&source)
+        self.validate_references_detailed(&source)?;
+        self.validate_detours_detailed(&source)
     }
     /// Validate a fully assembled runtime snapshot.
     ///
@@ -1052,6 +1319,7 @@ impl Config {
         crate::node::validate_node_collection(&self.nodes)?;
         // Provider display names are not operator declarations of reserved builtins.
         self.validate_references_detailed(&source)?;
+        self.validate_detours_detailed(&source)?;
 
         let node_ids: std::collections::HashSet<_> =
             self.nodes.iter().map(|node| node.id).collect();

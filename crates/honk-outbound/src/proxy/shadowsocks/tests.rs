@@ -51,7 +51,7 @@ fn test_is_2022_method() {
 fn legacy_transport(socket: tokio::net::UdpSocket, target: SocketAddr) -> SsUdpTransport {
     SsUdpTransport {
         server_addr: socket.peer_addr().unwrap(),
-        socket,
+        socket: super::DatagramPipe::Socket(socket),
         crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
             LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
         )),

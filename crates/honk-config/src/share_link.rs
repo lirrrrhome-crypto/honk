@@ -26,12 +26,15 @@ use crate::error::{ConfigError, DetailedConfigError, ErrorCategory};
 use crate::node::{Node, OutboundConfig, ShadowsocksConfig};
 use crate::options::vocab::{optional_text, vmess_cipher, xhttp_stream_transport};
 
+mod chain;
 mod options;
 mod xhttp;
 
+pub use chain::{ChainNamer, ShareLinkChain, chain_hops, is_bare_name, is_chain};
+
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
-    /// A chain describes several hops; only the first is parsed.
+    /// A dae `->` chain is rejected here; use [`Node::from_share_link_chain`].
     pub fn from_share_link(link: &str) -> Result<Node, ConfigError> {
         let mut diagnostics = Vec::new();
         let result = Self::from_share_link_with_detailed_diagnostics(link, &mut diagnostics);
@@ -81,6 +84,25 @@ impl Node {
         source: &crate::diagnostic::SourceRef,
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, crate::error::DetailedConfigError> {
+        if chain::is_chain(link) {
+            return Err(chain::chain_error(
+                source,
+                "invalid-chain",
+                "node chain (->) link needs chain parsing; it was not reduced to its first hop",
+            ));
+        }
+        // Chained-dial front hop: `dialer-proxy=` / `detour=` query parameter.
+        // Stripped before protocol decoding so no handler sees it.
+        let (stripped, detour) = take_detour_param(link).map_err(|message| {
+            DetailedConfigError::new(
+                ErrorCategory::Validation,
+                "invalid-detour",
+                source.clone(),
+                SettingPath::new("nodes").field("detour"),
+                message,
+            )
+        })?;
+        let link = stripped.as_ref();
         // A node entry that parses only ever warns with `legacy-*` codes, so native
         // clients read any other warning on the entry as the entry being dropped.
         let mut node = Self::decode_share_link(link, source, &mut |diagnostic| {
@@ -107,6 +129,7 @@ impl Node {
             error.diagnostic.source = source.clone();
             error
         })?;
+        node.detour = detour;
         node.id = node.derive_id();
         Ok(node)
     }
@@ -117,7 +140,7 @@ impl Node {
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, DetailedConfigError> {
         let legacy = |error| DetailedConfigError::from_legacy(error, source.clone());
-        let first = link.split("->").next().unwrap_or("").trim();
+        let first = link.trim();
         let mut ss_config = None;
         let (decoded, shadowrocket) = match first.split_once("://") {
             Some((scheme, payload)) if scheme.eq_ignore_ascii_case("vmess") => {
@@ -183,6 +206,13 @@ fn invalid_link(source: &SourceRef) -> DetailedConfigError {
 fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedConfigError> {
     let outbound = match url.scheme() {
         "socks5" | "socks4" | "socks4a" => OutboundConfig::Socks5(Default::default()),
+        "http" | "https" => OutboundConfig::Http(crate::node::HttpConfig {
+            tls: crate::node::TlsOptions {
+                enabled: url.scheme() == "https",
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         "ss" => OutboundConfig::Shadowsocks(Default::default()),
         "trojan" => OutboundConfig::Trojan(Default::default()),
         "anytls" => OutboundConfig::AnyTls(Default::default()),
@@ -197,7 +227,7 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 "unknown-protocol",
                 source.clone(),
                 SettingPath::new("config").field("protocol"),
-                "unknown node protocol; expected socks5, socks4, socks4a, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic or juicity",
+                "unknown node protocol; expected socks5, socks4, socks4a, http, https, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic or juicity",
             ));
         }
     };
@@ -205,7 +235,12 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
         .host_str()
         .ok_or_else(|| invalid_link(source))?
         .to_string();
-    let port = match url.port() {
+    // `url` hides the scheme's default port (http 80, https 443).
+    let port = match url.port().or_else(|| {
+        matches!(url.scheme(), "http" | "https")
+            .then(|| url.port_or_known_default())
+            .flatten()
+    }) {
         Some(0) => return Err(invalid_link(source)),
         Some(port) => port,
         None => 443,
@@ -230,6 +265,10 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
         let single = || percent_decode_credential(raw_password.or(raw_username), source);
         match &mut node.outbound {
             OutboundConfig::Socks5(config) => {
+                config.username = username()?;
+                config.password = password()?;
+            }
+            OutboundConfig::Http(config) => {
                 config.username = username()?;
                 config.password = password()?;
             }
@@ -735,4 +774,55 @@ fn hex_to_byte(h: u8, l: u8) -> Result<u8, ()> {
     let hi = hex_val(h).ok_or(())?;
     let lo = hex_val(l).ok_or(())?;
     Ok(hi << 4 | lo)
+}
+
+/// Query keys naming a chained-dial front hop on a share link.
+const DETOUR_PARAMS: [&str; 3] = ["dialer-proxy", "dialer_proxy", "detour"];
+
+/// Remove every `dialer-proxy=` / `detour=` query parameter from the first
+/// hop of `link`, returning the remaining link and the last non-empty
+/// (percent-decoded) value. Links without such a parameter are borrowed as-is.
+pub(crate) fn take_detour_param(
+    link: &str,
+) -> Result<(Cow<'_, str>, Option<String>), &'static str> {
+    let (hop, rest) = link.split_at(link.len());
+    let fragment_start = hop.find('#').unwrap_or(hop.len());
+    let (body, fragment) = hop.split_at(fragment_start);
+    let Some((base, query)) = body.split_once('?') else {
+        return Ok((Cow::Borrowed(link), None));
+    };
+    let mut detour = None;
+    let mut kept = Vec::new();
+    let mut found = false;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if DETOUR_PARAMS
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+        {
+            found = true;
+            let value = percent_decode_str(value);
+            let value = value.trim();
+            if !value.is_empty() {
+                if detour.as_deref().is_some_and(|previous| previous != value) {
+                    return Err("conflicting detour / dialer-proxy values in one share link");
+                }
+                detour = Some(value.to_string());
+            }
+        } else {
+            kept.push(pair);
+        }
+    }
+    if !found {
+        return Ok((Cow::Borrowed(link), None));
+    }
+    let mut out = String::with_capacity(link.len());
+    out.push_str(base);
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    out.push_str(fragment);
+    out.push_str(rest);
+    Ok((Cow::Owned(out), detour))
 }

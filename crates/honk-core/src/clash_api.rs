@@ -412,6 +412,7 @@ fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
         NodeProtocol::VMess => "Vmess",
         NodeProtocol::VLess => "Vless",
         NodeProtocol::Socks5 => "Socks5",
+        NodeProtocol::Http => "Http",
         NodeProtocol::Hysteria2 => "Hysteria2",
         NodeProtocol::Tuic => "Tuic",
         NodeProtocol::Juicity => "Juicity",
