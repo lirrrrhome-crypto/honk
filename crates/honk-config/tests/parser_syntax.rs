@@ -616,3 +616,19 @@ routing {
         );
     }
 }
+
+/// A routing line holding only Unicode whitespace (e.g. a full-width space
+/// pasted from a CJK editor) is a blank line, not a parser panic.
+#[test]
+fn whitespace_only_routing_lines_are_blank() {
+    for blank in ["\u{3000}", "\u{a0}", "\u{b}", "\u{c}", "\u{2003}\u{3000}"] {
+        let text = format!(
+            "global {{\n}}\nrouting {{\n{blank}\ndomain(example.com) -> block\n{blank}\nfallback: block\n}}\n"
+        );
+        let config =
+            honk_config::parser::parse_dae_config_with_detailed_diagnostics(&text, &mut Vec::new())
+                .unwrap_or_else(|e| panic!("{blank:?}: {e}"));
+        assert_eq!(config.routing.rules.len(), 1, "{blank:?}");
+        assert_eq!(config.routing.default_outbound, "block", "{blank:?}");
+    }
+}
