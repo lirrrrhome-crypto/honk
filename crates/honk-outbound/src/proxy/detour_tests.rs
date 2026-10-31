@@ -1823,3 +1823,26 @@ async fn caller_deadline_extends_the_chain_budget_for_slow_fronts() {
         .expect("the caller's longer deadline lets the slow front finish");
     http_204(&mut stream).await;
 }
+
+/// Nested caller deadlines merge to the earliest, in either order, and
+/// without any caller the default is one connect_timeout.
+#[tokio::test]
+async fn with_chain_deadline_keeps_the_earliest() {
+    let now = tokio::time::Instant::now();
+    let (early, late) = (now + Duration::from_secs(1), now + Duration::from_secs(9));
+    let t = Duration::from_secs(5);
+    let seen = super::with_chain_deadline(
+        early,
+        super::with_chain_deadline(late, async { super::chain_deadline(t) }),
+    )
+    .await;
+    assert_eq!(seen, early);
+    let seen = super::with_chain_deadline(
+        late,
+        super::with_chain_deadline(early, async { super::chain_deadline(t) }),
+    )
+    .await;
+    assert_eq!(seen, early);
+    let default = super::chain_deadline(t);
+    assert!(default >= now + t && default <= tokio::time::Instant::now() + t);
+}
