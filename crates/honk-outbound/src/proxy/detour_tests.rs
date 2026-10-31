@@ -1467,3 +1467,124 @@ fn chained_nodes_of_every_protocol_never_pool_or_warm_direct() {
         }
     }
 }
+
+/// Accepts TCP and never answers, so every handshake through it hangs.
+async fn silent_server() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    addr
+}
+
+/// Nested front groups whose members all hang share one total deadline:
+/// failover still walks members in order, but a dead path fails within
+/// `CHAIN_BUDGET_FACTOR × connect_timeout` instead of multiplying per hop.
+#[tokio::test]
+async fn nested_group_front_failover_shares_one_deadline() {
+    let _serial = SERIAL.lock().await;
+    let mut nodes = String::new();
+    for i in 0..4 {
+        nodes += &format!(" si{i}: 'socks5://{}'\n", silent_server().await);
+    }
+    for i in 0..4 {
+        nodes += &format!(" sm{i}: 'socks5://{}?detour=gi'\n", silent_server().await);
+    }
+    nodes += " sl: 'socks5://192.0.2.9:1080?detour=gm'\n";
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n{nodes}}}\ngroup {{\n gi {{\n filter: name(si0, si1, si2, si3)\n policy: selector\n }}\n\
+             gm {{\n filter: name(sm0, sm1, sm2, sm3)\n policy: selector\n }}\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let manager = Arc::new(crate::group::GroupManager::new(
+        &config.groups,
+        &config.nodes,
+    ));
+    super::install_group_manager(Arc::new(parking_lot::RwLock::new(Arc::clone(&manager))));
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let land = node_id(&config, "sl");
+    let timeout = Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        registry.dial_runtime(
+            Arc::clone(&generation),
+            land,
+            "198.51.100.7:80".parse().unwrap(),
+            None,
+            timeout,
+        ),
+    )
+    .await
+    .expect("dial must end by itself");
+    let elapsed = started.elapsed();
+    eprintln!("NESTED elapsed={elapsed:?} ok={}", result.is_ok());
+    assert!(result.is_err());
+    let budget = timeout * super::CHAIN_BUDGET_FACTOR;
+    assert!(
+        elapsed < budget + Duration::from_millis(500),
+        "dead nested fronts took {elapsed:?}, budget {budget:?}"
+    );
+}
+
+/// Under the shared deadline, a hanging selected front still fails over to
+/// the next member inside the same dial.
+#[tokio::test]
+async fn hanging_group_front_still_fails_over_in_order() {
+    let _serial = SERIAL.lock().await;
+    let land = Arc::new(Log::default());
+    let land_real = socks_server(Arc::new(AtomicBool::new(true)), None, Arc::clone(&land)).await;
+    let land_alias = SocketAddr::from(([192, 0, 2, 1], land_real.port()));
+    let good_log = Arc::new(Log::default());
+    let good = socks_server(
+        Arc::new(AtomicBool::new(true)),
+        Some((land_alias, land_real)),
+        Arc::clone(&good_log),
+    )
+    .await;
+    let dead = silent_server().await;
+    let http = http_server().await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n hd: 'socks5://{dead}'\n hg: 'socks5://{good}'\n hl: 'socks5://{land_alias}?detour=hgroup'\n}}\n\
+             group {{\n hgroup {{\n filter: name(hd, hg)\n policy: selector\n }}\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let manager = Arc::new(crate::group::GroupManager::new(
+        &config.groups,
+        &config.nodes,
+    ));
+    super::install_group_manager(Arc::new(parking_lot::RwLock::new(Arc::clone(&manager))));
+    manager
+        .set_selector_choice("hgroup", "hd", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let timeout = Duration::from_millis(400);
+    let started = tokio::time::Instant::now();
+    let mut stream = registry
+        .dial_runtime(
+            Arc::clone(&generation),
+            node_id(&config, "hl"),
+            http,
+            None,
+            timeout,
+        )
+        .await
+        .expect("fails over from the hanging member to hg");
+    http_204(&mut stream).await;
+    assert_eq!(good_log.targets.lock().len(), 1);
+    assert!(started.elapsed() < timeout * super::CHAIN_BUDGET_FACTOR + Duration::from_millis(300));
+}

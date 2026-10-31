@@ -68,6 +68,11 @@ pub fn install_runtime_registry(registry: &SharedRuntimeRegistry) {
         .write() = Arc::downgrade(registry);
 }
 
+/// A whole chained dial, however deep, finishes within this many
+/// `connect_timeout`s. It matches honk-core's per-dial cap
+/// (`connect_timeout * 3`), so the chain's own failover finishes first.
+pub(crate) const CHAIN_BUDGET_FACTOR: u32 = 3;
+
 tokio::task_local! {
     static PINNED_GENERATION: Arc<OutboundRuntimeRegistry>;
 }
@@ -218,6 +223,35 @@ fn group_front(name: &str) -> Option<Option<Node>> {
 /// Most fronts tried for one dial when the front is a group: its current
 /// selection, then other members in declaration order.
 pub(crate) const MAX_FRONT_CANDIDATES: usize = 4;
+
+tokio::task_local! {
+    /// The instant a chained dial must finish by. The outermost chained dial
+    /// sets it; every nested hop and front attempt inherits (a share of) it,
+    /// so failover across nested groups cannot multiply `connect_timeout`
+    /// per hop.
+    static CHAIN_DEADLINE: tokio::time::Instant;
+}
+
+/// The deadline in force, or a fresh one for an outermost chained dial.
+fn chain_deadline(connect_timeout: Duration) -> tokio::time::Instant {
+    CHAIN_DEADLINE
+        .try_with(|deadline| *deadline)
+        .unwrap_or_else(|_| tokio::time::Instant::now() + connect_timeout * CHAIN_BUDGET_FACTOR)
+}
+
+/// Run `dial` under the chain deadline (inherited or fresh), failing with a
+/// timeout error once it passes.
+async fn within_chain_deadline<T>(
+    connect_timeout: Duration,
+    what: &str,
+    dial: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let deadline = chain_deadline(connect_timeout);
+    CHAIN_DEADLINE
+        .scope(deadline, tokio::time::timeout_at(deadline, dial))
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("{what} timed out (detour chain deadline)")))
+}
 
 /// Front candidates for one dial, in try order. A group yields its current
 /// selection first and then its other ordinary member leaves, so a dead
@@ -386,6 +420,8 @@ pub(crate) fn dial_chained<'a>(
     depth: usize,
 ) -> BoxFuture<'a, anyhow::Result<ProxyStream>> {
     Box::pin(async move {
+        let what = format!("chained dial of {:?}", node.name);
+        within_chain_deadline(connect_timeout, &what, async move {
         tracing::debug!("Dialing {} via chained node {}", target, node.name);
         if is_quic(&node) {
             let carrier = FrontCarrier::new(
@@ -417,6 +453,8 @@ pub(crate) fn dial_chained<'a>(
                 connect_timeout,
             )
             .await
+        })
+        .await
     })
 }
 
@@ -452,18 +490,40 @@ pub(crate) fn dial_front_tcp<'a>(
             node.id,
         )?;
         let mut last = None;
-        for front in fronts {
+        let deadline = chain_deadline(connect_timeout);
+        let count = fronts.len();
+        for (index, front) in fronts.into_iter().enumerate() {
             let name = front.name.clone();
-            match dial_front_once(
-                table,
-                packet,
-                generation.clone(),
-                node,
-                front,
-                connect_timeout,
-                depth,
-            )
-            .await
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                last = Some(anyhow::anyhow!(
+                    "detour chain deadline passed before front {name} of {}",
+                    node.name
+                ));
+                break;
+            }
+            // Each remaining candidate gets an equal share of what is left,
+            // so one hanging member cannot starve the ones after it.
+            let share = deadline.saturating_duration_since(now) / (count - index) as u32;
+            let attempt_deadline = now + share;
+            let attempt = CHAIN_DEADLINE.scope(
+                attempt_deadline,
+                tokio::time::timeout_at(
+                    attempt_deadline,
+                    dial_front_once(
+                        table,
+                        packet,
+                        generation.clone(),
+                        node,
+                        front,
+                        connect_timeout,
+                        depth,
+                    ),
+                ),
+            );
+            match attempt
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("front attempt timed out after {share:?}")))
             {
                 Ok(stream) => return Ok(stream),
                 Err(error) => {
@@ -681,16 +741,20 @@ async fn dial_udp_chained(
     target_domain: Option<&str>,
     connect_timeout: Duration,
 ) -> anyhow::Result<Arc<dyn super::PacketTransport>> {
-    if is_quic(node) {
-        let (bridged, bridge) = quic_bridged_node(node, carrier, connect_timeout).await?;
-        return handler
-            .dial_udp_transport(&bridged, target, target_domain, connect_timeout)
+    let what = format!("chained UDP dial of {:?}", node.name);
+    within_chain_deadline(connect_timeout, &what, async {
+        if is_quic(node) {
+            let (bridged, bridge) = quic_bridged_node(node, carrier, connect_timeout).await?;
+            return handler
+                .dial_udp_transport(&bridged, target, target_domain, connect_timeout)
+                .await
+                .map(|transport| super::packet_transport_with_owner(transport, bridge));
+        }
+        handler
+            .dial_udp_transport_chained(node, carrier, target, target_domain, connect_timeout)
             .await
-            .map(|transport| super::packet_transport_with_owner(transport, bridge));
-    }
-    handler
-        .dial_udp_transport_chained(node, carrier, target, target_domain, connect_timeout)
-        .await
+    })
+    .await
 }
 
 /// Why `node` (which carries a detour) cannot carry UDP through its front.
