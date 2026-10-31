@@ -66,14 +66,16 @@ where
             None => None,
         };
         let remaining = candidate_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let error =
-            match tokio::time::timeout_at(candidate_deadline, dial(address, remaining, permit))
-                .await
-            {
-                Ok(Ok(value)) => return Ok(value),
-                Ok(Err(error)) => error,
-                Err(_) => anyhow::anyhow!("timed out after {budget:?}"),
-            };
+        let error = match honk_outbound::proxy::detour::with_chain_deadline(
+            candidate_deadline,
+            tokio::time::timeout_at(candidate_deadline, dial(address, remaining, permit)),
+        )
+        .await
+        {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error,
+            Err(_) => anyhow::anyhow!("timed out after {budget:?}"),
+        };
         if honk_outbound::proxy::is_packet_rejection(&error) {
             return Err(error.context(format!("{label} dial to {address}")));
         }

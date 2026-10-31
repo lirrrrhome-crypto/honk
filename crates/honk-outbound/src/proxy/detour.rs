@@ -68,10 +68,24 @@ pub fn install_runtime_registry(registry: &SharedRuntimeRegistry) {
         .write() = Arc::downgrade(registry);
 }
 
-/// A whole chained dial, however deep, finishes within this many
-/// `connect_timeout`s. It matches honk-core's per-dial cap
-/// (`connect_timeout * 3`), so the chain's own failover finishes first.
-pub(crate) const CHAIN_BUDGET_FACTOR: u32 = 3;
+/// Without a caller deadline (see [`with_chain_deadline`]), a whole
+/// chained dial, however deep, finishes within this many
+/// `connect_timeout`s. It is 1 so the chain's failover fits any caller that
+/// bounds the dial by `connect_timeout` itself.
+pub(crate) const CHAIN_BUDGET_FACTOR: u32 = 1;
+
+/// Run `dial` with `deadline` as the budget for any chained dial inside
+/// it, so front failover is shared out over the time the caller actually
+/// allows. An earlier deadline already in force wins.
+pub async fn with_chain_deadline<F: std::future::Future>(
+    deadline: tokio::time::Instant,
+    dial: F,
+) -> F::Output {
+    let deadline = CHAIN_DEADLINE
+        .try_with(|current| (*current).min(deadline))
+        .unwrap_or(deadline);
+    CHAIN_DEADLINE.scope(deadline, dial).await
+}
 
 tokio::task_local! {
     static PINNED_GENERATION: Arc<OutboundRuntimeRegistry>;
@@ -261,6 +275,55 @@ async fn within_chain_deadline<T>(
         .scope(deadline, tokio::time::timeout_at(deadline, dial))
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("{what} timed out (detour chain deadline)")))
+}
+
+/// Try `fronts` in order under the chain deadline. Each remaining
+/// candidate gets an equal share of what is left (passed down as the
+/// deadline for nested hops), so one hanging member cannot starve the ones
+/// after it. `what` names the dial in logs and errors (e.g. "UDP detour").
+async fn try_fronts_in_order<T, F, Fut>(
+    fronts: Vec<Node>,
+    connect_timeout: Duration,
+    what: &str,
+    owner: &str,
+    mut attempt: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut(Node) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let deadline = chain_deadline(connect_timeout);
+    let count = fronts.len();
+    let mut last = None;
+    for (index, front) in fronts.into_iter().enumerate() {
+        let name = front.name.clone();
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            last = Some(anyhow::anyhow!(
+                "detour chain deadline passed before {what} front {name} of {owner}"
+            ));
+            break;
+        }
+        let share = deadline.saturating_duration_since(now) / (count - index) as u32;
+        let attempt_deadline = now + share;
+        let result = CHAIN_DEADLINE
+            .scope(
+                attempt_deadline,
+                tokio::time::timeout_at(attempt_deadline, attempt(front)),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("front attempt timed out after {share:?}")));
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                tracing::warn!(
+                    "{what} front {name} of {owner} failed: {error:#}; trying next member"
+                );
+                last = Some(error);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("{what} front of {owner} has no candidates")))
 }
 
 /// Front candidates for one dial, in try order. A group yields its current
@@ -499,54 +562,18 @@ pub(crate) fn dial_front_tcp<'a>(
             generation.as_deref(),
             node.id,
         )?;
-        let mut last = None;
-        let deadline = chain_deadline(connect_timeout);
-        let count = fronts.len();
-        for (index, front) in fronts.into_iter().enumerate() {
-            let name = front.name.clone();
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                last = Some(anyhow::anyhow!(
-                    "detour chain deadline passed before front {name} of {}",
-                    node.name
-                ));
-                break;
-            }
-            // Each remaining candidate gets an equal share of what is left,
-            // so one hanging member cannot starve the ones after it.
-            let share = deadline.saturating_duration_since(now) / (count - index) as u32;
-            let attempt_deadline = now + share;
-            let attempt = CHAIN_DEADLINE.scope(
-                attempt_deadline,
-                tokio::time::timeout_at(
-                    attempt_deadline,
-                    dial_front_once(
-                        table,
-                        packet,
-                        generation.clone(),
-                        node,
-                        front,
-                        connect_timeout,
-                        depth,
-                    ),
-                ),
-            );
-            match attempt
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("front attempt timed out after {share:?}")))
-            {
-                Ok(stream) => return Ok(stream),
-                Err(error) => {
-                    tracing::warn!(
-                        "detour front {name} of {} failed: {error:#}; trying next member",
-                        node.name
-                    );
-                    last = Some(error);
-                }
-            }
-        }
-        Err(last
-            .unwrap_or_else(|| anyhow::anyhow!("detour front {front_name:?} has no candidates")))
+        try_fronts_in_order(fronts, connect_timeout, "detour", &node.name, |front| {
+            dial_front_once(
+                table,
+                packet,
+                generation.clone(),
+                node,
+                front,
+                connect_timeout,
+                depth,
+            )
+        })
+        .await
     })
 }
 
@@ -974,36 +1001,29 @@ impl UdpCarrier for FrontCarrier {
         server_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::datagram_pipe::DatagramPipe> {
-        let mut last = None;
-        for front in self.fronts()? {
-            let name = front.name.clone();
-            tracing::debug!(
-                "UDP of chained node {} to {} via front {}",
-                self.node.name,
-                server_domain.unwrap_or(&server.to_string()),
-                name
-            );
-            match self
-                .front_transport(front, server, server_domain, connect_timeout)
-                .await
-            {
-                Ok(transport) => {
-                    return Ok(super::datagram_pipe::DatagramPipe::relay(
-                        transport,
-                        server,
-                        server_domain,
-                    ));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "UDP detour front {name} of {} failed: {error:#}; trying next member",
-                        self.node.name
-                    );
-                    last = Some(error);
-                }
-            }
-        }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("detour front has no candidates")))
+        try_fronts_in_order(
+            self.fronts()?,
+            connect_timeout,
+            "UDP detour",
+            &self.node.name,
+            |front| async move {
+                tracing::debug!(
+                    "UDP of chained node {} to {} via front {}",
+                    self.node.name,
+                    server_domain.unwrap_or(&server.to_string()),
+                    front.name
+                );
+                let transport = self
+                    .front_transport(front, server, server_domain, connect_timeout)
+                    .await?;
+                Ok(super::datagram_pipe::DatagramPipe::relay(
+                    transport,
+                    server,
+                    server_domain,
+                ))
+            },
+        )
+        .await
     }
 }
 

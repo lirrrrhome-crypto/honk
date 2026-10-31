@@ -1638,3 +1638,134 @@ async fn chain_deadline_saturates_on_absurd_connect_timeouts() {
         assert!(deadline >= tokio::time::Instant::now() - Duration::from_secs(1));
     }
 }
+
+/// UDP through a group front whose selected member hangs still fails over
+/// to the next member within the shared chain deadline.
+#[tokio::test]
+async fn hanging_udp_group_front_still_fails_over() {
+    let _serial = SERIAL.lock().await;
+    let ss_log = Arc::new(UdpLog::default());
+    let ss_real = ss_udp_echo(Arc::clone(&ss_log)).await;
+    let ss_alias = SocketAddr::from(([192, 0, 2, 1], ss_real.port()));
+    let good_log = Arc::new(UdpLog::default());
+    let good = socks_udp_server(
+        Arc::new(AtomicBool::new(true)),
+        vec![(ss_alias, ss_real)],
+        Arc::clone(&good_log),
+    )
+    .await;
+    let dead = silent_server().await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n ud: 'socks5://{dead}'\n ugood: 'socks5://{good}'\n\
+             ul: 'ss://YWVzLTEyOC1nY206cHc=@{ss_alias}?detour=uhg'\n}}\n\
+             group {{\n uhg {{\n filter: name(ud, ugood)\n policy: selector\n }}\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let manager = Arc::new(crate::group::GroupManager::new(
+        &config.groups,
+        &config.nodes,
+    ));
+    super::install_group_manager(Arc::new(parking_lot::RwLock::new(Arc::clone(&manager))));
+    manager
+        .set_selector_choice("uhg", "ud", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let timeout = Duration::from_millis(400);
+    let target: SocketAddr = "198.51.100.7:53".parse().unwrap();
+    let started = tokio::time::Instant::now();
+    let transport = tokio::time::timeout(
+        Duration::from_secs(20),
+        registry.dial_udp_transport_runtime(
+            Arc::clone(&generation),
+            node_id(&config, "ul"),
+            target,
+            None,
+            timeout,
+        ),
+    )
+    .await
+    .expect("UDP dial must end by itself")
+    .expect("fails over from the hanging member to ugood");
+    assert!(started.elapsed() < timeout * super::CHAIN_BUDGET_FACTOR + Duration::from_millis(300));
+    udp_echo_once(transport.as_ref(), target).await;
+    assert_eq!(good_log.udp_targets.lock().len(), 1);
+}
+
+/// A caller that cuts the dial at `connect_timeout` (as DNS does) still
+/// reaches the last, working member behind three hanging ones; and a
+/// caller deadline given via `with_chain_deadline` sets the budget.
+#[tokio::test]
+async fn last_front_candidate_is_not_starved_by_the_caller_bound() {
+    let _serial = SERIAL.lock().await;
+    let land = Arc::new(Log::default());
+    let land_real = socks_server(Arc::new(AtomicBool::new(true)), None, Arc::clone(&land)).await;
+    let land_alias = SocketAddr::from(([192, 0, 2, 1], land_real.port()));
+    let good_log = Arc::new(Log::default());
+    let good = socks_server(
+        Arc::new(AtomicBool::new(true)),
+        Some((land_alias, land_real)),
+        Arc::clone(&good_log),
+    )
+    .await;
+    let mut nodes = String::new();
+    for i in 0..3 {
+        nodes += &format!(" sd{i}: 'socks5://{}'\n", silent_server().await);
+    }
+    let http = http_server().await;
+    let config = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        &format!(
+            "node {{\n{nodes} sg: 'socks5://{good}'\n sland: 'socks5://{land_alias}?detour=sgrp'\n}}\n\
+             group {{\n sgrp {{\n filter: name(sd0, sd1, sd2, sg)\n policy: selector\n }}\n}}\n"
+        ),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    config.validate_detailed().unwrap();
+    let generation = install_generation(&config);
+    let manager = Arc::new(crate::group::GroupManager::new(
+        &config.groups,
+        &config.nodes,
+    ));
+    super::install_group_manager(Arc::new(parking_lot::RwLock::new(Arc::clone(&manager))));
+    manager
+        .set_selector_choice("sgrp", "sd0", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let land_id = node_id(&config, "sland");
+    let timeout = Duration::from_millis(800);
+    let mut stream = tokio::time::timeout(
+        timeout,
+        registry.dial_runtime(Arc::clone(&generation), land_id, http, None, timeout),
+    )
+    .await
+    .expect("the chain fits inside the caller's connect_timeout bound")
+    .expect("reaches the last member sg");
+    http_204(&mut stream).await;
+    assert_eq!(good_log.targets.lock().len(), 1);
+
+    // A caller deadline shorter than connect_timeout is honoured.
+    let started = tokio::time::Instant::now();
+    let short = started + Duration::from_millis(200);
+    let result = super::with_chain_deadline(
+        short,
+        registry.dial_runtime(
+            Arc::clone(&generation),
+            land_id,
+            http,
+            None,
+            Duration::from_secs(5),
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "ignored the caller deadline: {elapsed:?}"
+    );
+    drop(result);
+}
