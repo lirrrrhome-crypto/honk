@@ -373,3 +373,33 @@ fn detour_is_part_of_node_identity_and_unchained_ids_are_stable() {
         id("via1")
     );
 }
+
+fn chain_of(links: usize) -> Result<Config, String> {
+    let hops: Vec<String> = (0..links)
+        .map(|i| format!("socks5://10.0.0.{}:1080#n{i}", i + 1))
+        .collect();
+    let text = format!(
+        "node {{\n land: '{}'\n}}\ngroup {{\n}}\n",
+        hops.join(" -> ")
+    );
+    parse_dae_config_with_detailed_diagnostics(&text, &mut Vec::new()).map_err(|e| format!("{e:?}"))
+}
+
+/// Nine links (eight relay edges) is the deepest chain; the runtime dials the
+/// last chained front at depth 7 < `MAX_DETOUR_DEPTH`. A tenth link is refused.
+#[test]
+fn chain_depth_limit_matches_runtime() {
+    let deepest = chain_of(honk_config::node::MAX_DETOUR_HOPS + 1).unwrap();
+    assert_eq!(deepest.nodes.len(), 9);
+    assert_eq!(code(&deepest), None);
+    let land = deepest.nodes.iter().find(|n| n.name == "land").unwrap();
+    let mut edges = 0;
+    let mut current = land;
+    while let Some(front) = current.detour.as_deref() {
+        current = deepest.nodes.iter().find(|n| n.name == front).unwrap();
+        edges += 1;
+    }
+    assert_eq!(edges, honk_config::node::MAX_DETOUR_HOPS);
+    let too_deep = chain_of(honk_config::node::MAX_DETOUR_HOPS + 2).unwrap();
+    assert!(too_deep.nodes.is_empty(), "over-deep chain must not load");
+}
