@@ -152,6 +152,7 @@ impl ControlPlane {
             .bind_transport_quality(&runtime_registry);
         runtime_registry.activate_background_dial_admission();
         let runtime_registry = runtime_registry.into_shared();
+        honk_outbound::proxy::chain::install_runtime_registry(runtime_registry.clone());
         info!(
             nofile = resource_budget.effective_nofile,
             fixed = resource_budget.fixed_reserve,

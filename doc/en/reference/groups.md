@@ -175,7 +175,8 @@ group {
 - The first hop may be any TCP-capable protocol. Every later hop, the exit included, must handshake over a single TCP connection: Shadowsocks without a plugin, Trojan, VMess, SOCKS5, and VLESS without multiplexing or XHTTP. QUIC protocols (Hysteria2, TUIC, Juicity), AnyTLS and multiplexed VLESS in a later position drop the chain with a diagnostic or refuse the dial.
 - The `->` after a node link must sit outside quotes and follow whitespace or a closing quote; a `->` inside quotes or a bare link's fragment stays link data.
 - A node that names itself as dialer is dropped; statically visible cycles are reported, and cycles through groups stop at the 16-hop limit at dial time. An unknown tag does not fail the configuration (subscription nodes may arrive later), but dials through it fail.
-- Later hops carry the previous hop's stream over a private loopback TCP connection: one extra userspace copy per hop, and no pooling or splice.
+- Later hops carry the previous hop's stream over a private loopback TCP connection: one extra userspace copy per hop, and no pooling or splice. After one direction ends, the other closes after 30 seconds without data; an error in either direction closes both at once.
+- A session protocol as first hop (Hysteria2, TUIC, AnyTLS, multiplexed VLESS) reuses the current generation's session. The whole chain shares the core's per-dial deadline (three times `connect_timeout`), which matters for long chains. Dial errors name the failing hop and the hop it was reaching.
 
 ## Related docs
 

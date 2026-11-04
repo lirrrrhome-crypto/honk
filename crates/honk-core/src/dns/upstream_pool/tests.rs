@@ -128,5 +128,6 @@ fn test_group(
         interrupt_connections: false,
         own: Default::default(),
         created_at: chrono::Utc::now(),
+        relay: Vec::new(),
     }
 }

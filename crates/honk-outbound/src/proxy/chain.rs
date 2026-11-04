@@ -34,6 +34,14 @@ pub trait ChainResolver: Send + Sync {
 }
 
 static RESOLVER: RwLock<Option<Arc<dyn ChainResolver>>> = RwLock::new(None);
+static RUNTIMES: RwLock<Option<crate::runtime::SharedRuntimeRegistry>> = RwLock::new(None);
+
+/// Install the live runtime registry so a session protocol (Hysteria2,
+/// TUIC, AnyTLS, multiplexed VLESS) as first hop reuses its warmed session
+/// instead of handshaking a fresh one for every chained flow.
+pub fn install_runtime_registry(registry: crate::runtime::SharedRuntimeRegistry) {
+    *RUNTIMES.write() = Some(registry);
+}
 
 /// Install the process-wide hop resolver (honk-core does this once, over its
 /// shared group manager, so reloads are followed automatically).
@@ -133,10 +141,88 @@ fn server_target(node: &Node) -> (SocketAddr, Option<String>) {
     }
 }
 
+/// After one direction of a bridge ends, the other may idle this long
+/// before the bridge closes (matches the relay's `DRAIN_DEADLINE`), so a
+/// peer that never closes cannot pin the task and both sockets.
+#[cfg(not(test))]
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DRAIN_DEADLINE: Duration = Duration::from_millis(300);
+
+/// Bridges currently alive (observability and leak tests).
+static LIVE_BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of loopback bridges whose copy task is still running.
+pub fn live_bridges() -> usize {
+    LIVE_BRIDGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct LiveBridge;
+
+impl LiveBridge {
+    fn new() -> Self {
+        LIVE_BRIDGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for LiveBridge {
+    fn drop(&mut self) {
+        LIVE_BRIDGES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Copy `reader` to `writer` until EOF, then half-close `writer`. Once
+/// `drained` is set (the opposite direction ended), each read may wait at
+/// most [`DRAIN_DEADLINE`].
+async fn pump<R, W>(
+    mut reader: R,
+    mut writer: W,
+    drained: &tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut drained = drained.clone();
+    loop {
+        let read = async {
+            if *drained.borrow() {
+                return tokio::time::timeout(DRAIN_DEADLINE, reader.read(&mut buffer))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "proxy chain bridge drain deadline",
+                        ))
+                    });
+            }
+            tokio::select! {
+                read = reader.read(&mut buffer) => read,
+                _ = drained.changed() => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            }
+        };
+        let read = match read.await {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        writer.write_all(&buffer[..read]).await?;
+        writer.flush().await?;
+    }
+}
+
 /// Carry `upstream` on a fresh loopback `TcpStream`: returns our end, and a
-/// task copies between the other end and `upstream` until either closes.
-/// The connection is marked so a datapath hooked on `lo` leaves it alone,
-/// and only our own connect is accepted.
+/// task copies between the other end and `upstream`. EOF in one direction
+/// half-closes the other side and starts the drain deadline; an error in
+/// either direction closes both at once. The connection is marked so a
+/// datapath hooked on `lo` leaves it alone, and only our own connect is
+/// accepted.
 async fn bridge(upstream: ProxyStream, timeout: Duration) -> anyhow::Result<TcpStream> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
@@ -154,14 +240,47 @@ async fn bridge(upstream: ProxyStream, timeout: Duration) -> anyhow::Result<TcpS
     );
     let _ = theirs.set_nodelay(true);
     let _ = ours.set_nodelay(true);
-    let mut upstream = upstream.stream;
+    let live = LiveBridge::new();
     tokio::spawn(async move {
-        let mut theirs = theirs;
-        if let Err(error) = tokio::io::copy_bidirectional(&mut theirs, &mut upstream).await {
+        let _live = live;
+        let (local_read, local_write) = theirs.into_split();
+        let (remote_read, remote_write) = tokio::io::split(upstream.stream);
+        let (drained_tx, drained_rx) = tokio::sync::watch::channel(false);
+        let outbound = pump(local_read, remote_write, &drained_rx);
+        let inbound = pump(remote_read, local_write, &drained_rx);
+        tokio::pin!(outbound, inbound);
+        // The first direction to finish starts the drain of the other; an
+        // error ends both (dropping the halves closes the sockets).
+        let first = tokio::select! {
+            result = &mut outbound => (result, true),
+            result = &mut inbound => (result, false),
+        };
+        let result = match first {
+            (Err(error), _) => Err(error),
+            (Ok(()), outbound_done) => {
+                let _ = drained_tx.send(true);
+                if outbound_done { inbound.await } else { outbound.await }
+            }
+        };
+        if let Err(error) = result {
             tracing::debug!("proxy chain bridge closed: {error}");
         }
     });
     Ok(ours)
+}
+
+/// "hop `a` (1/3) reaching `b`": which leaf failed and what it was reaching,
+/// so a dead later hop is not blamed on the hop in front of it.
+fn hop_context(leaves: &[Node], index: usize) -> String {
+    let toward = leaves
+        .get(index + 1)
+        .map_or_else(|| "the destination".to_owned(), |next| format!("`{}`", next.name));
+    format!(
+        "proxy chain hop `{}` ({}/{}) reaching {toward}",
+        leaves[index].name,
+        index + 1,
+        leaves.len()
+    )
 }
 
 /// Dials chain nodes over a registry of the ordinary protocols.
@@ -197,11 +316,30 @@ impl ChainHandler {
                 .join(" -> "),
             target_domain.map_or_else(|| target.to_string(), str::to_owned)
         );
-        let mut stream = self
-            .base
-            .dial(&leaves[0], hop_target, hop_domain.as_deref(), connect_timeout)
-            .await
-            .map_err(|error| error.context(format!("proxy chain hop `{}`", leaves[0].name)))?;
+        let generation = RUNTIMES
+            .read()
+            .as_ref()
+            .map(|shared| Arc::clone(&shared.read()))
+            .filter(|generation| generation.get(&leaves[0].id).is_some());
+        let first = match generation {
+            Some(generation) => {
+                self.base
+                    .dial_runtime(
+                        generation,
+                        leaves[0].id,
+                        hop_target,
+                        hop_domain.as_deref(),
+                        connect_timeout,
+                    )
+                    .await
+            }
+            None => {
+                self.base
+                    .dial(&leaves[0], hop_target, hop_domain.as_deref(), connect_timeout)
+                    .await
+            }
+        };
+        let mut stream = first.map_err(|error| error.context(hop_context(leaves, 0)))?;
         for (index, leaf) in leaves.iter().enumerate().skip(1) {
             let entry = self
                 .base
@@ -219,7 +357,7 @@ impl ChainHandler {
                     connect_timeout,
                 )
                 .await
-                .map_err(|error| error.context(format!("proxy chain hop `{}`", leaf.name)))?;
+                .map_err(|error| error.context(hop_context(leaves, index)))?;
         }
         stream.target_addr = target;
         stream.target_domain = target_domain.map(str::to_owned);
@@ -364,22 +502,27 @@ mod tests {
         port
     }
 
-    #[tokio::test]
-    async fn three_hop_chain_visits_every_hop_in_order() {
-        let log_a = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let log_b = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let log_c = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let a = socks("a", socks_server(Arc::clone(&log_a)).await);
-        let mut b = socks("b", socks_server(Arc::clone(&log_b)).await);
+    /// Chain tests share the process-wide resolver and bridge counter.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct Setup {
+        logs: [Arc<parking_lot::Mutex<Vec<String>>>; 3],
+        hops: [Node; 3],
+        relay: Node,
+        handler: ChainHandler,
+    }
+
+    async fn setup() -> Setup {
+        let logs: [Arc<parking_lot::Mutex<Vec<String>>>; 3] = Default::default();
+        let a = socks("a", socks_server(Arc::clone(&logs[0])).await);
+        let mut b = socks("b", socks_server(Arc::clone(&logs[1])).await);
         b.host = "localhost".to_owned();
-        let c = socks("c", socks_server(Arc::clone(&log_c)).await);
-        let echo = echo_server().await;
+        let c = socks("c", socks_server(Arc::clone(&logs[2])).await);
         install_resolver(Arc::new(MapResolver(HashMap::from([
             ("a".to_owned(), a.clone()),
             ("b".to_owned(), b.clone()),
             ("c".to_owned(), c.clone()),
         ]))));
-
         // relay: a -> b -> c
         let relay = Node {
             name: "r/relay".to_owned(),
@@ -389,8 +532,42 @@ mod tests {
             }),
             ..Node::default()
         };
-        let handler = ChainHandler::new(ProxyRegistry::default_resolver().unwrap());
-        let target: SocketAddr = format!("127.0.0.1:{echo}").parse().unwrap();
+        Setup {
+            logs,
+            hops: [a, b, c],
+            relay,
+            handler: ChainHandler::new(ProxyRegistry::default_resolver().unwrap()),
+        }
+    }
+
+    async fn bridges_settle(baseline: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while live_bridges() > baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} bridge task(s) leaked",
+                live_bridges() - baseline
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn local(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[tokio::test]
+    async fn three_hop_chain_visits_every_hop_in_order() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let Setup {
+            logs,
+            hops: [_, b, c],
+            relay,
+            handler,
+        } = setup().await;
+        let echo = echo_server().await;
+        let target = local(echo);
         let mut stream = handler
             .dial(&relay, target, None, Duration::from_secs(3))
             .await
@@ -401,9 +578,11 @@ mod tests {
         assert_eq!(&reply, b"ping through three hops");
 
         // a reached b's server by name, b reached c's server, c the target.
-        assert_eq!(*log_a.lock(), [format!("localhost:{}", b.port)]);
-        assert_eq!(*log_b.lock(), [format!("127.0.0.1:{}", c.port)]);
-        assert_eq!(*log_c.lock(), [format!("127.0.0.1:{echo}")]);
+        assert_eq!(*logs[0].lock(), [format!("localhost:{}", b.port)]);
+        assert_eq!(*logs[1].lock(), [format!("127.0.0.1:{}", c.port)]);
+        assert_eq!(*logs[2].lock(), [format!("127.0.0.1:{echo}")]);
+        drop(stream);
+        bridges_settle(baseline).await;
 
         // A refused later hop fails closed before any connection.
         let mut quic = socks("q", 1);
@@ -420,6 +599,202 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("refused"), "{error:#}");
-        assert_eq!(log_a.lock().len(), 1);
+        assert_eq!(logs[0].lock().len(), 1);
+    }
+
+    /// Many concurrent flows with bulk data stay byte-exact and leave no
+    /// bridge behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_bulk_flows_stay_intact() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let setup = Arc::new(setup().await);
+        let target = local(echo_server().await);
+        let mut flows = tokio::task::JoinSet::new();
+        for flow in 0..64u32 {
+            let setup = Arc::clone(&setup);
+            flows.spawn(async move {
+                let stream = setup
+                    .handler
+                    .dial(&setup.relay, target, None, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                let (mut read, mut write) = tokio::io::split(stream.stream);
+                let payload: Vec<u8> = (0..256 * 1024u32)
+                    .map(|i| (i.wrapping_mul(31).wrapping_add(flow) % 251) as u8)
+                    .collect();
+                let expected = payload.clone();
+                let writer = tokio::spawn(async move {
+                    write.write_all(&payload).await.unwrap();
+                    write.shutdown().await.unwrap();
+                });
+                let mut echoed = Vec::new();
+                read.read_to_end(&mut echoed).await.unwrap();
+                writer.await.unwrap();
+                assert_eq!(echoed.len(), expected.len(), "flow {flow} length");
+                assert!(echoed == expected, "flow {flow} corrupted");
+            });
+        }
+        let started = std::time::Instant::now();
+        while let Some(result) = flows.join_next().await {
+            result.unwrap();
+        }
+        tracing::info!("64 x 256 KiB through 3 hops in {:?}", started.elapsed());
+        assert_eq!(setup.logs[2].lock().len(), 64);
+        bridges_settle(baseline).await;
+    }
+
+    /// The client half-closes, the server answers after EOF and closes.
+    #[tokio::test]
+    async fn half_close_round_trip() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let setup = setup().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            stream
+                .write_all(format!("got {} bytes", request.len()).as_bytes())
+                .await
+                .unwrap();
+        });
+        let stream = setup
+            .handler
+            .dial(&setup.relay, target, None, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let (mut read, mut write) = tokio::io::split(stream.stream);
+        write.write_all(&[7u8; 1000]).await.unwrap();
+        write.shutdown().await.unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(3), read.read_to_string(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, "got 1000 bytes");
+        drop((read, write));
+        bridges_settle(baseline).await;
+    }
+
+    /// A destination that never answers or closes after the client's
+    /// half-close cannot pin the bridges: they drain out on the deadline.
+    #[tokio::test]
+    async fn silent_peer_after_half_close_is_reaped() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let setup = setup().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let held = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let keep = Arc::clone(&held);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            stream.read_to_end(&mut sink).await.unwrap();
+            keep.lock().push(stream); // never writes, never closes
+        });
+        let stream = setup
+            .handler
+            .dial(&setup.relay, target, None, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let (mut read, mut write) = tokio::io::split(stream.stream);
+        write.shutdown().await.unwrap();
+        assert!(live_bridges() > baseline);
+        // The client side stays open; only the bridges' deadline ends it.
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut rest)).await;
+        bridges_settle(baseline).await;
+        drop((read, write, held));
+    }
+
+    /// A dead middle hop fails the dial promptly and cleans up.
+    #[tokio::test]
+    async fn dead_middle_hop_fails_fast() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let Setup {
+            hops: [a, _, c],
+            relay,
+            handler,
+            ..
+        } = setup().await;
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dead = socks("b", closed.local_addr().unwrap().port());
+        drop(closed);
+        install_resolver(Arc::new(MapResolver(HashMap::from([
+            ("a".to_owned(), a),
+            ("b".to_owned(), dead),
+            ("c".to_owned(), c),
+        ]))));
+        let started = std::time::Instant::now();
+        let error = handler
+            .dial(&relay, local(9), None, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(format!("{error:#}").contains("reaching `b`"), "{error:#}");
+        bridges_settle(baseline).await;
+    }
+
+    /// Dropping a flow mid-transfer releases every hop.
+    #[tokio::test]
+    async fn aborted_flow_releases_bridges() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let setup = setup().await;
+        let target = local(echo_server().await);
+        for _ in 0..16 {
+            let mut stream = setup
+                .handler
+                .dial(&setup.relay, target, None, Duration::from_secs(3))
+                .await
+                .unwrap();
+            stream.stream.write_all(&[1u8; 64 * 1024]).await.unwrap();
+            drop(stream);
+        }
+        bridges_settle(baseline).await;
+    }
+
+    /// An unresolvable hop and a self-referencing chain are refused.
+    #[tokio::test]
+    async fn unresolved_and_cyclic_hops_are_errors() {
+        let _serial = SERIAL.lock().await;
+        let setup = setup().await;
+        let missing = Node {
+            outbound: OutboundConfig::Chain(ChainConfig {
+                hops: vec!["nope".to_owned()],
+                exit: ChainExit::Tag("c".to_owned()),
+            }),
+            ..Node::default()
+        };
+        let error = setup
+            .handler
+            .dial(&missing, local(9), None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("resolves to no node"), "{error:#}");
+
+        let looped = Node {
+            name: "loop".to_owned(),
+            outbound: OutboundConfig::Chain(ChainConfig {
+                hops: vec!["loop".to_owned()],
+                exit: ChainExit::Tag("c".to_owned()),
+            }),
+            ..Node::default()
+        };
+        install_resolver(Arc::new(MapResolver(HashMap::from([
+            ("loop".to_owned(), looped.clone()),
+            ("c".to_owned(), setup.hops[2].clone()),
+        ]))));
+        let error = setup
+            .handler
+            .dial(&looped, local(9), None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("nests too deeply"), "{error:#}");
     }
 }
