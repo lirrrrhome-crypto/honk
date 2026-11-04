@@ -107,6 +107,15 @@ impl Node {
         if self.name.is_empty() {
             return Err(invalid(Some("name"), "node name must not be empty"));
         }
+        if let OutboundConfig::Chain(chain) = &self.outbound {
+            if chain.hops.is_empty() || chain.referenced_tags().any(|tag| tag.trim().is_empty()) {
+                return Err(invalid(Some("chain_hops"), "a chain needs nonempty hop tags"));
+            }
+            return match &chain.exit {
+                crate::node::ChainExit::Node(exit) => exit.validate_inner(),
+                crate::node::ChainExit::Tag(_) => Ok(()),
+            };
+        }
         if self.host().trim().is_empty()
             || self.port == 0
             || (self.host.is_empty() && self.address.matches(':').count() > 1)

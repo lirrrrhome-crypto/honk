@@ -181,6 +181,12 @@ struct FlatNode {
     #[serde(default)]
     anytls_idle_session_timeout: Option<u64>,
     #[serde(default)]
+    chain_hops: Vec<String>,
+    #[serde(default)]
+    chain_exit: Option<Box<Node>>,
+    #[serde(default)]
+    chain_exit_tag: Option<String>,
+    #[serde(default)]
     mark: Option<u32>,
     #[serde(default)]
     tags: Vec<String>,
@@ -681,6 +687,23 @@ impl FlatNode {
             }
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
+            NodeProtocol::Chain => {
+                let exit = match (flat.chain_exit.take(), flat.chain_exit_tag.take()) {
+                    (Some(node), None) => super::ChainExit::Node(node),
+                    (None, Some(tag)) if !tag.trim().is_empty() => super::ChainExit::Tag(tag),
+                    _ => {
+                        return Err(semantic_error(
+                            source,
+                            setting.clone().field("chain_exit"),
+                            "a chain needs exactly one of chain_exit or chain_exit_tag",
+                        ));
+                    }
+                };
+                OutboundConfig::Chain(super::ChainConfig {
+                    hops: std::mem::take(&mut flat.chain_hops),
+                    exit,
+                })
+            }
         };
         if !flat.tls_alpn.is_empty() {
             return Err(semantic_error(
@@ -702,6 +725,7 @@ impl FlatNode {
             group_id: flat.group_id,
             created_at: flat.created_at,
             updated_at: flat.updated_at,
+            dialer: None,
         };
         node.normalize_stream_transport()
             .map_err(|(field, message)| {
@@ -779,6 +803,12 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_hops: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_exit: Option<&'a Node>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_exit_tag: Option<&'a str>,
     mark: Option<u32>,
     tags: &'a [String],
     subscription_id: Option<uuid::Uuid>,
@@ -911,6 +941,13 @@ impl<'a> WireOptions<'a> {
                 wire.set_tls(&config.tls);
             }
             OutboundConfig::Direct | OutboundConfig::Block => {}
+            OutboundConfig::Chain(config) => {
+                wire.chain_hops = Some(&config.hops);
+                match &config.exit {
+                    super::ChainExit::Node(node) => wire.chain_exit = Some(node),
+                    super::ChainExit::Tag(tag) => wire.chain_exit_tag = Some(tag),
+                }
+            }
         }
         wire
     }

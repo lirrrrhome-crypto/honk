@@ -114,6 +114,7 @@ fn parse_node_entry(
         (None, value)
     };
 
+    let (uri, dialer) = split_dialer(uri);
     let Some((uri, end)) = complete_quoted_value(uri, diagnostics) else {
         return Ok(());
     };
@@ -122,6 +123,7 @@ fn parse_node_entry(
             if let Some(tag) = tag.filter(|tag| !tag.raw().is_empty()) {
                 node.name = tag.raw().to_owned();
             }
+            node.dialer = dialer;
             on_entry(&node, text.source.span(text.span.start, end));
             nodes.push(node);
         }
@@ -148,6 +150,32 @@ fn parse_node_entry(
         }
     }
     Ok(())
+}
+
+/// Split a trailing `-> hop` (mihomo `dialer-proxy`) off a node entry
+/// value. The arrow must stand outside quotes and follow whitespace or a
+/// closing quote, so a `->` inside a bare link's fragment stays link data.
+fn split_dialer<'d, 'a>(value: Text<'d, 'a>) -> (Text<'d, 'a>, Option<String>) {
+    let value = value.trim();
+    let raw = value.raw();
+    let Some(arrow) = value
+        .delimiter_positions("->")
+        .map(|position| position - value.span.start)
+        .filter(|&offset| {
+            raw[..offset]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace() || c == '\'' || c == '"')
+        })
+        .last()
+    else {
+        return (value, None);
+    };
+    let hop = value.sub(arrow + 2, raw.len()).trim().unquote();
+    if hop.raw().is_empty() || hop.raw().chars().any(char::is_whitespace) {
+        return (value, None);
+    }
+    (value.sub(0, arrow).trim(), Some(hop.raw().to_owned()))
 }
 
 fn complete_quoted_value<'d, 'a>(
@@ -322,6 +350,7 @@ struct SubscriptionFields<'d, 'a> {
     cache: Option<Text<'d, 'a>>,
     route: Option<Text<'d, 'a>>,
     download_detour: Option<Text<'d, 'a>>,
+    dialer: Option<Text<'d, 'a>>,
 }
 
 /// The old `tag: { url: … }` block also reads `url` and `download_detour`;
@@ -362,6 +391,7 @@ fn collect_subscription_fields<'d, 'a>(
                 "interval" => fields.interval = Some(value),
                 "cache" => fields.cache = Some(value),
                 "route" => fields.route = Some(value),
+                "dialer" => fields.dialer = Some(value),
                 "download_detour" if legacy => fields.download_detour = Some(value),
                 _ if super::read::block_header(&child).is_none() => key.notice(
                     diagnostics,
@@ -426,6 +456,9 @@ fn parse_subscription_block<'d, 'a>(
     }
     if let Some(user_agent) = fields.user_agent {
         subscription.user_agent = Some(user_agent.raw().to_owned());
+    }
+    if let Some(dialer) = fields.dialer {
+        subscription.dialer = dialer.raw().trim().to_owned();
     }
     if let Some(detour) = fields.route.or(fields.download_detour) {
         subscription.download_detour = detour.raw().to_owned();

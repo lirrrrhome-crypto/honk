@@ -149,6 +149,7 @@ fn serialization_golden_node() -> Node {
         group_id: Some(uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap()),
         created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
         updated_at: "2026-02-03T04:05:06Z".parse().unwrap(),
+        dialer: None,
     }
 }
 

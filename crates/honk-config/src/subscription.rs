@@ -29,6 +29,10 @@ pub struct Subscription {
     /// `direct` goes straight to the host, anything else names a group.
     #[serde(default)]
     pub download_detour: String,
+    /// Node or group every node of this subscription dials its server
+    /// through (mihomo provider `override.dialer-proxy`); empty = none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dialer: String,
     /// Last update time
     #[serde(default)]
     pub last_updated: Option<DateTime<Utc>>,
@@ -73,6 +77,7 @@ impl Default for Subscription {
             enabled: true,
             cache: true,
             download_detour: String::new(),
+            dialer: String::new(),
             last_updated: None,
             node_count: 0,
             created_at: Utc::now(),

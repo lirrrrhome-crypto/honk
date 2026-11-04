@@ -80,6 +80,7 @@ pub(super) fn parse_group_section(
                     "tolerance",
                     "idle_timeout",
                     "interrupt_connections",
+                    "relay",
                 ]
                 .contains(&key.raw())
                 {
@@ -94,14 +95,44 @@ pub(super) fn parse_group_section(
                 let key = key.raw().trim();
                 if key == "filter" {
                     append_filter(&mut group, value.trim(), diagnostics);
+                } else if key == "relay" {
+                    diagnostics.register_field(key, value);
+                    group.relay = value
+                        .trim()
+                        .split("->")
+                        .map(|member| member.trim().unquote().raw().to_owned())
+                        .collect();
                 } else {
                     diagnostics.register_field(key, value);
                     fields.insert(key, value.unquote());
                 }
             }
 
-            if let Some(policy) = fields.get("policy").copied() {
+            let relay_policy = fields.get("policy").is_some_and(|policy| {
+                policy.trim().raw().eq_ignore_ascii_case("relay")
+            });
+            if relay_policy {
+                if group.relay.is_empty() {
+                    diagnostics.push(ConfigDiagnostic {
+                        setting: format!("group.{}.relay", group.name),
+                        value: String::new(),
+                        message: "policy relay needs `relay: a -> b -> exit`; using selector"
+                            .to_string(),
+                    });
+                }
+            } else if let Some(policy) = fields.get("policy").copied() {
                 group.policy = parse_group_policy(policy, &group.name, diagnostics)?;
+            }
+            if !group.relay.is_empty() && (!group.filters.is_empty() || !group.groups.is_empty())
+            {
+                diagnostics.push(ConfigDiagnostic {
+                    setting: format!("group.{}.filter", group.name),
+                    value: String::new(),
+                    message: "a relay group takes its members from `relay`; filters ignored"
+                        .to_string(),
+                });
+                group.filters.clear();
+                group.groups.clear();
             }
             if group.policy == GroupPolicy::URLTest {
                 group.tolerance = tolerance;
@@ -365,7 +396,7 @@ fn is_builtin(node: &Node) -> bool {
     matches!(
         node.outbound,
         crate::node::OutboundConfig::Direct | crate::node::OutboundConfig::Block
-    )
+    ) || crate::chain::is_relay_node(node)
 }
 
 struct GroupFilterTerm {

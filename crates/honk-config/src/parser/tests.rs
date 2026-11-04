@@ -3385,3 +3385,59 @@ mod assets_block {
         }
     }
 }
+
+#[test]
+fn test_parse_proxy_chain_dialer_and_relay() {
+    use crate::node::{ChainExit, OutboundConfig};
+    let input = r#"
+node {
+    front: 'socks5://127.0.0.1:1080'
+    exit: 'socks5://10.0.0.2:1080' -> front
+    'bare': socks5://10.0.0.3:1080 -> 'front'
+    hashed: 'socks5://10.0.0.4:1080#a->b'
+}
+subscription {
+    sub: 'https://example.test/sub' {
+        dialer: front
+    }
+}
+group {
+    r {
+        policy: relay
+        relay: front -> 'exit'
+    }
+    all {
+        policy: select
+    }
+}
+"#;
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    let hops = |name: &str| match &config.nodes.iter().find(|n| n.name == name).unwrap().outbound {
+        OutboundConfig::Chain(chain) => Some(chain.hops.clone()),
+        _ => None,
+    };
+    assert_eq!(hops("front"), None);
+    assert_eq!(hops("exit"), Some(vec!["front".to_string()]));
+    assert_eq!(hops("bare"), Some(vec!["front".to_string()]));
+    assert_eq!(hops("hashed"), None, "an arrow inside quotes is link data");
+    let derived = config.nodes.iter().find(|n| n.name == "r/relay").unwrap();
+    let OutboundConfig::Chain(chain) = &derived.outbound else {
+        panic!("relay node must be a chain");
+    };
+    assert_eq!(chain.hops, ["front"]);
+    assert_eq!(chain.exit, ChainExit::Tag("exit".into()));
+    assert_eq!(config.subscriptions[0].dialer, "front");
+
+    let relay = config.groups.iter().find(|g| g.name == "r").unwrap();
+    assert_eq!(relay.nodes, vec![derived.id]);
+    let all = config.groups.iter().find(|g| g.name == "all").unwrap();
+    assert!(!all.nodes.contains(&derived.id), "relay nodes stay out of unfiltered groups");
+
+    // The expanded form survives a JSON round trip and re-expansion.
+    let json = config.to_json_string().unwrap();
+    let mut back = crate::config::Config::from_json_str(&json).unwrap();
+    let before = back.nodes.clone();
+    crate::chain::expand_chains(&mut back.nodes, &mut back.groups, &back.subscriptions);
+    assert_eq!(back.nodes, before);
+}

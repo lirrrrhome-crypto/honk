@@ -75,6 +75,11 @@ pub struct Node {
     pub group_id: Option<uuid::Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Pending `dialer` tag (mihomo `dialer-proxy`): a node or group this
+    /// node's own server connection goes through. Consumed by
+    /// [`crate::chain::expand_chains`], which replaces the node with a
+    /// [`OutboundConfig::Chain`]; never serialized.
+    pub dialer: Option<String>,
 }
 
 pub(super) fn default_transport() -> String {
@@ -96,6 +101,7 @@ impl Default for Node {
             group_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            dialer: None,
         }
     }
 }
@@ -404,6 +410,12 @@ pub struct Group {
     #[serde(skip)]
     pub own: OwnOptions,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `policy: relay` members in traffic order (mihomo `type: relay`):
+    /// `relay: a -> b -> exit`. Non-empty marks a relay group, which
+    /// [`crate::chain::expand_chains`] turns into a one-member selector over
+    /// a derived chain node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay: Vec<String>,
 }
 
 impl Default for Group {
@@ -425,6 +437,7 @@ impl Default for Group {
             interrupt_connections: false,
             own: OwnOptions::default(),
             created_at: chrono::Utc::now(),
+            relay: Vec::new(),
         }
     }
 }
@@ -494,6 +507,8 @@ impl<'de> Deserialize<'de> for Group {
             interrupt_connections: Option<bool>,
             #[serde(default = "chrono::Utc::now")]
             created_at: chrono::DateTime<chrono::Utc>,
+            #[serde(default)]
+            relay: Vec<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
         Ok(Group {
@@ -516,6 +531,7 @@ impl<'de> Deserialize<'de> for Group {
                 interrupt_connections: wire.interrupt_connections.is_some(),
             },
             created_at: wire.created_at,
+            relay: wire.relay,
         })
     }
 }
