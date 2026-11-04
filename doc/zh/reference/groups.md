@@ -137,7 +137,9 @@ honk 会忽略无法解析的过滤器，并在诊断中注明其在组内节点
 
 ## 代理链
 
-代理链让一个出站先经过其他节点再连接自己的服务器，对应 mihomo 的 `dialer-proxy` 与 `type: relay`。目前只支持 TCP：链式节点不参与 UDP 选择，组内 UDP 流量改用其他支持 UDP 的成员，没有时按 `final` 处理或失败，不会绕过链路直连。
+代理链让一个出站先经过其他节点再连接自己的服务器，对应 mihomo 的 `dialer-proxy` 与 `type: relay`。TCP 与 UDP 都经过整条链路。
+
+UDP 沿用链路的 TCP 通道：各跳把一条 TCP 流送到出口服务器，出口在这条流上封装 UDP。因此只有 UDP 跑在单条流上的出口能承载 UDP：Trojan（`network` 含 `udp`），以及非多路复用、非 XHTTP 的 VLESS 的 native、XUDP 与 UoT v2 编码。Shadowsocks、SOCKS5 以及 QUIC 协议的 UDP 需要到服务器的数据报通路，作为出口时链式节点不参与 UDP 选择：组内 UDP 流量改用其他支持 UDP 的成员，没有时按 `final` 处理或失败，绝不绕过链路直连。中间跳点只需支持 TCP。出口为组时，UDP 能力随该组当前的选择实时判断。
 
 三种写法：
 

@@ -209,11 +209,12 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
-    // TCP-only; the chain opens its own first connection, so nothing may
-    // pre-dial or pool a socket to the exit's server on its behalf.
+    // UDP when the current exit frames it on the chain's stream; the chain
+    // opens its own first connection, so nothing may pre-dial or pool a
+    // socket to the exit's server on its behalf.
     ProtocolDescriptor {
         protocol: NodeProtocol::Chain,
-        supports_udp: never,
+        supports_udp: crate::proxy::chain::chain_supports_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         supports_warm: no_warm,

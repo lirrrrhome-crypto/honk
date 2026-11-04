@@ -1,4 +1,4 @@
-//! TCP proxy chains (mihomo `dialer-proxy` / `relay`).
+//! TCP and UDP proxy chains (mihomo `dialer-proxy` / `relay`).
 //!
 //! A chain node names its hops by tag. At dial time each tag resolves to a
 //! concrete leaf through the installed [`ChainResolver`] (a group follows its
@@ -11,6 +11,12 @@
 //! previous leaf's stream is bridged through a private loopback connection.
 //! A leaf that would open a connection of its own is refused, never dialed
 //! around the chain: see [`honk_config::chain::check_exit_protocol`].
+//!
+//! UDP rides on the same TCP path: the hops carry a stream to the exit's
+//! server and the exit frames UDP on it (Trojan UDP, VLESS native / XUDP /
+//! UoT v2). Exits whose UDP needs a datagram path to their server
+//! (Shadowsocks, SOCKS5, QUIC protocols) refuse UDP instead of sending it
+//! around the chain; see [`udp_exit_supported`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -22,7 +28,9 @@ use honk_config::types::NodeProtocol;
 use parking_lot::RwLock;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{ProbeableOutbound, ProxyRegistry, ProxyStream, TcpOutbound};
+use super::{
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyRegistry, ProxyStream, TcpOutbound,
+};
 
 /// Upper bound on flattened leaves, nested chains included.
 pub const MAX_CHAIN_LEAVES: usize = 16;
@@ -50,11 +58,39 @@ pub fn install_resolver(resolver: Arc<dyn ChainResolver>) {
 }
 
 /// [`ChainResolver`] over the live group manager.
-pub struct GroupManagerResolver(pub crate::group::SharedGroupManager);
+pub struct GroupManagerResolver {
+    shared: crate::group::SharedGroupManager,
+    /// Last manager seen, used when the cell cannot be read without waiting.
+    last: parking_lot::Mutex<Arc<crate::group::GroupManager>>,
+}
+
+impl GroupManagerResolver {
+    pub fn new(shared: crate::group::SharedGroupManager) -> Self {
+        let last = parking_lot::Mutex::new(Arc::clone(&shared.read()));
+        Self { shared, last }
+    }
+
+    /// Never blocks on the manager cell. UDP eligibility asks a chain from
+    /// inside group selection, possibly under this cell's read guard, and
+    /// parking_lot's task-fair lock would park a second read behind a
+    /// queued reload writer forever. While a writer holds or awaits the
+    /// cell, the previous manager answers.
+    fn manager(&self) -> Arc<crate::group::GroupManager> {
+        match self.shared.try_read() {
+            Some(guard) => {
+                let manager = Arc::clone(&guard);
+                drop(guard);
+                *self.last.lock() = Arc::clone(&manager);
+                manager
+            }
+            None => Arc::clone(&self.last.lock()),
+        }
+    }
+}
 
 impl ChainResolver for GroupManagerResolver {
     fn resolve(&self, tag: &str) -> Option<Node> {
-        let manager = Arc::clone(&self.0.read());
+        let manager = self.manager();
         manager
             .node_by_name(tag)
             .or_else(|| manager.select_node(tag))
@@ -63,6 +99,7 @@ impl ChainResolver for GroupManagerResolver {
 }
 
 fn resolve(tag: &str) -> anyhow::Result<Node> {
+    // Written once at startup; the guard never outlives this statement.
     let resolver = RESOLVER
         .read()
         .clone()
@@ -125,6 +162,42 @@ pub fn leaves(node: &Node) -> anyhow::Result<Vec<Node>> {
         );
     }
     Ok(out)
+}
+
+/// Whether `exit` can carry UDP to `port` over a stream the chain supplies.
+pub fn udp_exit_supported(exit: &Node, port: u16) -> Result<(), String> {
+    match &exit.outbound {
+        OutboundConfig::Trojan(_) => {
+            if crate::descriptor::network_allows_udp(exit) {
+                Ok(())
+            } else {
+                Err("Trojan node network excludes udp".to_owned())
+            }
+        }
+        OutboundConfig::Vless(vless) => {
+            use honk_config::node::VlessUdpPath;
+            match vless.udp_path(port) {
+                _ if exit.is_xhttp() => Err("VLESS XHTTP UDP cannot be chained".to_owned()),
+                Some(VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2) => Ok(()),
+                Some(other) => Err(format!("VLESS {other:?} UDP cannot be chained")),
+                None => Err(format!("VLESS UDP to port {port} is disabled")),
+            }
+        }
+        other => Err(format!(
+            "{} UDP needs a datagram path to its server; only Trojan and VLESS exits chain UDP",
+            other.protocol().as_str()
+        )),
+    }
+}
+
+/// Descriptor predicate: a chain is UDP-capable when its current exit can
+/// frame UDP on the chain's stream. Resolved live, so a relay whose exit is a
+/// group follows that group's current pick.
+pub fn chain_supports_udp(node: &Node) -> bool {
+    leaves(node).is_ok_and(|leaves| {
+        let exit = leaves.last().expect("leaves are nonempty");
+        leaves.len() == 1 || udp_exit_supported(exit, 0).is_ok()
+    })
 }
 
 /// The address a leaf's server is reached at, as a proxy target: an IP
@@ -293,9 +366,13 @@ impl ChainHandler {
         Self { base }
     }
 
+    /// Dial through `leaves` to `target`. `chain` is the whole chain the
+    /// leaves start, so errors name hops by their place in it (a UDP dial
+    /// stops one leaf short, at the exit's server).
     async fn dial_leaves(
         &self,
         leaves: &[Node],
+        chain: &[Node],
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
@@ -339,7 +416,7 @@ impl ChainHandler {
                     .await
             }
         };
-        let mut stream = first.map_err(|error| error.context(hop_context(leaves, 0)))?;
+        let mut stream = first.map_err(|error| error.context(hop_context(chain, 0)))?;
         for (index, leaf) in leaves.iter().enumerate().skip(1) {
             let entry = self
                 .base
@@ -357,7 +434,7 @@ impl ChainHandler {
                     connect_timeout,
                 )
                 .await
-                .map_err(|error| error.context(hop_context(leaves, index)))?;
+                .map_err(|error| error.context(hop_context(chain, index)))?;
         }
         stream.target_addr = target;
         stream.target_domain = target_domain.map(str::to_owned);
@@ -375,7 +452,7 @@ impl TcpOutbound for ChainHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         let leaves = leaves(node)?;
-        self.dial_leaves(&leaves, target, target_domain, connect_timeout)
+        self.dial_leaves(&leaves, &leaves, target, target_domain, connect_timeout)
             .await
     }
 
@@ -391,6 +468,46 @@ impl TcpOutbound for ChainHandler {
         drop(tcp);
         self.dial(node, target, target_domain, connect_timeout)
             .await
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for ChainHandler {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let leaves = leaves(node)?;
+        let (exit, hops) = leaves.split_last().expect("leaves are nonempty");
+        let packet = self
+            .base
+            .find(exit.protocol())
+            .and_then(|entry| entry.packet.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("proxy chain exit `{}` has no UDP support", exit.name)
+            })?;
+        if hops.is_empty() {
+            // Every hop was `direct`: the exit is dialed as itself.
+            return packet
+                .dial_udp_transport(exit, target, target_domain, connect_timeout)
+                .await;
+        }
+        udp_exit_supported(exit, target.port()).map_err(|reason| {
+            anyhow::Error::from(super::PacketRejection::Policy)
+                .context(format!("proxy chain exit `{}` refused UDP: {reason}", exit.name))
+        })?;
+        let (server, server_domain) = server_target(exit);
+        let stream = self
+            .dial_leaves(hops, &leaves, server, server_domain.as_deref(), connect_timeout)
+            .await?;
+        let carrier = bridge(stream, connect_timeout).await?;
+        packet
+            .dial_udp_transport_with_tcp(exit, target, target_domain, carrier, connect_timeout)
+            .await
+            .map_err(|error| error.context(hop_context(&leaves, leaves.len() - 1)))
     }
 }
 
@@ -796,5 +913,359 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("nests too deeply"), "{error:#}");
+    }
+
+    // ------------------------------------------------------------ UDP
+
+    async fn read_socks_addr(
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> std::io::Result<SocketAddr> {
+        let mut atyp = [0u8; 1];
+        stream.read_exact(&mut atyp).await?;
+        match atyp[0] {
+            1 => {
+                let mut raw = [0u8; 6];
+                stream.read_exact(&mut raw).await?;
+                Ok(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])),
+                    u16::from_be_bytes([raw[4], raw[5]]),
+                ))
+            }
+            3 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                let mut raw = vec![0u8; len[0] as usize + 2];
+                stream.read_exact(&mut raw).await?;
+                let port = u16::from_be_bytes([raw[len[0] as usize], raw[len[0] as usize + 1]]);
+                // Test names all mean loopback.
+                Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+            }
+            _ => Err(std::io::Error::other("unsupported atyp")),
+        }
+    }
+
+    fn socks_addr(addr: SocketAddr) -> Vec<u8> {
+        let SocketAddr::V4(v4) = addr else {
+            panic!("tests use IPv4")
+        };
+        let mut out = vec![1];
+        out.extend_from_slice(&v4.ip().octets());
+        out.extend_from_slice(&v4.port().to_be_bytes());
+        out
+    }
+
+    /// Plaintext Trojan server: CONNECT and UDP ASSOCIATE, recording the
+    /// command of every accepted request.
+    async fn trojan_server(commands: Arc<parking_lot::Mutex<Vec<u8>>>) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let commands = Arc::clone(&commands);
+                tokio::spawn(async move {
+                    let mut auth = [0u8; 58];
+                    client.read_exact(&mut auth).await?;
+                    let mut command = [0u8; 1];
+                    client.read_exact(&mut command).await?;
+                    let target = read_socks_addr(&mut client).await?;
+                    let mut crlf = [0u8; 2];
+                    client.read_exact(&mut crlf).await?;
+                    commands.lock().push(command[0]);
+                    if command[0] == 1 {
+                        let mut upstream = TcpStream::connect(target).await?;
+                        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                        return Ok::<_, std::io::Error>(());
+                    }
+                    let socket = Arc::new(tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+                    let (mut read, mut write) = client.into_split();
+                    let replies = Arc::clone(&socket);
+                    let back = tokio::spawn(async move {
+                        let mut buffer = vec![0u8; 65535];
+                        loop {
+                            let (n, from) = replies.recv_from(&mut buffer).await?;
+                            let mut frame = socks_addr(from);
+                            frame.extend_from_slice(&(n as u16).to_be_bytes());
+                            frame.extend_from_slice(b"\r\n");
+                            frame.extend_from_slice(&buffer[..n]);
+                            write.write_all(&frame).await?;
+                        }
+                        #[allow(unreachable_code)]
+                        Ok::<_, std::io::Error>(())
+                    });
+                    loop {
+                        let Ok(destination) = read_socks_addr(&mut read).await else {
+                            break;
+                        };
+                        let mut head = [0u8; 4];
+                        read.read_exact(&mut head).await?;
+                        let len = u16::from_be_bytes([head[0], head[1]]) as usize;
+                        let mut payload = vec![0u8; len];
+                        read.read_exact(&mut payload).await?;
+                        socket.send_to(&payload, destination).await?;
+                    }
+                    back.abort();
+                    Ok(())
+                });
+            }
+        });
+        port
+    }
+
+    async fn udp_echo() -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 65535];
+            loop {
+                let (n, from) = socket.recv_from(&mut buffer).await.unwrap();
+                socket.send_to(&buffer[..n], from).await.unwrap();
+            }
+        });
+        address
+    }
+
+    fn trojan(name: &str, port: u16) -> Node {
+        let mut node = Node {
+            name: name.to_owned(),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".to_owned(),
+            port,
+            outbound: OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+                password: Some("pw".to_owned()),
+                ..Default::default()
+            }),
+            ..Node::default()
+        };
+        node.id = node.derive_id();
+        node
+    }
+
+    #[tokio::test]
+    async fn udp_rides_the_chain_to_a_trojan_exit() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let logs: [Arc<parking_lot::Mutex<Vec<String>>>; 2] = Default::default();
+        let a = socks("a", socks_server(Arc::clone(&logs[0])).await);
+        let b = socks("b", socks_server(Arc::clone(&logs[1])).await);
+        let commands = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let exit = trojan("exit", trojan_server(Arc::clone(&commands)).await);
+        install_resolver(Arc::new(MapResolver(HashMap::from([
+            ("a".to_owned(), a.clone()),
+            ("b".to_owned(), b.clone()),
+            ("exit".to_owned(), exit.clone()),
+        ]))));
+        let relay = Node {
+            name: "r/relay".to_owned(),
+            outbound: OutboundConfig::Chain(ChainConfig {
+                hops: vec!["a".to_owned(), "b".to_owned()],
+                exit: ChainExit::Tag("exit".to_owned()),
+            }),
+            ..Node::default()
+        };
+        assert!(chain_supports_udp(&relay));
+        let handler = ChainHandler::new(ProxyRegistry::default_resolver().unwrap());
+        let echo = udp_echo().await;
+
+        let transport = handler
+            .dial_udp_transport(&relay, echo, None, Duration::from_secs(3))
+            .await
+            .unwrap();
+        // Many datagrams, sizes up to near the UDP maximum, in order.
+        for size in [1usize, 512, 1400, 8 * 1024, 60 * 1024] {
+            let payload: Vec<u8> = (0..size).map(|i| (i * 7 + size) as u8).collect();
+            transport.send_packet(&payload).await.unwrap();
+            let mut reply = vec![0u8; 65535];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
+                .await
+                .expect("reply within 3s")
+                .unwrap();
+            assert_eq!(&reply[..n], &payload[..], "datagram of {size} bytes");
+            assert_eq!(from, echo);
+        }
+        // The TCP path went a -> b -> exit; only the exit spoke UDP.
+        assert_eq!(*logs[0].lock(), [format!("127.0.0.1:{}", b.port)]);
+        assert_eq!(*logs[1].lock(), [format!("127.0.0.1:{}", exit.port)]);
+        assert_eq!(*commands.lock(), [3]);
+
+        drop(transport);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while live_bridges() > baseline && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(live_bridges(), baseline, "UDP bridges must close with the transport");
+    }
+
+    #[tokio::test]
+    async fn udp_to_a_datagram_only_exit_is_refused_before_any_connection() {
+        let _serial = SERIAL.lock().await;
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let a = socks("a", socks_server(Arc::clone(&log)).await);
+        let mut ss = socks("ss", 1);
+        ss.outbound = OutboundConfig::Shadowsocks(honk_config::node::ShadowsocksConfig {
+            password: Some("pw".to_owned()),
+            encryption: Some("aes-128-gcm".to_owned()),
+            ..Default::default()
+        });
+        install_resolver(Arc::new(MapResolver(HashMap::from([("a".to_owned(), a)]))));
+        let chained = Node {
+            outbound: OutboundConfig::Chain(ChainConfig {
+                hops: vec!["a".to_owned()],
+                exit: ChainExit::Node(Box::new(ss)),
+            }),
+            ..Node::default()
+        };
+        assert!(!chain_supports_udp(&chained));
+        let handler = ChainHandler::new(ProxyRegistry::default_resolver().unwrap());
+        let error = handler
+            .dial_udp_transport(&chained, local(53), None, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause.downcast_ref::<super::super::PacketRejection>().is_some()),
+            "{error:#}"
+        );
+        assert!(log.lock().is_empty(), "no hop may be dialed for a refused exit");
+    }
+
+    /// Plaintext VLESS server for native command-UDP only.
+    #[cfg(feature = "rprx")]
+    async fn vless_udp_server(uuid: [u8; 16]) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut head = [0u8; 18];
+                    client.read_exact(&mut head).await?;
+                    assert_eq!(&head[1..17], &uuid, "VLESS uuid");
+                    let mut addons = vec![0u8; head[17] as usize];
+                    client.read_exact(&mut addons).await?;
+                    let mut command = [0u8; 3];
+                    client.read_exact(&mut command).await?;
+                    assert_eq!(command[0], 2, "native UDP command");
+                    let port = u16::from_be_bytes([command[1], command[2]]);
+                    let mut atyp = [0u8; 1];
+                    client.read_exact(&mut atyp).await?;
+                    let mut ip = [0u8; 4];
+                    assert_eq!(atyp[0], 1, "tests use IPv4 targets");
+                    client.read_exact(&mut ip).await?;
+                    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port);
+                    client.write_all(&[0, 0]).await?;
+                    let socket = Arc::new(tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+                    socket.connect(target).await?;
+                    let (mut read, mut write) = client.into_split();
+                    let replies = Arc::clone(&socket);
+                    let back = tokio::spawn(async move {
+                        let mut buffer = vec![0u8; 65535];
+                        loop {
+                            let n = replies.recv(&mut buffer).await?;
+                            write.write_all(&(n as u16).to_be_bytes()).await?;
+                            write.write_all(&buffer[..n]).await?;
+                        }
+                        #[allow(unreachable_code)]
+                        Ok::<_, std::io::Error>(())
+                    });
+                    loop {
+                        let mut len = [0u8; 2];
+                        if read.read_exact(&mut len).await.is_err() {
+                            break;
+                        }
+                        let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
+                        read.read_exact(&mut payload).await?;
+                        socket.send(&payload).await?;
+                    }
+                    back.abort();
+                    Ok::<_, std::io::Error>(())
+                });
+            }
+        });
+        port
+    }
+
+    #[cfg(feature = "rprx")]
+    #[tokio::test]
+    async fn udp_rides_the_chain_to_a_vless_native_exit() {
+        let _serial = SERIAL.lock().await;
+        let baseline = live_bridges();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let a = socks("a", socks_server(Arc::clone(&log)).await);
+        let uuid = *uuid::Uuid::parse_str("9d3e3b62-6a0b-4d55-9a3c-1b2f6f1b0c11").unwrap().as_bytes();
+        let port = vless_udp_server(uuid).await;
+        let mut exit = socks("vless-exit", port);
+        exit.outbound = OutboundConfig::Vless(honk_config::node::VlessConfig {
+            uuid: Some("9d3e3b62-6a0b-4d55-9a3c-1b2f6f1b0c11".to_owned()),
+            encryption: Some("none".to_owned()),
+            udp_encoding: honk_config::node::VlessUdpEncoding::Native,
+            ..Default::default()
+        });
+        exit.id = exit.derive_id();
+        install_resolver(Arc::new(MapResolver(HashMap::from([("a".to_owned(), a)]))));
+        let chained = Node {
+            outbound: OutboundConfig::Chain(ChainConfig {
+                hops: vec!["a".to_owned()],
+                exit: ChainExit::Node(Box::new(exit.clone())),
+            }),
+            ..Node::default()
+        };
+        assert!(chain_supports_udp(&chained));
+        let handler = ChainHandler::new(ProxyRegistry::default_resolver().unwrap());
+        let echo = udp_echo().await;
+        let transport = handler
+            .dial_udp_transport(&chained, echo, None, Duration::from_secs(3))
+            .await
+            .unwrap();
+        // VLESS native UDP caps a datagram at 8190 bytes.
+        for size in [1usize, 1200, 8190] {
+            let payload: Vec<u8> = (0..size).map(|i| (i * 13 + 1) as u8).collect();
+            transport.send_packet(&payload).await.unwrap();
+            let mut reply = vec![0u8; 65535];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
+                .await
+                .expect("reply within 3s")
+                .unwrap();
+            assert_eq!(&reply[..n], &payload[..]);
+        }
+        assert_eq!(*log.lock(), [format!("127.0.0.1:{}", exit.port)]);
+        drop(transport);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while live_bridges() > baseline && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(live_bridges(), baseline);
+    }
+
+    /// UDP eligibility runs inside group selection, which may hold the
+    /// manager's read guard; a reload writer queued meanwhile must not
+    /// deadlock the chain's resolver.
+    #[test]
+    fn resolver_reads_under_a_held_guard_with_a_queued_writer() {
+        let node = socks("a", 1);
+        let shared = crate::group::GroupManager::new(&[], std::slice::from_ref(&node)).into_shared();
+        let resolver = GroupManagerResolver::new(Arc::clone(&shared));
+        let guard = shared.read();
+        let writer = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let _write = shared.write();
+            })
+        };
+        // Give the writer time to queue behind `guard`.
+        std::thread::sleep(Duration::from_millis(100));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let resolver = Arc::new(resolver);
+        // Detached: a deadlocked resolver must fail the test, not hang it.
+        std::thread::spawn({
+            let resolver = Arc::clone(&resolver);
+            move || {
+                let _ = done_tx.send(resolver.resolve("a").map(|node| node.name));
+            }
+        });
+        let resolved = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        let resolved = resolved.expect("resolver deadlocked behind a queued writer");
+        assert_eq!(resolved.as_deref(), Some("a"));
+        writer.join().unwrap();
     }
 }

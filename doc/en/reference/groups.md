@@ -139,7 +139,9 @@ Clash-facing group output preserves member tags: the `all` field lists direct no
 
 ## Proxy chains
 
-A proxy chain makes an outbound reach its own server through other nodes first, like mihomo's `dialer-proxy` and `type: relay`. Only TCP is supported: chain nodes take no part in UDP selection, so a group's UDP uses its other UDP-capable members, or its `final`, or fails; it never bypasses the chain.
+A proxy chain makes an outbound reach its own server through other nodes first, like mihomo's `dialer-proxy` and `type: relay`. Both TCP and UDP traverse the whole chain.
+
+UDP reuses the chain's TCP path: the hops carry one TCP stream to the exit's server and the exit frames UDP on it. So only exits whose UDP runs on a single stream carry UDP: Trojan (with `udp` in `network`), and VLESS without multiplexing or XHTTP using the native, XUDP or UoT v2 encodings. Shadowsocks, SOCKS5 and QUIC protocols need a datagram path to their server; with such an exit a chain takes no part in UDP selection, so a group's UDP uses its other UDP-capable members, or its `final`, or fails, and never bypasses the chain. Intermediate hops only need TCP. When the exit is a group, UDP capability follows that group's current pick live.
 
 Three spellings:
 

@@ -95,6 +95,19 @@ impl VLessHandler {
         })
     }
 
+    /// A VLESS UDP request stream over a supplied carrier (proxy chains).
+    pub(super) async fn dial_udp_carrier(
+        &self,
+        node: &Node,
+        uuid: [u8; 16],
+        header: Vec<u8>,
+        tcp: TcpStream,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        self.dial_carrier(node, uuid, header, Some(tcp), connect_timeout, None)
+            .await
+    }
+
     pub(super) async fn prepare_retained_carrier(
         &self,
         runtime: &Arc<crate::runtime::NodeRuntime>,

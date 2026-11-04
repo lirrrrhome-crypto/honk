@@ -107,6 +107,25 @@ pub trait PacketOutbound: Send + Sync {
         .await
     }
 
+    /// Open the UDP transport over an already connected carrier to this
+    /// node's server (a proxy chain's previous hop). Only protocols whose UDP
+    /// rides on that one stream implement this; the default refuses rather
+    /// than opening a socket of its own around the carrier.
+    async fn dial_udp_transport_with_tcp(
+        &self,
+        node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        tcp: tokio::net::TcpStream,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        drop(tcp);
+        anyhow::bail!(
+            "{} UDP cannot ride on a supplied stream",
+            node.protocol().as_str()
+        )
+    }
+
     /// UDP counterpart of [`TcpOutbound::dial_runtime_marked`].
     async fn dial_udp_transport_runtime_marked(
         &self,

@@ -18,6 +18,12 @@
 //!   exit=LINK       the exit share link (required unless `selftest`)
 //!   url=http://H/P  probe with a plain HTTP GET (2xx/3xx counts as success)
 //!   echo=HOST:PORT  probe an echo server: send `payload` bytes, verify reply
+//!   udp=HOST:PORT   UDP: open a chained UDP transport per probe, send
+//!                   `packets` datagrams of `payload` bytes to a UDP echo
+//!                   server and verify every reply
+//!   dns=HOST:PORT   UDP: one A query for `name` (default example.com) per
+//!                   probe; success is a matching response
+//!   packets=N       datagrams per UDP probe (default 1)
 //!   concurrency=N   parallel probe workers (default 4)
 //!   duration=SECS   total run time; 0 runs until Ctrl-C (default 60)
 //!   interval=SECS   report window (default 10)
@@ -30,7 +36,9 @@
 //!                   to soak long-lived flows (default 0)
 //!   csv=PATH        append one row per report window
 //!   selftest        run local hops; with hops=N, fail=P (probability a hop
-//!                   drops a connection), jitter=MS (random delay per hop)
+//!                   drops a connection), jitter=MS (random delay per hop).
+//!                   With `udp` (no value needed), the exit is a local
+//!                   Trojan server and the target a local UDP echo.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -53,6 +61,10 @@ struct Options {
     exit: Option<String>,
     url: Option<String>,
     echo: Option<String>,
+    udp: Option<String>,
+    dns: Option<String>,
+    name: String,
+    packets: usize,
     concurrency: usize,
     duration: Duration,
     interval: Duration,
@@ -92,6 +104,10 @@ fn parse_options() -> Options {
         exit: get("exit"),
         url: get("url"),
         echo: get("echo"),
+        udp: get("udp").or_else(|| args.iter().any(|arg| arg == "udp").then(String::new)),
+        dns: get("dns"),
+        name: get("name").unwrap_or_else(|| "example.com".to_owned()),
+        packets: num("packets", 1.0).max(1.0) as usize,
         concurrency: num("concurrency", 4.0).max(1.0) as usize,
         duration: Duration::from_secs_f64(num("duration", 60.0)),
         interval: Duration::from_secs_f64(num("interval", 10.0).max(1.0)),
@@ -141,6 +157,26 @@ enum Probe {
         target: SocketAddr,
         domain: Option<String>,
     },
+    UdpEcho {
+        target: SocketAddr,
+        domain: Option<String>,
+    },
+    Dns {
+        target: SocketAddr,
+        domain: Option<String>,
+        query: Vec<u8>,
+    },
+}
+
+fn dns_query(name: &str) -> Vec<u8> {
+    // id, RD flag, one question; the id is rewritten per probe.
+    let mut query = vec![0, 0, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.trim_end_matches('.').split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 1, 0, 1]);
+    query
 }
 
 fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
@@ -236,8 +272,12 @@ async fn run_probe(
     options: &Options,
     payload: &[u8],
 ) -> Outcome {
+    if matches!(probe, Probe::UdpEcho { .. } | Probe::Dns { .. }) {
+        return run_udp_probe(registry, chain_node, probe, options, payload).await;
+    }
     let (target, domain) = match probe {
         Probe::Http { target, domain, .. } | Probe::Echo { target, domain } => (*target, domain),
+        Probe::UdpEcho { .. } | Probe::Dns { .. } => unreachable!(),
     };
     let start = Instant::now();
     // Like the core: each hop gets `connect_timeout`, the dial as a whole 3x.
@@ -277,6 +317,7 @@ async fn run_probe(
                 while stream.read(&mut sink).await? != 0 {}
                 Ok(first_byte)
             }
+            Probe::UdpEcho { .. } | Probe::Dns { .. } => unreachable!(),
             Probe::Echo { .. } => {
                 stream.write_all(payload).await?;
                 let mut reply = vec![0u8; payload.len()];
@@ -311,6 +352,84 @@ async fn run_probe(
     }
     let _ = stream.shutdown().await;
     outcome
+}
+
+async fn run_udp_probe(
+    registry: &ProxyRegistry,
+    chain_node: &Node,
+    probe: &Probe,
+    options: &Options,
+    payload: &[u8],
+) -> Outcome {
+    let (target, domain) = match probe {
+        Probe::UdpEcho { target, domain } | Probe::Dns { target, domain, .. } => (*target, domain),
+        _ => unreachable!(),
+    };
+    let Some(packet) = registry
+        .find(honk_config::types::NodeProtocol::Chain)
+        .and_then(|entry| entry.packet.clone())
+    else {
+        return Outcome::Fail("chain has no UDP handler".to_owned());
+    };
+    let start = Instant::now();
+    let dial = tokio::time::timeout(
+        options.timeout * 3,
+        packet.dial_udp_transport(chain_node, target, domain.as_deref(), options.timeout),
+    )
+    .await;
+    let transport = match dial {
+        Err(_) => return Outcome::Fail("udp chain timeout (whole-dial deadline)".to_owned()),
+        Ok(Err(error)) => return Outcome::Fail(format!("udp {}", classify(&error))),
+        Ok(Ok(transport)) => transport,
+    };
+    let dial_time = start.elapsed();
+    let exchange = async {
+        let mut first_byte = None;
+        let mut reply = vec![0u8; 65535];
+        for index in 0..options.packets {
+            let datagram: Vec<u8> = match probe {
+                Probe::Dns { query, .. } => {
+                    let mut query = query.clone();
+                    let id = (start.elapsed().as_nanos() as u16) ^ index as u16;
+                    query[..2].copy_from_slice(&id.to_be_bytes());
+                    query
+                }
+                _ => {
+                    let mut datagram = payload.to_vec();
+                    datagram[0] = index as u8;
+                    datagram
+                }
+            };
+            transport.send_packet(&datagram).await?;
+            let (n, _) = transport.recv_packet(&mut reply).await?;
+            first_byte.get_or_insert_with(|| start.elapsed());
+            match probe {
+                Probe::Dns { .. } => anyhow::ensure!(
+                    n >= 12 && reply[..2] == datagram[..2] && reply[2] & 0x80 != 0,
+                    "dns reply does not answer the query"
+                ),
+                _ => anyhow::ensure!(reply[..n] == datagram[..], "udp payload mismatch (data corruption)"),
+            }
+        }
+        Ok::<_, anyhow::Error>(first_byte.expect("at least one packet"))
+    };
+    match tokio::time::timeout(options.io_timeout, exchange).await {
+        Err(_) => Outcome::Fail("udp io timeout (datagram lost)".to_owned()),
+        Ok(Err(error)) => {
+            let text = format!("{error:#}");
+            Outcome::Fail(if text.contains("mismatch") {
+                "udp io corruption".to_owned()
+            } else if text.contains("dns reply") {
+                "udp io bad dns reply".to_owned()
+            } else {
+                format!("udp io {}", classify(&error).trim_start_matches("chain "))
+            })
+        }
+        Ok(Ok(first_byte)) => Outcome::Ok {
+            dial: dial_time,
+            first_byte,
+        },
+    }
 }
 
 // ---------------------------------------------------------------- stats
@@ -476,6 +595,90 @@ async fn local_socks(fail: f64, jitter: u64, seed: u64) -> anyhow::Result<u16> {
     Ok(port)
 }
 
+async fn read_socks_addr(stream: &mut (impl AsyncReadExt + Unpin)) -> std::io::Result<SocketAddr> {
+    let mut atyp = [0u8; 1];
+    stream.read_exact(&mut atyp).await?;
+    match atyp[0] {
+        1 => {
+            let mut raw = [0u8; 6];
+            stream.read_exact(&mut raw).await?;
+            Ok(SocketAddr::from((
+                Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]),
+                u16::from_be_bytes([raw[4], raw[5]]),
+            )))
+        }
+        _ => Err(std::io::Error::other("selftest Trojan supports IPv4 targets")),
+    }
+}
+
+/// Plaintext Trojan server (CONNECT and UDP) used as the selftest UDP exit.
+async fn local_trojan() -> anyhow::Result<u16> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut auth = [0u8; 59];
+                client.read_exact(&mut auth).await?;
+                let command = auth[58];
+                let target = read_socks_addr(&mut client).await?;
+                let mut crlf = [0u8; 2];
+                client.read_exact(&mut crlf).await?;
+                if command == 1 {
+                    let mut upstream = TcpStream::connect(target).await?;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    return Ok::<_, std::io::Error>(());
+                }
+                let socket = Arc::new(tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+                let (mut read, mut write) = client.into_split();
+                let replies = Arc::clone(&socket);
+                let back = tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 65535];
+                    while let Ok((n, from)) = replies.recv_from(&mut buffer).await {
+                        let SocketAddr::V4(from) = from else { continue };
+                        let mut frame = vec![1];
+                        frame.extend_from_slice(&from.ip().octets());
+                        frame.extend_from_slice(&from.port().to_be_bytes());
+                        frame.extend_from_slice(&(n as u16).to_be_bytes());
+                        frame.extend_from_slice(b"\r\n");
+                        frame.extend_from_slice(&buffer[..n]);
+                        if write.write_all(&frame).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                while let Ok(destination) = read_socks_addr(&mut read).await {
+                    let mut head = [0u8; 4];
+                    if read.read_exact(&mut head).await.is_err() {
+                        break;
+                    }
+                    let mut payload = vec![0u8; u16::from_be_bytes([head[0], head[1]]) as usize];
+                    read.read_exact(&mut payload).await?;
+                    socket.send_to(&payload, destination).await?;
+                }
+                back.abort();
+                Ok(())
+            });
+        }
+    });
+    Ok(port)
+}
+
+async fn local_udp_echo() -> anyhow::Result<u16> {
+    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = socket.local_addr()?.port();
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 65535];
+        while let Ok((n, from)) = socket.recv_from(&mut buffer).await {
+            let _ = socket.send_to(&buffer[..n], from).await;
+        }
+    });
+    Ok(port)
+}
+
 async fn local_echo() -> anyhow::Result<u16> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
@@ -501,6 +704,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut hop_links = options.hops.clone();
     let mut exit_link = options.exit.clone();
+    // Share links refuse plaintext Trojan, so the selftest builds it directly.
+    let mut selftest_trojan: Option<u16> = None;
     if options.selftest {
         let mut links = Vec::new();
         for index in 0..=options.selftest_hops {
@@ -509,18 +714,45 @@ async fn main() -> anyhow::Result<()> {
         }
         exit_link = links.pop();
         hop_links = links;
-        if options.url.is_none() && options.echo.is_none() {
+        if options.udp.is_some() {
+            // UDP needs an exit that frames it on the chain's stream.
+            selftest_trojan = Some(local_trojan().await?);
+            if options.udp.as_deref().is_none_or(str::is_empty) {
+                options.udp = Some(format!("127.0.0.1:{}", local_udp_echo().await?));
+            }
+        } else if options.url.is_none() && options.echo.is_none() {
             options.echo = Some(format!("127.0.0.1:{}", local_echo().await?));
         }
     }
-    let exit_link = exit_link.ok_or_else(|| anyhow::anyhow!("exit=LINK is required"))?;
     anyhow::ensure!(!hop_links.is_empty(), "give at least one hop=LINK");
 
     let mut nodes = Vec::new();
     for (index, link) in hop_links.iter().enumerate() {
         nodes.push(parse_node(link, &format!("hop{index}"))?);
     }
-    let exit = parse_node(&exit_link, "exit")?;
+    let exit = match selftest_trojan {
+        Some(port) => {
+            let mut node = Node {
+                name: "selftest-trojan".to_owned(),
+                address: format!("127.0.0.1:{port}"),
+                host: "127.0.0.1".to_owned(),
+                port,
+                outbound: OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+                    password: Some("pw".to_owned()),
+                    ..Default::default()
+                }),
+                ..Node::default()
+            };
+            node.id = node.derive_id();
+            node
+        }
+        None => parse_node(
+            exit_link
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("exit=LINK is required"))?,
+            "exit",
+        )?,
+    };
     honk_config::chain::check_exit_protocol(&exit)
         .map_err(|reason| anyhow::anyhow!("exit cannot be chained: {reason}"))?;
     for hop in &nodes[1..] {
@@ -554,7 +786,23 @@ async fn main() -> anyhow::Result<()> {
     };
     let registry = Arc::new(ProxyRegistry::default_resolver()?);
 
+    let udp_target = |value: &str, default_port: u16| {
+        let (host, port) = split_host_port(value, default_port);
+        proxy_target(&host, port)
+    };
     let probe = match (&options.url, &options.echo) {
+        _ if options.dns.is_some() => {
+            let (target, domain) = udp_target(options.dns.as_deref().unwrap(), 53);
+            Probe::Dns {
+                target,
+                domain,
+                query: dns_query(&options.name),
+            }
+        }
+        _ if options.udp.as_deref().is_some_and(|value| !value.is_empty()) => {
+            let (target, domain) = udp_target(options.udp.as_deref().unwrap(), 7);
+            Probe::UdpEcho { target, domain }
+        }
         (Some(url), _) => http_probe(url)?,
         (None, Some(echo)) => {
             let (host, port) = split_host_port(echo, 7);
@@ -585,6 +833,18 @@ async fn main() -> anyhow::Result<()> {
                 "echo {} ({} bytes)",
                 domain.clone().unwrap_or_else(|| target.to_string()),
                 options.payload
+            ),
+            Probe::UdpEcho { domain, target } => format!(
+                "UDP echo {} ({} x {} bytes per probe)",
+                domain.clone().unwrap_or_else(|| target.to_string()),
+                options.packets,
+                options.payload
+            ),
+            Probe::Dns { domain, target, .. } => format!(
+                "UDP DNS {} A {} ({} queries per probe)",
+                domain.clone().unwrap_or_else(|| target.to_string()),
+                options.name,
+                options.packets
             ),
         }
     );

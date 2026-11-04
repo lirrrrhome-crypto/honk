@@ -121,7 +121,7 @@ impl ControlPlane {
         // Proxy chains resolve hop tags through the live manager, so a hop
         // group keeps following its policy and reloads need no re-install.
         honk_outbound::proxy::chain::install_resolver(Arc::new(
-            honk_outbound::proxy::chain::GroupManagerResolver(group_manager.clone()),
+            honk_outbound::proxy::chain::GroupManagerResolver::new(group_manager.clone()),
         ));
         {
             let group_manager = group_manager.clone();

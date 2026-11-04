@@ -115,7 +115,9 @@ impl ProxyRegistry {
         let mut registry = Self::base_resolver()?;
         let chain = Arc::new(super::chain::ChainHandler::new(Self::base_resolver()?));
         registry.register(
-            ProtocolEntry::new(NodeProtocol::Chain, chain.clone()).with_probeable(chain),
+            ProtocolEntry::new(NodeProtocol::Chain, chain.clone())
+                .with_packet(chain.clone())
+                .with_probeable(chain),
         );
         for entry in &registry.entries {
             entry.validate_consistency();
@@ -571,7 +573,14 @@ impl ProxyRegistry {
         {
             return Err(PacketRejection::Policy.into());
         }
-        if protocol != NodeProtocol::Block && !runtime.udp_capable {
+        // A chain's UDP capability follows its live exit (a relay exit group
+        // may switch protocols), so it is not read from the build snapshot.
+        let udp_capable = if protocol == NodeProtocol::Chain {
+            crate::proxy::chain::chain_supports_udp(&runtime.node)
+        } else {
+            runtime.udp_capable
+        };
+        if protocol != NodeProtocol::Block && !udp_capable {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
         entry

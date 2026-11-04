@@ -266,6 +266,28 @@ impl PacketOutbound for TrojanHandler {
         Self::dial_udp_stream(node, None, target, target_domain, connect_timeout).await
     }
 
+    /// Trojan UDP is framed on the command stream, so it rides on any carrier.
+    async fn dial_udp_transport_with_tcp(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        tcp: TcpStream,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if !crate::descriptor::network_allows_udp(node) {
+            anyhow::bail!(
+                "Trojan UDP: node network {:?} does not include \"udp\"",
+                node.network()
+            );
+        }
+        let (control, preparation) =
+            Self::prepare_transport(node, None, Some(tcp), connect_timeout).await?;
+        preparation.commit()?;
+        let transport = Self::finish_udp_stream(node, target, target_domain, control).await?;
+        Ok(transport)
+    }
+
     async fn dial_udp_transport_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
