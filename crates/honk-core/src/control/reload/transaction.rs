@@ -61,6 +61,18 @@ pub(crate) fn rebase_subscription_nodes(
     }
 
     candidate.nodes = static_nodes;
+    for diagnostic in honk_config::chain::expand_chains(
+        &mut candidate.nodes,
+        &mut candidate.groups,
+        &candidate.subscriptions,
+    ) {
+        tracing::warn!(
+            "{} = {}: {}",
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message
+        );
+    }
     honk_config::parser::resolve_group_filters(
         &mut candidate.groups,
         &candidate.nodes,

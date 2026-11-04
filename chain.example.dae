@@ -1,0 +1,37 @@
+global {
+    lan_interface: auto
+}
+
+node {
+    front: 'socks5://127.0.0.1:1080'
+    hk2: 'ss://YWVzLTEyOC1nY206cGFzcw@hk2.example:8388#hk2'
+    # mihomo dialer-proxy: exit reaches its server through group `front_group`
+    exit: 'trojan://secret@exit.example:443?sni=exit.example#exit' -> front_group
+}
+
+subscription {
+    landing: 'https://example.test/landing' {
+        dialer: front_group
+    }
+}
+
+group {
+    front_group {
+        filter: name('front')
+        policy: urltest
+    }
+    # mihomo type: relay
+    chained {
+        policy: relay
+        relay: front_group -> hk2 -> exit
+    }
+    proxy {
+        filter: name('exit')
+        filter: group('chained')
+        policy: select
+    }
+}
+
+routing {
+    fallback: proxy
+}

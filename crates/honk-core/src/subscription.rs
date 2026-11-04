@@ -638,7 +638,14 @@ pub fn parse_subscription_content_with_diagnostics(
 ) -> Result<Vec<Node>, DetailedConfigError> {
     let source = DiagnosticSources::new(None).root();
     let result = parse_subscription_content_attempt(sub, content, &source, diagnostics);
-    finish_attempt(result, diagnostics)
+    // A provider never chooses which of the user's nodes its traffic rides
+    // on: chains come only from the user's own `dialer`/`relay` settings.
+    finish_attempt(result, diagnostics).map(|nodes| {
+        nodes
+            .into_iter()
+            .filter(|node| node.protocol() != honk_config::types::NodeProtocol::Chain)
+            .collect()
+    })
 }
 
 fn parse_subscription_content_attempt(

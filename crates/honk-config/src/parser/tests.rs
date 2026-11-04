@@ -3441,3 +3441,14 @@ group {
     crate::chain::expand_chains(&mut back.nodes, &mut back.groups, &back.subscriptions);
     assert_eq!(back.nodes, before);
 }
+
+#[test]
+fn test_chain_example_config_parses() {
+    use crate::node::OutboundConfig;
+    let config = parse_dae_config(include_str!("../../../../chain.example.dae")).unwrap();
+    let exit = config.nodes.iter().find(|n| n.name == "exit").unwrap();
+    assert!(matches!(&exit.outbound, OutboundConfig::Chain(c) if c.hops == ["front_group"]));
+    assert!(config.nodes.iter().any(|n| n.name == "chained/relay"));
+    let proxy = config.groups.iter().find(|g| g.name == "proxy").unwrap();
+    assert!(proxy.nodes.contains(&exit.id));
+}

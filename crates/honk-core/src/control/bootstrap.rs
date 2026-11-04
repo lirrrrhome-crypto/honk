@@ -118,6 +118,11 @@ impl ControlPlane {
         // they currently select, and the tag keeps the result. The cell
         // keeps working across reloads (the manager inside is swapped).
         let group_manager = group_manager.into_shared();
+        // Proxy chains resolve hop tags through the live manager, so a hop
+        // group keeps following its policy and reloads need no re-install.
+        honk_outbound::proxy::chain::install_resolver(Arc::new(
+            honk_outbound::proxy::chain::GroupManagerResolver(group_manager.clone()),
+        ));
         {
             let group_manager = group_manager.clone();
             let probe_interval = Duration::from_secs(config.global.check_interval_secs);

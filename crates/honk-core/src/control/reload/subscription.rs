@@ -27,6 +27,18 @@ pub(in crate::control) fn config_with_subscription_nodes(
     for group in &mut config.groups {
         group.nodes.retain(|id| live.contains(id));
     }
+    for diagnostic in honk_config::chain::expand_chains(
+        &mut config.nodes,
+        &mut config.groups,
+        &config.subscriptions,
+    ) {
+        tracing::warn!(
+            "{} = {}: {}",
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message
+        );
+    }
     honk_config::parser::resolve_group_filters(
         &mut config.groups,
         &config.nodes,

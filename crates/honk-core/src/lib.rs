@@ -1032,6 +1032,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // defined with `filter:` (or with no filter at all, meaning "all nodes")
     // would otherwise end up with an empty member list for static configs.
     // Filter-backed membership is rebuilt from the current node provenance.
+    for diagnostic in honk_config::chain::expand_chains(
+        &mut config.nodes,
+        &mut config.groups,
+        &config.subscriptions,
+    ) {
+        tracing::warn!(
+            "{} = {}: {}",
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message
+        );
+    }
     honk_config::parser::resolve_group_filters(
         &mut config.groups,
         &config.nodes,

@@ -137,6 +137,46 @@ Nested selection is depth-capped at 8. When the group manager builds the graph, 
 
 Clash-facing group output preserves member tags: the `all` field lists direct node names and nested group tags rather than expanding nested groups. Leaf-facing health and connectivity traversal expands the real nodes below those tags.
 
+## Proxy chains
+
+A proxy chain makes an outbound reach its own server through other nodes first, like mihomo's `dialer-proxy` and `type: relay`. Only TCP is supported: chain nodes take no part in UDP selection, so a group's UDP uses its other UDP-capable members, or its `final`, or fails; it never bypasses the chain.
+
+Three spellings:
+
+```dae
+node {
+    front: 'socks5://127.0.0.1:1080'
+    # Node dialer: exit's server connection is opened through front
+    exit: 'trojan://secret@exit.example:443' -> front
+}
+
+subscription {
+    # Subscription dialer: every node of this provider goes through group front
+    landing: 'https://example.test/sub' {
+        dialer: front
+    }
+}
+
+group {
+    front {
+        filter: name(keyword: 'HK')
+        policy: urltest
+    }
+    # Relay group: front's current pick, then hk2, then out through exit
+    chained {
+        policy: relay
+        relay: front -> 'hk2' -> exit
+    }
+}
+```
+
+- Hops and dialers name nodes or groups and resolve at dial time; a hop group keeps applying its own policy. A `direct` hop is skipped and `block` is refused.
+- A node with a dialer keeps its name and group membership; its protocol shows as `chain`. A relay group becomes a Selector over one derived node, `<group>/relay`, which unfiltered groups and pattern filters never admit.
+- The first hop may be any TCP-capable protocol. Every later hop, the exit included, must handshake over a single TCP connection: Shadowsocks without a plugin, Trojan, VMess, SOCKS5, and VLESS without multiplexing or XHTTP. QUIC protocols (Hysteria2, TUIC, Juicity), AnyTLS and multiplexed VLESS in a later position drop the chain with a diagnostic or refuse the dial.
+- The `->` after a node link must sit outside quotes and follow whitespace or a closing quote; a `->` inside quotes or a bare link's fragment stays link data.
+- A node that names itself as dialer is dropped; statically visible cycles are reported, and cycles through groups stop at the 16-hop limit at dial time. An unknown tag does not fail the configuration (subscription nodes may arrive later), but dials through it fail.
+- Later hops carry the previous hop's stream over a private loopback TCP connection: one extra userspace copy per hop, and no pooling or splice.
+
 ## Related docs
 
 - [Node reference](./nodes.md)

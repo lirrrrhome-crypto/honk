@@ -135,6 +135,46 @@ honk 会忽略无法解析的过滤器，并在诊断中注明其在组内节点
 
 面向 Clash 的组输出保留成员 tag：`all` 字段列出直接节点名和嵌套组 tag，而不展开嵌套组。面向叶节点的健康状态与连通性遍历会展开这些 tag 下的实际节点。
 
+## 代理链
+
+代理链让一个出站先经过其他节点再连接自己的服务器，对应 mihomo 的 `dialer-proxy` 与 `type: relay`。目前只支持 TCP：链式节点不参与 UDP 选择，组内 UDP 流量改用其他支持 UDP 的成员，没有时按 `final` 处理或失败，不会绕过链路直连。
+
+三种写法：
+
+```dae
+node {
+    front: 'socks5://127.0.0.1:1080'
+    # 节点级 dialer：exit 的服务器连接经由 front 建立
+    exit: 'trojan://secret@exit.example:443' -> front
+}
+
+subscription {
+    # 订阅级 dialer：该订阅的每个节点都经由 front 组
+    landing: 'https://example.test/sub' {
+        dialer: front
+    }
+}
+
+group {
+    front {
+        filter: name(keyword: 'HK')
+        policy: urltest
+    }
+    # relay 组：流量依次经过 front 组当前选中的节点、hk2，再从 exit 离开
+    chained {
+        policy: relay
+        relay: front -> 'hk2' -> exit
+    }
+}
+```
+
+- 跳点和 dialer 可写节点名或组名，在拨号时解析；组跳点继续执行它自己的策略。`direct` 跳点会被省略，`block` 被拒绝。
+- 带 dialer 的节点保留原名和组成员关系，只是协议显示为 `chain`。relay 组变为只含一个派生节点 `<组名>/relay` 的 Selector；该派生节点不会被无过滤器的组或模式过滤器收入。
+- 第一跳可以是任意支持 TCP 的协议。后续跳点（包括出口）必须在单条 TCP 连接上完成握手：Shadowsocks（无插件）、Trojan、VMess、SOCKS5，以及非多路复用、非 XHTTP 的 VLESS。QUIC 协议（Hysteria2、TUIC、Juicity）、AnyTLS 和多路复用 VLESS 放在后续位置时，该链被丢弃并给出诊断，或在拨号时拒绝。
+- 节点名后的 `->` 必须位于引号外，且前面是空白或闭合引号；引号内或裸链接片段中的 `->` 仍是链接数据。
+- 自身作为 dialer 的节点会被丢弃；静态可见的环会报告诊断，经由组形成的环在拨号时受 16 跳上限拦截。未知 tag 不会使配置失败（订阅节点可能稍后才出现），但经过它的拨号会失败。
+- 后续跳点通过一条私有回环 TCP 连接承载前一跳的流，每跳多一次用户态复制，也不使用连接池与 splice。
+
 ## 相关文档
 
 - [节点参考](./nodes.md)

@@ -4,7 +4,7 @@
 
 ## `node {}` declarations
 
-Each non-comment line is one share link. Tags and links may be quoted or bare:
+Each non-comment line is one share link, optionally followed by `-> <node or group>` to dial through it (see [proxy chains](./groups.md#proxy-chains)). Tags and links may be quoted or bare:
 
 Outside matching quotes, `#` starts a comment at the start of a statement or immediately after an ASCII space or tab.
 

@@ -58,7 +58,6 @@ impl std::str::FromStr for NodeProtocol {
             "anytls" => Ok(NodeProtocol::AnyTLS),
             "direct" => Ok(NodeProtocol::Direct),
             "block" => Ok(NodeProtocol::Block),
-            "chain" => Ok(NodeProtocol::Chain),
             _ => Err(crate::ConfigError::UnknownProtocol(s.to_string())),
         }
     }
