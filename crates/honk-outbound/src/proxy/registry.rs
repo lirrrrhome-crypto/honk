@@ -110,7 +110,21 @@ impl ProxyRegistry {
         }
     }
 
+    /// Every built-in protocol, proxy chains included.
     pub fn default_resolver() -> anyhow::Result<Self> {
+        let mut registry = Self::base_resolver()?;
+        let chain = Arc::new(super::chain::ChainHandler::new(Self::base_resolver()?));
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Chain, chain.clone()).with_probeable(chain),
+        );
+        for entry in &registry.entries {
+            entry.validate_consistency();
+        }
+        Ok(registry)
+    }
+
+    /// The ordinary protocols: what a chain dials its leaves with.
+    fn base_resolver() -> anyhow::Result<Self> {
         let mut registry = Self::new();
 
         let socks5 = Arc::new(Socks5Handler::new());
