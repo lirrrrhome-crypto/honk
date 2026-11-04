@@ -141,7 +141,14 @@ Clash-facing group output preserves member tags: the `all` field lists direct no
 
 A proxy chain makes an outbound reach its own server through other nodes first, like mihomo's `dialer-proxy` and `type: relay`. Both TCP and UDP traverse the whole chain.
 
-UDP reuses the chain's TCP path: the hops carry one TCP stream to the exit's server and the exit frames UDP on it. So only exits whose UDP runs on a single stream carry UDP: Trojan (with `udp` in `network`), and VLESS without multiplexing or XHTTP using the native, XUDP or UoT v2 encodings. Shadowsocks, SOCKS5 and QUIC protocols need a datagram path to their server; with such an exit a chain takes no part in UDP selection, so a group's UDP uses its other UDP-capable members, or its `final`, or fails, and never bypasses the chain. Intermediate hops only need TCP. When the exit is a group, UDP capability follows that group's current pick live.
+UDP traverses a chain in one of two ways, by exit:
+
+- **Stream-framed exits**: Trojan (with `udp` in `network`), and VLESS without multiplexing or XHTTP using the native, XUDP or UoT v2 encodings. The hops carry one TCP stream to the exit's server and the exit frames UDP on it; the hops in front only need TCP.
+- **SOCKS5 exits**: the `UDP ASSOCIATE` control connection rides the chain's TCP path, and the RFC 1928 datagrams travel to the SOCKS5 relay through the hops in front, so that part of the chain must carry UDP itself: a single hop must support UDP (for example SS, Hysteria2, TUIC, Trojan, VLESS or SOCKS5), and longer prefixes follow the same rule recursively. An unspecified `0.0.0.0` relay is replaced by the SOCKS5 node's own server address; a relay name is resolved by the hop in front, never locally.
+
+In a later position, Shadowsocks and QUIC protocols would need their own datagram socket to their server, so they carry no UDP there. A chain that cannot carry UDP takes no part in UDP selection: a group's UDP uses its other UDP-capable members, or its `final`, or fails, and never bypasses the chain. When the exit is a group, UDP capability follows that group's current pick live.
+
+honk has no HTTP proxy outbound; a standard HTTP proxy offers only `CONNECT`, which carries no UDP.
 
 Three spellings:
 

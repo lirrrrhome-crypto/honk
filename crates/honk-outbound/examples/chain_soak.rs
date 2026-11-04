@@ -38,7 +38,9 @@
 //!   selftest        run local hops; with hops=N, fail=P (probability a hop
 //!                   drops a connection), jitter=MS (random delay per hop).
 //!                   With `udp` (no value needed), the exit is a local
-//!                   Trojan server and the target a local UDP echo.
+//!                   Trojan server and the target a local UDP echo; add
+//!                   `udp_exit=socks5` to end in a local SOCKS5 exit whose
+//!                   datagrams ride a Trojan hop in front of it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -62,6 +64,7 @@ struct Options {
     url: Option<String>,
     echo: Option<String>,
     udp: Option<String>,
+    udp_exit: String,
     dns: Option<String>,
     name: String,
     packets: usize,
@@ -105,6 +108,7 @@ fn parse_options() -> Options {
         url: get("url"),
         echo: get("echo"),
         udp: get("udp").or_else(|| args.iter().any(|arg| arg == "udp").then(String::new)),
+        udp_exit: get("udp_exit").unwrap_or_else(|| "trojan".to_owned()),
         dns: get("dns"),
         name: get("name").unwrap_or_else(|| "example.com".to_owned()),
         packets: num("packets", 1.0).max(1.0) as usize,
@@ -667,6 +671,70 @@ async fn local_trojan() -> anyhow::Result<u16> {
     Ok(port)
 }
 
+/// SOCKS5 server with CONNECT and UDP ASSOCIATE (relay named as 0.0.0.0,
+/// as many servers do), used as the selftest's SOCKS5 UDP exit.
+async fn local_socks_udp() -> anyhow::Result<u16> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut head = [0u8; 2];
+                client.read_exact(&mut head).await?;
+                let mut methods = vec![0u8; head[1] as usize];
+                client.read_exact(&mut methods).await?;
+                client.write_all(&[5, 0]).await?;
+                let mut request = [0u8; 3];
+                client.read_exact(&mut request).await?;
+                let target = read_socks_addr(&mut client).await?;
+                if request[1] == 1 {
+                    let mut upstream = TcpStream::connect(target).await?;
+                    client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    return Ok::<_, std::io::Error>(());
+                }
+                let relay = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+                let mut reply = vec![5, 0, 0, 1, 0, 0, 0, 0];
+                reply.extend_from_slice(&relay.local_addr()?.port().to_be_bytes());
+                client.write_all(&reply).await?;
+                let mut buffer = vec![0u8; 65535];
+                let mut probe = [0u8; 1];
+                let mut peer: Option<SocketAddr> = None;
+                loop {
+                    tokio::select! {
+                        received = relay.recv_from(&mut buffer) => {
+                            let (n, from) = received?;
+                            if peer.is_none_or(|peer| peer == from) && n >= 10 && buffer[3] == 1 {
+                                peer = Some(from);
+                                let destination = SocketAddr::from((
+                                    Ipv4Addr::new(buffer[4], buffer[5], buffer[6], buffer[7]),
+                                    u16::from_be_bytes([buffer[8], buffer[9]]),
+                                ));
+                                relay.send_to(&buffer[10..n], destination).await?;
+                            } else if let (Some(peer), SocketAddr::V4(from)) = (peer, from) {
+                                let mut frame = vec![0, 0, 0, 1];
+                                frame.extend_from_slice(&from.ip().octets());
+                                frame.extend_from_slice(&from.port().to_be_bytes());
+                                frame.extend_from_slice(&buffer[..n]);
+                                relay.send_to(&frame, peer).await?;
+                            }
+                        }
+                        closed = client.read(&mut probe) => {
+                            if closed.unwrap_or(0) == 0 {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(port)
+}
+
 async fn local_udp_echo() -> anyhow::Result<u16> {
     let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = socket.local_addr()?.port();
@@ -726,27 +794,40 @@ async fn main() -> anyhow::Result<()> {
     }
     anyhow::ensure!(!hop_links.is_empty(), "give at least one hop=LINK");
 
+    let trojan_node = |port: u16| {
+        let mut node = Node {
+            name: "selftest-trojan".to_owned(),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".to_owned(),
+            port,
+            outbound: OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+                password: Some("pw".to_owned()),
+                ..Default::default()
+            }),
+            ..Node::default()
+        };
+        node.id = node.derive_id();
+        node
+    };
     let mut nodes = Vec::new();
     for (index, link) in hop_links.iter().enumerate() {
         nodes.push(parse_node(link, &format!("hop{index}"))?);
     }
-    let exit = match selftest_trojan {
-        Some(port) => {
-            let mut node = Node {
-                name: "selftest-trojan".to_owned(),
-                address: format!("127.0.0.1:{port}"),
-                host: "127.0.0.1".to_owned(),
-                port,
-                outbound: OutboundConfig::Trojan(honk_config::node::TrojanConfig {
-                    password: Some("pw".to_owned()),
-                    ..Default::default()
-                }),
-                ..Node::default()
-            };
-            node.id = node.derive_id();
-            node
-        }
-        None => parse_node(
+    // SOCKS5 UDP exit: the Trojan server becomes the hop in front of it,
+    // carrying the SOCKS5 datagrams on its own UDP-over-stream framing.
+    let mut selftest_socks_exit = None;
+    if options.selftest && options.udp.is_some() && options.udp_exit == "socks5" {
+        let port = selftest_trojan.take().expect("selftest Trojan server");
+        nodes.push(trojan_node(port));
+        selftest_socks_exit = Some(parse_node(
+            &format!("socks5://127.0.0.1:{}#selftest-socks5-exit", local_socks_udp().await?),
+            "exit",
+        )?);
+    }
+    let exit = match (selftest_socks_exit, selftest_trojan) {
+        (Some(node), _) => node,
+        (None, Some(port)) => trojan_node(port),
+        (None, None) => parse_node(
             exit_link
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("exit=LINK is required"))?,

@@ -139,7 +139,14 @@ honk 会忽略无法解析的过滤器，并在诊断中注明其在组内节点
 
 代理链让一个出站先经过其他节点再连接自己的服务器，对应 mihomo 的 `dialer-proxy` 与 `type: relay`。TCP 与 UDP 都经过整条链路。
 
-UDP 沿用链路的 TCP 通道：各跳把一条 TCP 流送到出口服务器，出口在这条流上封装 UDP。因此只有 UDP 跑在单条流上的出口能承载 UDP：Trojan（`network` 含 `udp`），以及非多路复用、非 XHTTP 的 VLESS 的 native、XUDP 与 UoT v2 编码。Shadowsocks、SOCKS5 以及 QUIC 协议的 UDP 需要到服务器的数据报通路，作为出口时链式节点不参与 UDP 选择：组内 UDP 流量改用其他支持 UDP 的成员，没有时按 `final` 处理或失败，绝不绕过链路直连。中间跳点只需支持 TCP。出口为组时，UDP 能力随该组当前的选择实时判断。
+UDP 依出口分两种方式经过链路：
+
+- **流封装出口**：Trojan（`network` 含 `udp`），以及非多路复用、非 XHTTP 的 VLESS 的 native、XUDP 与 UoT v2 编码。各跳把一条 TCP 流送到出口服务器，出口在这条流上封装 UDP；前面的跳点只需支持 TCP。
+- **SOCKS5 出口**：`UDP ASSOCIATE` 控制连接走链路的 TCP 通道；RFC 1928 数据报则经前面的跳点送往 SOCKS5 中继，因此前面那段链路自身须能承载 UDP：只有一跳时该跳须支持 UDP（如 SS、Hysteria2、TUIC、Trojan、VLESS、SOCKS5），多跳时按同样规则递归判断。中继地址为 `0.0.0.0` 时替换为 SOCKS5 节点自己的服务器地址；中继为域名时由前一跳解析，不在本地查询。
+
+Shadowsocks 与 QUIC 协议放在后续位置时，UDP 需要它们自己到服务器的数据报 socket，因此不承载 UDP。无法承载 UDP 的链式节点不参与 UDP 选择：组内 UDP 流量改用其他支持 UDP 的成员，没有时按 `final` 处理或失败，绝不绕过链路直连。出口为组时，UDP 能力随该组当前的选择实时判断。
+
+honk 没有 HTTP 代理出口；标准 HTTP 代理只有 `CONNECT`，本身不转发 UDP。
 
 三种写法：
 

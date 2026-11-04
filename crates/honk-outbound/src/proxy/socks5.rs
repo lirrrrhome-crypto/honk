@@ -236,6 +236,67 @@ impl Socks5Handler {
         username: Option<&str>,
         password: Option<&str>,
     ) -> anyhow::Result<SocketAddr> {
+        let relay_addr = match Self::negotiate_udp_associate(stream, username, password).await? {
+            RelayAddr::Ip(addr) => addr,
+            RelayAddr::Domain(domain, port) => {
+                let resolution = crate::bootstrap::resolve(&domain);
+                let (resolution, selection) =
+                    crate::runtime::flow_observation::observe_resolution(resolution).await;
+                let ip = resolution?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty"))?;
+                if let Some(selection) = selection {
+                    selection.selected_ip(ip);
+                }
+                SocketAddr::new(ip, port)
+            }
+        };
+        let relay_addr = if relay_addr.ip().is_unspecified() {
+            SocketAddr::new(stream.peer_addr()?.ip(), relay_addr.port())
+        } else {
+            relay_addr
+        };
+        debug!("SOCKS5 UDP ASSOCIATE: relay address {}", relay_addr);
+        Ok(relay_addr)
+    }
+
+    /// UDP ASSOCIATE over a carrier that reached this node's server through
+    /// a proxy chain. The relay is returned as named, never resolved here: a
+    /// name is resolved by the hop in front, and an unspecified address
+    /// means this node's own server host (the carrier's peer is a local
+    /// bridge, not the server).
+    pub(crate) async fn associate_over_chain(
+        node: &Node,
+        control: &mut TcpStream,
+    ) -> anyhow::Result<RelayAddr> {
+        let config = node.socks5().unwrap();
+        let relay = Self::negotiate_udp_associate(
+            control,
+            config.username.as_deref(),
+            config.password.as_deref(),
+        )
+        .await?;
+        Ok(match relay {
+            RelayAddr::Ip(addr) if addr.ip().is_unspecified() => {
+                let host = node.host();
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                match host.parse::<std::net::IpAddr>() {
+                    Ok(ip) => RelayAddr::Ip(SocketAddr::new(ip, addr.port())),
+                    Err(_) => RelayAddr::Domain(host.to_owned(), addr.port()),
+                }
+            }
+            other => other,
+        })
+    }
+
+    /// Greeting, authentication and the UDP ASSOCIATE request; the relay is
+    /// returned exactly as the server named it.
+    async fn negotiate_udp_associate(
+        stream: &mut tokio::net::TcpStream,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> anyhow::Result<RelayAddr> {
         // The TCP path bounds the same exchange at `handshake`; without a
         // deadline here a peer that accepts the connection and then goes
         // silent leaves this await pending, and the caller only bounds the
@@ -312,7 +373,7 @@ impl Socks5Handler {
                     stream.read_exact(&mut addr).await?;
                     let ip = std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
                     let port = u16::from_be_bytes([addr[4], addr[5]]);
-                    SocketAddr::new(std::net::IpAddr::V4(ip), port)
+                    RelayAddr::Ip(SocketAddr::new(std::net::IpAddr::V4(ip), port))
                 }
                 ATYP_IPV6 => {
                     let mut addr = [0u8; 18];
@@ -321,7 +382,7 @@ impl Socks5Handler {
                         <[u8; 16]>::try_from(&addr[..16]).expect("slice length"),
                     );
                     let port = u16::from_be_bytes([addr[16], addr[17]]);
-                    SocketAddr::new(std::net::IpAddr::V6(ip), port)
+                    RelayAddr::Ip(SocketAddr::new(std::net::IpAddr::V6(ip), port))
                 }
                 ATYP_DOMAIN => {
                     let mut len_buf = [0u8; 1];
@@ -334,16 +395,7 @@ impl Socks5Handler {
                         domain_and_port[domain_len + 1],
                     ]);
                     let domain = std::str::from_utf8(&domain_and_port[..domain_len])?;
-                    let resolution = crate::bootstrap::resolve(domain);
-                    let (resolution, selection) =
-                        crate::runtime::flow_observation::observe_resolution(resolution).await;
-                    let ip = resolution?.into_iter().next().ok_or_else(|| {
-                        anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty")
-                    })?;
-                    if let Some(selection) = selection {
-                        selection.selected_ip(ip);
-                    }
-                    SocketAddr::new(ip, port)
+                    RelayAddr::Domain(domain.to_owned(), port)
                 }
                 a => anyhow::bail!("SOCKS5 UDP: unknown address type 0x{:02x}", a),
             };
@@ -351,14 +403,6 @@ impl Socks5Handler {
         })
         .await
         .map_err(|_| anyhow::anyhow!("SOCKS5 UDP: associate timed out"))??;
-
-        let relay_addr = if relay_addr.ip().is_unspecified() {
-            SocketAddr::new(stream.peer_addr()?.ip(), relay_addr.port())
-        } else {
-            relay_addr
-        };
-
-        debug!("SOCKS5 UDP ASSOCIATE: relay address {}", relay_addr);
         Ok(relay_addr)
     }
 
@@ -409,6 +453,48 @@ impl Socks5Handler {
             target_domain: target_domain.map(Box::from),
         })
     }
+}
+
+/// The UDP relay a SOCKS5 server named in its UDP ASSOCIATE reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelayAddr {
+    Ip(SocketAddr),
+    Domain(String, u16),
+}
+
+/// One RFC 1928 UDP request datagram: header for `target` (or `domain`),
+/// then `data`. The header is written straight into the outgoing packet.
+fn encode_udp_packet(target: SocketAddr, domain: Option<&str>, data: &[u8]) -> io::Result<Vec<u8>> {
+    let header_len = match (domain, target) {
+        (Some(domain), _) => 7 + domain.len(),
+        (None, SocketAddr::V4(_)) => 10,
+        (None, SocketAddr::V6(_)) => 22,
+    };
+    let mut packet = Vec::with_capacity(header_len + data.len());
+    packet.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV, FRAG
+    match (domain, target) {
+        (Some(domain), _) => {
+            let domain_len = u8::try_from(domain.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SOCKS5 UDP domain exceeds 255 bytes",
+                )
+            })?;
+            packet.extend_from_slice(&[ATYP_DOMAIN, domain_len]);
+            packet.extend_from_slice(domain.as_bytes());
+        }
+        (None, SocketAddr::V4(v4)) => {
+            packet.push(ATYP_IPV4);
+            packet.extend_from_slice(&v4.ip().octets());
+        }
+        (None, SocketAddr::V6(v6)) => {
+            packet.push(ATYP_IPV6);
+            packet.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    packet.extend_from_slice(&target.port().to_be_bytes());
+    packet.extend_from_slice(data);
+    Ok(packet)
 }
 
 /// Source of one inbound datagram as named by its RFC 1928 header.
@@ -506,35 +592,7 @@ impl Socks5UdpTransport {
         data: &[u8],
         admitted: Option<&AtomicBool>,
     ) -> io::Result<()> {
-        let header_len = match (domain, target) {
-            (Some(domain), _) => 7 + domain.len(),
-            (None, SocketAddr::V4(_)) => 10,
-            (None, SocketAddr::V6(_)) => 22,
-        };
-        let mut packet = Vec::with_capacity(header_len + data.len());
-        packet.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV, FRAG
-        match (domain, target) {
-            (Some(domain), _) => {
-                let domain_len = u8::try_from(domain.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "SOCKS5 UDP domain exceeds 255 bytes",
-                    )
-                })?;
-                packet.extend_from_slice(&[ATYP_DOMAIN, domain_len]);
-                packet.extend_from_slice(domain.as_bytes());
-            }
-            (None, SocketAddr::V4(v4)) => {
-                packet.push(ATYP_IPV4);
-                packet.extend_from_slice(&v4.ip().octets());
-            }
-            (None, SocketAddr::V6(v6)) => {
-                packet.push(ATYP_IPV6);
-                packet.extend_from_slice(&v6.ip().octets());
-            }
-        }
-        packet.extend_from_slice(&target.port().to_be_bytes());
-        packet.extend_from_slice(data);
+        let packet = encode_udp_packet(target, domain, data)?;
         self.socket
             .send(&packet)
             .await
@@ -631,6 +689,112 @@ impl MultiTargetTransport for Socks5UdpTransport {
 
     fn carrier_addr(&self) -> Option<SocketAddr> {
         self.socket.peer_addr().ok()
+    }
+}
+
+/// SOCKS5 UDP whose datagrams travel to the relay over another transport
+/// (a proxy chain's previous hops) instead of a local socket. The control
+/// stream rides the chain too and must stay open for the association.
+pub(crate) struct Socks5RelayedUdp {
+    datagrams: Arc<dyn PacketTransport>,
+    control: tokio::sync::Mutex<TcpStream>,
+    recv_buf: tokio::sync::Mutex<Vec<u8>>,
+    target_addr: SocketAddr,
+    target_domain: Option<Box<str>>,
+}
+
+impl Socks5RelayedUdp {
+    pub(crate) fn new(
+        datagrams: Arc<dyn PacketTransport>,
+        control: TcpStream,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> io::Result<Self> {
+        if target_domain.is_some_and(|domain| domain.len() > usize::from(u8::MAX)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SOCKS5 UDP domain exceeds 255 bytes",
+            ));
+        }
+        Ok(Self {
+            datagrams,
+            control: tokio::sync::Mutex::new(control),
+            recv_buf: tokio::sync::Mutex::new(vec![0u8; u16::MAX as usize]),
+            target_addr: target,
+            target_domain: target_domain.map(Box::from),
+        })
+    }
+}
+
+impl std::fmt::Debug for Socks5RelayedUdp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Socks5RelayedUdp")
+            .field("target", &self.target_addr)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl PacketTransport for Socks5RelayedUdp {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target_addr
+    }
+    fn allows_full_cone_replies(&self) -> bool {
+        true
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+        let packet = encode_udp_packet(self.target_addr, self.target_domain.as_deref(), data)?;
+        self.datagrams.send_packet(&packet).await
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let mut control = self.control.lock().await;
+        let mut packet = self.recv_buf.lock().await;
+        let mut control_probe = [0u8; 1];
+        loop {
+            tokio::select! {
+                received = self.datagrams.recv_packet(&mut packet) => {
+                    let (n, _relay) = received?;
+                    let Some((source, payload_start)) = Socks5UdpTransport::parse_packet(&packet[..n])? else {
+                        continue;
+                    };
+                    let peer = match source {
+                        WireSource::Addr(peer) => SocketAddr::new(peer.ip().to_canonical(), peer.port()),
+                        WireSource::Domain(domain, port) => {
+                            let Some(peer) = super::addr::dialed_domain_peer(
+                                self.target_domain.as_deref(),
+                                self.target_addr,
+                                domain,
+                                port,
+                            ) else {
+                                continue;
+                            };
+                            peer
+                        }
+                    };
+                    let payload = &packet[payload_start..n];
+                    if payload.len() > buf.len() {
+                        return Err(Socks5UdpTransport::invalid_packet(
+                            "SOCKS5 UDP: payload exceeds receive buffer",
+                        ));
+                    }
+                    buf[..payload.len()].copy_from_slice(payload);
+                    return Ok((payload.len(), peer));
+                }
+                control_result = control.read(&mut control_probe) => {
+                    return Err(match control_result? {
+                        0 => io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "SOCKS5 UDP control connection closed",
+                        ),
+                        _ => Socks5UdpTransport::invalid_packet(
+                            "SOCKS5 UDP control connection sent unexpected data",
+                        ),
+                    });
+                }
+            }
+        }
     }
 }
 
