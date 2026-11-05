@@ -78,6 +78,14 @@ pub(crate) fn rebase_subscription_nodes(
         &candidate.nodes,
         &candidate.subscriptions,
     );
+    for diagnostic in honk_config::chain::membership_cycles(&candidate.nodes, &candidate.groups) {
+        tracing::warn!(
+            "{} = {}: {}",
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message
+        );
+    }
     retained_providers
 }
 

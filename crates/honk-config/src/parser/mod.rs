@@ -712,6 +712,9 @@ fn parse_documents(
         &config.subscriptions,
         Some(diagnostics),
     );
+    for diagnostic in crate::chain::membership_cycles(&config.nodes, &config.groups) {
+        diagnostics.push(diagnostic);
+    }
 
     Ok(config)
 }

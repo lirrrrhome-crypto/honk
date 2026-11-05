@@ -1049,6 +1049,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         &config.nodes,
         &config.subscriptions,
     );
+    for diagnostic in honk_config::chain::membership_cycles(&config.nodes, &config.groups) {
+        tracing::warn!(
+            "{} = {}: {}",
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message
+        );
+    }
     config
         .validate_assembled()
         .map_err(|error| anyhow::anyhow!("invalid assembled configuration: {error}"))?;

@@ -44,6 +44,14 @@ pub(in crate::control) fn config_with_subscription_nodes(
         &config.nodes,
         &config.subscriptions,
     );
+    for diagnostic in honk_config::chain::membership_cycles(&config.nodes, &config.groups) {
+        tracing::warn!(
+            "{} = {}: {}",
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message
+        );
+    }
     config
 }
 fn subscription_provenance_error(index: usize) -> honk_config::error::DetailedConfigError {

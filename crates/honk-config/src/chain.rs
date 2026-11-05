@@ -243,6 +243,49 @@ pub fn check_exit_protocol(node: &Node) -> Result<(), String> {
     }
 }
 
+/// After group filters are resolved: report chains whose hop group (or a
+/// group nested in it) has the chain node itself as a member. When the group
+/// picks that member, the dial nests into itself until the depth limit and
+/// fails (e.g. a subscription `dialer: proxy` where `proxy` holds every node
+/// of that subscription). Groups are re-resolved on every refresh, so this
+/// runs after each resolution, not inside [`expand_chains`].
+pub fn membership_cycles(nodes: &[Node], groups: &[Group]) -> Vec<ConfigDiagnostic> {
+    let by_name: HashMap<&str, &Group> = groups.iter().map(|g| (g.name.as_str(), g)).collect();
+    let reaches = |start: &str, target: uuid::Uuid| -> bool {
+        let mut stack = vec![start];
+        let mut seen = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name) {
+                continue;
+            }
+            let Some(group) = by_name.get(name) else {
+                continue;
+            };
+            if group.nodes.contains(&target) {
+                return true;
+            }
+            stack.extend(group.groups.iter().map(String::as_str));
+        }
+        false
+    };
+    let mut diagnostics = Vec::new();
+    for node in nodes {
+        let OutboundConfig::Chain(config) = &node.outbound else {
+            continue;
+        };
+        if let Some(tag) = config.referenced_tags().find(|tag| reaches(tag, node.id)) {
+            diagnostics.push(ConfigDiagnostic {
+                setting: format!("node.{}.chain", node.name),
+                value: tag.to_owned(),
+                message: format!(
+                    "hop group `{tag}` contains this node itself; dials that pick it fail"
+                ),
+            });
+        }
+    }
+    diagnostics
+}
+
 fn chain_node_from_exit(exit: Node, hops: Vec<String>) -> Node {
     let mut node = Node {
         id: uuid::Uuid::nil(),
@@ -461,5 +504,31 @@ mod tests {
             "{diagnostics:?}"
         );
         assert!(!nodes.iter().any(is_relay_node), "no derived node beside the user's");
+    }
+
+    #[test]
+    fn hop_group_containing_the_chain_itself_is_reported() {
+        let sub = Subscription {
+            dialer: "proxy".to_owned(),
+            ..Subscription::default()
+        };
+        let mut exit = socks("exit", 2);
+        exit.subscription_id = Some(sub.id);
+        let mut nodes = vec![socks("front", 1), exit];
+        let mut groups = vec![Group {
+            name: "proxy".to_owned(),
+            ..Group::default()
+        }];
+        assert!(expand_chains(&mut nodes, &mut groups, std::slice::from_ref(&sub)).is_empty());
+        // An unfiltered group takes every node, the chained `exit` included.
+        crate::parser::resolve_group_filters(&mut groups, &nodes, std::slice::from_ref(&sub));
+        let diagnostics = membership_cycles(&nodes, &groups);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].setting, "node.exit.chain");
+
+        // A front group without the chained node is fine.
+        groups[0].filters = vec!["name('front')".to_owned()];
+        crate::parser::resolve_group_filters(&mut groups, &nodes, std::slice::from_ref(&sub));
+        assert!(membership_cycles(&nodes, &groups).is_empty());
     }
 }
