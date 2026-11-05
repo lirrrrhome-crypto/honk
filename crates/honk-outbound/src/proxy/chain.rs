@@ -255,7 +255,11 @@ pub fn udp_path_supported(leaves: &[Node], port: u16) -> Result<(), String> {
         return if (crate::descriptor::descriptor(exit.protocol()).supports_udp)(exit) {
             Ok(())
         } else {
-            Err(format!("`{}` ({}) carries no UDP", exit.name, exit.protocol().as_str()))
+            Err(format!(
+                "`{}` ({}) carries no UDP",
+                exit.name,
+                exit.protocol().as_str()
+            ))
         };
     }
     match &exit.outbound {
@@ -408,7 +412,11 @@ async fn bridge(upstream: ProxyStream, timeout: Duration) -> anyhow::Result<TcpS
             (Err(error), _) => Err(error),
             (Ok(()), outbound_done) => {
                 let _ = drained_tx.send(true);
-                if outbound_done { inbound.await } else { outbound.await }
+                if outbound_done {
+                    inbound.await
+                } else {
+                    outbound.await
+                }
             }
         };
         if let Err(error) = result {
@@ -421,9 +429,10 @@ async fn bridge(upstream: ProxyStream, timeout: Duration) -> anyhow::Result<TcpS
 /// "hop `a` (1/3) reaching `b`": which leaf failed and what it was reaching,
 /// so a dead later hop is not blamed on the hop in front of it.
 fn hop_context(leaves: &[Node], index: usize) -> String {
-    let toward = leaves
-        .get(index + 1)
-        .map_or_else(|| "the destination".to_owned(), |next| format!("`{}`", next.name));
+    let toward = leaves.get(index + 1).map_or_else(
+        || "the destination".to_owned(),
+        |next| format!("`{}`", next.name),
+    );
     format!(
         "proxy chain hop `{}` ({}/{}) reaching {toward}",
         leaves[index].name,
@@ -431,6 +440,11 @@ fn hop_context(leaves: &[Node], index: usize) -> String {
         leaves.len()
     )
 }
+
+/// A boxed, recursive UDP chain dial.
+type UdpDial<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<Arc<dyn PacketTransport>>> + Send + 'a>,
+>;
 
 /// Dials chain nodes over a registry of the ordinary protocols.
 pub struct ChainHandler {
@@ -488,7 +502,12 @@ impl ChainHandler {
             }
             None => {
                 self.base
-                    .dial(&leaves[0], hop_target, hop_domain.as_deref(), connect_timeout)
+                    .dial(
+                        &leaves[0],
+                        hop_target,
+                        hop_domain.as_deref(),
+                        connect_timeout,
+                    )
                     .await
             }
         };
@@ -558,9 +577,7 @@ impl ChainHandler {
         target: SocketAddr,
         target_domain: Option<&'a str>,
         connect_timeout: Duration,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<Arc<dyn PacketTransport>>> + Send + 'a>,
-    > {
+    ) -> UdpDial<'a> {
         Box::pin(async move {
             let (exit, hops) = leaves.split_last().expect("leaves are nonempty");
             let index = leaves.len() - 1;
@@ -601,7 +618,13 @@ impl ChainHandler {
             if let OutboundConfig::Socks5(_) = &exit.outbound {
                 udp_path_supported(hops, 0).map_err(refuse)?;
                 let stream = self
-                    .dial_leaves(hops, chain, server, server_domain.as_deref(), connect_timeout)
+                    .dial_leaves(
+                        hops,
+                        chain,
+                        server,
+                        server_domain.as_deref(),
+                        connect_timeout,
+                    )
                     .await?;
                 let mut control = bridge(stream, connect_timeout).await?;
                 let relay = super::socks5::Socks5Handler::associate_over_chain(exit, &mut control)
@@ -617,15 +640,26 @@ impl ChainHandler {
                 tracing::debug!(
                     "proxy chain: SOCKS5 `{}` relay {} via the hops in front",
                     exit.name,
-                    relay_domain
-                        .as_deref()
-                        .map_or_else(|| relay_target.to_string(), |d| format!("{d}:{}", relay_target.port()))
+                    relay_domain.as_deref().map_or_else(
+                        || relay_target.to_string(),
+                        |d| format!("{d}:{}", relay_target.port())
+                    )
                 );
                 let datagrams = self
-                    .udp_through(hops, chain, relay_target, relay_domain.as_deref(), connect_timeout)
+                    .udp_through(
+                        hops,
+                        chain,
+                        relay_target,
+                        relay_domain.as_deref(),
+                        connect_timeout,
+                    )
                     .await?;
-                let transport =
-                    super::socks5::Socks5RelayedUdp::new(datagrams, control, target, target_domain)?;
+                let transport = super::socks5::Socks5RelayedUdp::new(
+                    datagrams,
+                    control,
+                    target,
+                    target_domain,
+                )?;
                 return Ok(Arc::new(transport));
             }
             udp_exit_supported(exit, target.port()).map_err(refuse)?;
@@ -635,7 +669,13 @@ impl ChainHandler {
                 .and_then(|entry| entry.packet.clone())
                 .ok_or_else(|| refuse("no UDP handler".to_owned()))?;
             let stream = self
-                .dial_leaves(hops, chain, server, server_domain.as_deref(), connect_timeout)
+                .dial_leaves(
+                    hops,
+                    chain,
+                    server,
+                    server_domain.as_deref(),
+                    connect_timeout,
+                )
                 .await?;
             let carrier = bridge(stream, connect_timeout).await?;
             packet
@@ -844,7 +884,11 @@ mod tests {
             .dial(&relay, target, None, Duration::from_secs(3))
             .await
             .unwrap();
-        stream.stream.write_all(b"ping through three hops").await.unwrap();
+        stream
+            .stream
+            .write_all(b"ping through three hops")
+            .await
+            .unwrap();
         let mut reply = [0u8; 23];
         stream.stream.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply, b"ping through three hops");
@@ -1007,7 +1051,11 @@ mod tests {
             .dial(&relay, local(9), None, Duration::from_secs(3))
             .await
             .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(format!("{error:#}").contains("reaching `b`"), "{error:#}");
         bridges_settle(baseline).await;
     }
@@ -1048,7 +1096,10 @@ mod tests {
             .dial(&missing, local(9), None, Duration::from_secs(1))
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("resolves to no node"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("resolves to no node"),
+            "{error:#}"
+        );
 
         let looped = Node {
             name: "loop".to_owned(),
@@ -1067,7 +1118,10 @@ mod tests {
             .dial(&looped, local(9), None, Duration::from_secs(1))
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("nests too deeply"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("nests too deeply"),
+            "{error:#}"
+        );
     }
 
     // ------------------------------------------------------------ UDP
@@ -1132,7 +1186,8 @@ mod tests {
                         tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
                         return Ok::<_, std::io::Error>(());
                     }
-                    let socket = Arc::new(tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+                    let socket =
+                        Arc::new(tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
                     let (mut read, mut write) = client.into_split();
                     let replies = Arc::clone(&socket);
                     let back = tokio::spawn(async move {
@@ -1168,7 +1223,9 @@ mod tests {
     }
 
     async fn udp_echo() -> SocketAddr {
-        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
         let address = socket.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 65535];
@@ -1231,10 +1288,11 @@ mod tests {
             let payload: Vec<u8> = (0..size).map(|i| (i * 7 + size) as u8).collect();
             transport.send_packet(&payload).await.unwrap();
             let mut reply = vec![0u8; 65535];
-            let (n, from) = tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
-                .await
-                .expect("reply within 3s")
-                .unwrap();
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
+                    .await
+                    .expect("reply within 3s")
+                    .unwrap();
             assert_eq!(&reply[..n], &payload[..], "datagram of {size} bytes");
             assert_eq!(from, echo);
         }
@@ -1248,7 +1306,11 @@ mod tests {
         while live_bridges() > baseline && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(live_bridges(), baseline, "UDP bridges must close with the transport");
+        assert_eq!(
+            live_bridges(),
+            baseline,
+            "UDP bridges must close with the transport"
+        );
     }
 
     #[tokio::test]
@@ -1277,10 +1339,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.chain().any(|cause| cause.downcast_ref::<super::super::PacketRejection>().is_some()),
+            error.chain().any(|cause| cause
+                .downcast_ref::<super::super::PacketRejection>()
+                .is_some()),
             "{error:#}"
         );
-        assert!(log.lock().is_empty(), "no hop may be dialed for a refused exit");
+        assert!(
+            log.lock().is_empty(),
+            "no hop may be dialed for a refused exit"
+        );
     }
 
     /// Plaintext VLESS server for native command-UDP only.
@@ -1308,7 +1375,8 @@ mod tests {
                     client.read_exact(&mut ip).await?;
                     let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port);
                     client.write_all(&[0, 0]).await?;
-                    let socket = Arc::new(tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+                    let socket =
+                        Arc::new(tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
                     socket.connect(target).await?;
                     let (mut read, mut write) = client.into_split();
                     let replies = Arc::clone(&socket);
@@ -1346,7 +1414,9 @@ mod tests {
         let baseline = live_bridges();
         let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let a = socks("a", socks_server(Arc::clone(&log)).await);
-        let uuid = *uuid::Uuid::parse_str("9d3e3b62-6a0b-4d55-9a3c-1b2f6f1b0c11").unwrap().as_bytes();
+        let uuid = *uuid::Uuid::parse_str("9d3e3b62-6a0b-4d55-9a3c-1b2f6f1b0c11")
+            .unwrap()
+            .as_bytes();
         let port = vless_udp_server(uuid).await;
         let mut exit = socks("vless-exit", port);
         exit.outbound = OutboundConfig::Vless(honk_config::node::VlessConfig {
@@ -1376,10 +1446,11 @@ mod tests {
             let payload: Vec<u8> = (0..size).map(|i| (i * 13 + 1) as u8).collect();
             transport.send_packet(&payload).await.unwrap();
             let mut reply = vec![0u8; 65535];
-            let (n, _) = tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
-                .await
-                .expect("reply within 3s")
-                .unwrap();
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
+                    .await
+                    .expect("reply within 3s")
+                    .unwrap();
             assert_eq!(&reply[..n], &payload[..]);
         }
         assert_eq!(*log.lock(), [format!("127.0.0.1:{}", exit.port)]);
@@ -1397,7 +1468,8 @@ mod tests {
     #[test]
     fn resolver_reads_under_a_held_guard_with_a_queued_writer() {
         let node = socks("a", 1);
-        let shared = crate::group::GroupManager::new(&[], std::slice::from_ref(&node)).into_shared();
+        let shared =
+            crate::group::GroupManager::new(&[], std::slice::from_ref(&node)).into_shared();
         let resolver = GroupManagerResolver::new(Arc::clone(&shared));
         let guard = shared.read();
         let writer = {
@@ -1514,10 +1586,11 @@ mod tests {
             let payload: Vec<u8> = (0..size).map(|i| (i * 11 + size) as u8).collect();
             transport.send_packet(&payload).await.unwrap();
             let mut reply = vec![0u8; 65535];
-            let (n, from) = tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
-                .await
-                .expect("reply within 3s")
-                .unwrap();
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut reply))
+                    .await
+                    .expect("reply within 3s")
+                    .unwrap();
             assert_eq!(&reply[..n], &payload[..], "datagram of {size} bytes");
             assert_eq!(from, echo, "reply names the real remote peer");
         }
@@ -1528,7 +1601,11 @@ mod tests {
         while live_bridges() > baseline && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(live_bridges(), baseline, "bridges must close with the transport");
+        assert_eq!(
+            live_bridges(),
+            baseline,
+            "bridges must close with the transport"
+        );
     }
 
     #[tokio::test]
@@ -1539,10 +1616,16 @@ mod tests {
         let exit_log = Arc::new(parking_lot::Mutex::new(SocksUdpLog::default()));
         let front = socks("front", socks_udp_server(Arc::clone(&front_log)).await);
         let exit_ip = Ipv4Addr::new(127, 0, 0, 2);
-        let mut exit = socks("exit", socks_udp_server_on(exit_ip, Arc::clone(&exit_log)).await);
+        let mut exit = socks(
+            "exit",
+            socks_udp_server_on(exit_ip, Arc::clone(&exit_log)).await,
+        );
         exit.host = exit_ip.to_string();
         exit.address = format!("{exit_ip}:{}", exit.port);
-        install_resolver(Arc::new(MapResolver(HashMap::from([("front".to_owned(), front)]))));
+        install_resolver(Arc::new(MapResolver(HashMap::from([(
+            "front".to_owned(),
+            front,
+        )]))));
         let chained = Node {
             outbound: OutboundConfig::Chain(ChainConfig {
                 hops: vec!["front".to_owned()],
@@ -1562,21 +1645,26 @@ mod tests {
         // Control went front -> exit over TCP; the exit's unspecified relay
         // was replaced by its own server host, and front carried the
         // datagrams to it with its own UDP association.
-        let front_log = front_log.lock();
-        assert_eq!(front_log.connects, [format!("{exit_ip}:{}", exit.port)]);
-        assert_eq!(front_log.associations, 1);
-        assert_eq!(front_log.datagrams_to.len(), 4);
-        assert!(
-            front_log.datagrams_to.iter().all(|to| to.ip() == IpAddr::V4(exit_ip) && to.port() != exit.port),
-            "datagrams must go to the exit's own relay, not the bridge: {:?}",
-            front_log.datagrams_to
-        );
-        drop(front_log);
-        let exit_log = exit_log.lock();
-        assert_eq!(exit_log.associations, 1);
-        assert!(exit_log.datagrams_to.iter().all(|to| *to == echo));
-        assert_eq!(exit_log.datagrams_to.len(), 4);
-        drop(exit_log);
+        {
+            let front_log = front_log.lock();
+            assert_eq!(front_log.connects, [format!("{exit_ip}:{}", exit.port)]);
+            assert_eq!(front_log.associations, 1);
+            assert_eq!(front_log.datagrams_to.len(), 4);
+            assert!(
+                front_log
+                    .datagrams_to
+                    .iter()
+                    .all(|to| to.ip() == IpAddr::V4(exit_ip) && to.port() != exit.port),
+                "datagrams must go to the exit's own relay, not the bridge: {:?}",
+                front_log.datagrams_to
+            );
+        }
+        {
+            let exit_log = exit_log.lock();
+            assert_eq!(exit_log.associations, 1);
+            assert!(exit_log.datagrams_to.iter().all(|to| *to == echo));
+            assert_eq!(exit_log.datagrams_to.len(), 4);
+        }
         drop(transport);
         wait_for_bridges(baseline).await;
     }
@@ -1585,7 +1673,10 @@ mod tests {
     async fn udp_reaches_a_socks5_exit_through_a_trojan_hop() {
         let _serial = SERIAL.lock().await;
         let baseline = live_bridges();
-        let a = socks("a", socks_server(Arc::new(parking_lot::Mutex::new(Vec::new()))).await);
+        let a = socks(
+            "a",
+            socks_server(Arc::new(parking_lot::Mutex::new(Vec::new()))).await,
+        );
         let commands = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let middle = trojan("middle", trojan_server(Arc::clone(&commands)).await);
         let exit_log = Arc::new(parking_lot::Mutex::new(SocksUdpLog::default()));
@@ -1646,8 +1737,14 @@ mod tests {
             .dial_udp_transport(&chained, local(53), None, Duration::from_secs(3))
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("SOCKS5 exit `exit` needs UDP"), "{error:#}");
-        assert!(log.lock().is_empty(), "nothing may be dialed for a refused chain");
+        assert!(
+            format!("{error:#}").contains("SOCKS5 exit `exit` needs UDP"),
+            "{error:#}"
+        );
+        assert!(
+            log.lock().is_empty(),
+            "nothing may be dialed for a refused chain"
+        );
     }
 
     /// Capability checks run inside every UDP selection; they must leave a
@@ -1662,11 +1759,9 @@ mod tests {
             nodes: vec![a.id, b.id],
             ..Default::default()
         };
-        let shared = crate::group::GroupManager::new(
-            std::slice::from_ref(&group),
-            &[a.clone(), b.clone()],
-        )
-        .into_shared();
+        let shared =
+            crate::group::GroupManager::new(std::slice::from_ref(&group), &[a.clone(), b.clone()])
+                .into_shared();
         let resolver = GroupManagerResolver::new(shared);
         let first = resolver.resolve("lb").unwrap().name;
         for _ in 0..5 {

@@ -161,9 +161,10 @@ pub fn expand_chains(
                 })
                 .or_else(|| {
                     // `name('<group>/relay')` would also admit that node.
-                    nodes.iter().any(|node| node.name == derived).then(|| {
-                        format!("a node is already named `{derived}`")
-                    })
+                    nodes
+                        .iter()
+                        .any(|node| node.name == derived)
+                        .then(|| format!("a node is already named `{derived}`"))
                 })
         };
         group.policy = GroupPolicy::Selector;
@@ -334,7 +335,7 @@ fn static_cycles(nodes: &[Node], groups: &[Group]) -> Vec<ConfigDiagnostic> {
         .map(|group| (group.name.clone(), group.name.as_str()))
         .collect();
     let mut diagnostics = Vec::new();
-    for (name, _) in by_name.iter() {
+    for name in by_name.keys() {
         let mut stack: Vec<String> = vec![(*name).to_owned()];
         let mut seen: HashSet<String> = HashSet::new();
         while let Some(current) = stack.pop() {
@@ -470,7 +471,9 @@ mod tests {
         let mut nodes = vec![a, b];
         let diagnostics = expand_chains(&mut nodes, &mut [], &[]);
         assert!(
-            diagnostics.iter().any(|d| d.message.contains("reaches itself")),
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("reaches itself")),
             "{diagnostics:?}"
         );
     }
@@ -500,10 +503,15 @@ mod tests {
         }];
         let diagnostics = expand_chains(&mut nodes, &mut groups, &[]);
         assert!(
-            diagnostics.iter().any(|d| d.message.contains("already named")),
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("already named")),
             "{diagnostics:?}"
         );
-        assert!(!nodes.iter().any(is_relay_node), "no derived node beside the user's");
+        assert!(
+            !nodes.iter().any(is_relay_node),
+            "no derived node beside the user's"
+        );
     }
 
     #[test]

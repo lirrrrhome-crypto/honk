@@ -108,9 +108,9 @@ pub(super) fn parse_group_section(
                 }
             }
 
-            let relay_policy = fields.get("policy").is_some_and(|policy| {
-                policy.trim().raw().eq_ignore_ascii_case("relay")
-            });
+            let relay_policy = fields
+                .get("policy")
+                .is_some_and(|policy| policy.trim().raw().eq_ignore_ascii_case("relay"));
             if relay_policy {
                 if group.relay.is_empty() {
                     diagnostics.push(ConfigDiagnostic {
@@ -123,8 +123,7 @@ pub(super) fn parse_group_section(
             } else if let Some(policy) = fields.get("policy").copied() {
                 group.policy = parse_group_policy(policy, &group.name, diagnostics)?;
             }
-            if !group.relay.is_empty() && (!group.filters.is_empty() || !group.groups.is_empty())
-            {
+            if !group.relay.is_empty() && (!group.filters.is_empty() || !group.groups.is_empty()) {
                 diagnostics.push(ConfigDiagnostic {
                     setting: format!("group.{}.filter", group.name),
                     value: String::new(),

@@ -33,6 +33,7 @@ fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
         interrupt_connections: false,
         own: Default::default(),
         created_at: Utc::now(),
+        relay: Vec::new(),
     }
 }
 

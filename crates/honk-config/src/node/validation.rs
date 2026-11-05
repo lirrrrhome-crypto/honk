@@ -109,7 +109,10 @@ impl Node {
         }
         if let OutboundConfig::Chain(chain) = &self.outbound {
             if chain.hops.is_empty() || chain.referenced_tags().any(|tag| tag.trim().is_empty()) {
-                return Err(invalid(Some("chain_hops"), "a chain needs nonempty hop tags"));
+                return Err(invalid(
+                    Some("chain_hops"),
+                    "a chain needs nonempty hop tags",
+                ));
             }
             return match &chain.exit {
                 crate::node::ChainExit::Node(exit) => exit.validate_inner(),

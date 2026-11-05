@@ -512,7 +512,10 @@ impl PacketOutbound for VLessHandler {
         tcp: tokio::net::TcpStream,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        anyhow::ensure!(!node.is_xhttp(), "VLESS XHTTP UDP cannot ride on a supplied stream");
+        anyhow::ensure!(
+            !node.is_xhttp(),
+            "VLESS XHTTP UDP cannot ride on a supplied stream"
+        );
         let path = Self::udp_path(node, target.port())?;
         let vless = node.vless().unwrap();
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
@@ -537,10 +540,17 @@ impl PacketOutbound for VLessHandler {
             .dial_udp_carrier(node, uuid, header, tcp, connect_timeout)
             .await?;
         Ok(match path {
-            VlessUdpPath::Xudp => cool::connect_single_xudp(stream, target, target_domain, [0; 8]).await?,
+            VlessUdpPath::Xudp => {
+                cool::connect_single_xudp(stream, target, target_domain, [0; 8]).await?
+            }
             VlessUdpPath::UotV2 => {
                 let request = crate::proxy::uot::request(false, target, target_domain)?;
-                Arc::new(VlessUotTransport::new(stream, target, target_domain, request))
+                Arc::new(VlessUotTransport::new(
+                    stream,
+                    target,
+                    target_domain,
+                    request,
+                ))
             }
             _ => Arc::new(VlessConnectedTransport::new(stream, target)),
         })

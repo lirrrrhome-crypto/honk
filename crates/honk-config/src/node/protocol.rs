@@ -293,10 +293,13 @@ impl ChainConfig {
 
     /// Tags this chain names (hops, then a tag exit).
     pub fn referenced_tags(&self) -> impl Iterator<Item = &str> {
-        self.hops.iter().map(String::as_str).chain(match &self.exit {
-            ChainExit::Tag(tag) => Some(tag.as_str()),
-            ChainExit::Node(_) => None,
-        })
+        self.hops
+            .iter()
+            .map(String::as_str)
+            .chain(match &self.exit {
+                ChainExit::Tag(tag) => Some(tag.as_str()),
+                ChainExit::Node(_) => None,
+            })
     }
 }
 
@@ -359,7 +362,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&config.quic.tls),
             Self::Juicity(config) => Some(&config.quic.tls),
             Self::AnyTls(config) => Some(&config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block | Self::Chain(_) => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain(_) => None,
         }
     }
 
@@ -372,7 +379,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&mut config.quic.tls),
             Self::Juicity(config) => Some(&mut config.quic.tls),
             Self::AnyTls(config) => Some(&mut config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block | Self::Chain(_) => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain(_) => None,
         }
     }
 

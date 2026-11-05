@@ -3413,7 +3413,13 @@ group {
 "#;
     let mut diagnostics = Vec::new();
     let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
-    let hops = |name: &str| match &config.nodes.iter().find(|n| n.name == name).unwrap().outbound {
+    let hops = |name: &str| match &config
+        .nodes
+        .iter()
+        .find(|n| n.name == name)
+        .unwrap()
+        .outbound
+    {
         OutboundConfig::Chain(chain) => Some(chain.hops.clone()),
         _ => None,
     };
@@ -3432,7 +3438,10 @@ group {
     let relay = config.groups.iter().find(|g| g.name == "r").unwrap();
     assert_eq!(relay.nodes, vec![derived.id]);
     let all = config.groups.iter().find(|g| g.name == "all").unwrap();
-    assert!(!all.nodes.contains(&derived.id), "relay nodes stay out of unfiltered groups");
+    assert!(
+        !all.nodes.contains(&derived.id),
+        "relay nodes stay out of unfiltered groups"
+    );
 
     // The expanded form survives a JSON round trip and re-expansion.
     let json = config.to_json_string().unwrap();

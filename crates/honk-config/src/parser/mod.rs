@@ -699,11 +699,9 @@ fn parse_documents(
             parse_group_section(segments, diagnostics, config.global.check_tolerance_ms)?;
     }
 
-    for diagnostic in crate::chain::expand_chains(
-        &mut config.nodes,
-        &mut config.groups,
-        &config.subscriptions,
-    ) {
+    for diagnostic in
+        crate::chain::expand_chains(&mut config.nodes, &mut config.groups, &config.subscriptions)
+    {
         diagnostics.push(diagnostic);
     }
     resolve_group_filters_inner(

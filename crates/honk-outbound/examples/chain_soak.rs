@@ -211,9 +211,9 @@ fn proxy_target(host: &str, port: u16) -> (SocketAddr, Option<String>) {
 }
 
 fn http_probe(url: &str) -> anyhow::Result<Probe> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow::anyhow!("url= must be plain http:// (TLS would hide chain errors)"))?;
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        anyhow::anyhow!("url= must be plain http:// (TLS would hide chain errors)")
+    })?;
     let (authority, path) = match rest.find('/') {
         Some(index) => (&rest[..index], &rest[index..]),
         None => (rest, "/"),
@@ -412,7 +412,10 @@ async fn run_udp_probe(
                     n >= 12 && reply[..2] == datagram[..2] && reply[2] & 0x80 != 0,
                     "dns reply does not answer the query"
                 ),
-                _ => anyhow::ensure!(reply[..n] == datagram[..], "udp payload mismatch (data corruption)"),
+                _ => anyhow::ensure!(
+                    reply[..n] == datagram[..],
+                    "udp payload mismatch (data corruption)"
+                ),
             }
         }
         Ok::<_, anyhow::Error>(first_byte.expect("at least one packet"))
@@ -452,7 +455,8 @@ impl Window {
         match outcome {
             Outcome::Ok { dial, first_byte } => {
                 self.ok += 1;
-                self.dial_us.push(dial.as_micros().min(u32::MAX as u128) as u32);
+                self.dial_us
+                    .push(dial.as_micros().min(u32::MAX as u128) as u32);
                 self.first_byte_us
                     .push(first_byte.as_micros().min(u32::MAX as u128) as u32);
             }
@@ -611,7 +615,9 @@ async fn read_socks_addr(stream: &mut (impl AsyncReadExt + Unpin)) -> std::io::R
                 u16::from_be_bytes([raw[4], raw[5]]),
             )))
         }
-        _ => Err(std::io::Error::other("selftest Trojan supports IPv4 targets")),
+        _ => Err(std::io::Error::other(
+            "selftest Trojan supports IPv4 targets",
+        )),
     }
 }
 
@@ -777,7 +783,8 @@ async fn main() -> anyhow::Result<()> {
     if options.selftest {
         let mut links = Vec::new();
         for index in 0..=options.selftest_hops {
-            let port = local_socks(options.fail, options.jitter, 0x9e37_79b9 + index as u64).await?;
+            let port =
+                local_socks(options.fail, options.jitter, 0x9e37_79b9 + index as u64).await?;
             links.push(format!("socks5://127.0.0.1:{port}#selftest-{index}"));
         }
         exit_link = links.pop();
@@ -820,7 +827,10 @@ async fn main() -> anyhow::Result<()> {
         let port = selftest_trojan.take().expect("selftest Trojan server");
         nodes.push(trojan_node(port));
         selftest_socks_exit = Some(parse_node(
-            &format!("socks5://127.0.0.1:{}#selftest-socks5-exit", local_socks_udp().await?),
+            &format!(
+                "socks5://127.0.0.1:{}#selftest-socks5-exit",
+                local_socks_udp().await?
+            ),
             "exit",
         )?);
     }
@@ -880,7 +890,11 @@ async fn main() -> anyhow::Result<()> {
                 query: dns_query(&options.name),
             }
         }
-        _ if options.udp.as_deref().is_some_and(|value| !value.is_empty()) => {
+        _ if options
+            .udp
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()) =>
+        {
             let (target, domain) = udp_target(options.udp.as_deref().unwrap(), 7);
             Probe::UdpEcho { target, domain }
         }
@@ -908,8 +922,10 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "probe     {}",
         match &probe {
-            Probe::Http { domain, target, .. } =>
-                format!("HTTP GET {}", domain.clone().unwrap_or_else(|| target.to_string())),
+            Probe::Http { domain, target, .. } => format!(
+                "HTTP GET {}",
+                domain.clone().unwrap_or_else(|| target.to_string())
+            ),
             Probe::Echo { domain, target } => format!(
                 "echo {} ({} bytes)",
                 domain.clone().unwrap_or_else(|| target.to_string()),
@@ -1038,7 +1054,8 @@ async fn main() -> anyhow::Result<()> {
         }
         if let Some(file) = csv.as_mut() {
             let cell = |p: &Option<Percentiles>, f: fn(&Percentiles) -> f64| {
-                p.as_ref().map_or_else(String::new, |p| format!("{:.2}", f(p)))
+                p.as_ref()
+                    .map_or_else(String::new, |p| format!("{:.2}", f(p)))
             };
             let errors: Vec<String> = current
                 .errors
@@ -1076,7 +1093,11 @@ async fn main() -> anyhow::Result<()> {
             let _ = worker.await;
         }
     };
-    let _ = tokio::time::timeout(options.io_timeout + options.timeout * 3 + options.hold, drain).await;
+    let _ = tokio::time::timeout(
+        options.io_timeout + options.timeout * 3 + options.hold,
+        drain,
+    )
+    .await;
     // Let bridges see their EOFs before the leak check.
     let settle = Instant::now();
     while chain::live_bridges() > 0 && settle.elapsed() < Duration::from_secs(35) {
@@ -1087,7 +1108,10 @@ async fn main() -> anyhow::Result<()> {
     let first_byte = percentiles(&mut total.first_byte_us);
     let attempts = total.ok + total.fail;
     println!();
-    println!("summary   {:.0}s, {attempts} attempts", started.elapsed().as_secs_f64());
+    println!(
+        "summary   {:.0}s, {attempts} attempts",
+        started.elapsed().as_secs_f64()
+    );
     println!(
         "success   {} ok / {} failed = {:.3}%",
         total.ok,
