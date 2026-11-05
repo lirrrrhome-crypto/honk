@@ -138,6 +138,21 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
         false,
         "proxy plugins are unsupported",
     )?;
+    // A provider never picks which of the user's nodes its traffic rides on,
+    // and dropping the key would dial the server directly instead of through
+    // the intended upstream; chains come from the subscription's `dialer`.
+    reject_active_unless(
+        mapping,
+        &[
+            "dialer-proxy",
+            "dialer_proxy",
+            "underlying-proxy",
+            "underlying_proxy",
+            "detour",
+        ],
+        false,
+        "proxy chaining is unsupported in subscriptions; set the subscription's dialer instead",
+    )?;
     if !supports_tls(protocol)
         && has_active_for_key(
             mapping,

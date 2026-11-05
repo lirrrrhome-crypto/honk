@@ -27,7 +27,7 @@ The entry block accepts five options:
 | `interval` | Set the refresh duration; `0` disables periodic refresh. | `86400s` |
 | `cache` | `false` keeps this subscription's body out of the subscription store. | On |
 | `route` | Select the fetch route (see below). | `routing` |
-| `dialer` | Every node of this subscription reaches its server through this node or group; see [proxy chains](./groups.md#proxy-chains). | None |
+| `dialer` | Every node of this subscription reaches its server through this node or group; see [proxy chains](./groups.md#proxy-chains). Chaining fields inside the body (Clash `dialer-proxy`, sing-box `detour` and similar) are never honored; such nodes are skipped rather than dialed directly. | None |
 
 A missing option uses the `assets.subscription` default, or `assets.route` for the route, before the built-in default. See the [assets reference](./assets.md).
 

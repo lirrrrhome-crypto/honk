@@ -27,7 +27,7 @@ subscription {
 | `interval` | 设置刷新间隔；`0` 禁用定期刷新。 | `86400s` |
 | `cache` | `false` 使该订阅的正文不写入订阅存储。 | 开启 |
 | `route` | 指定拉取出口（见下文）。 | `routing` |
-| `dialer` | 该订阅的每个节点经由此节点或组连接服务器，见[代理链](./groups.md#代理链)。 | 无 |
+| `dialer` | 该订阅的每个节点经由此节点或组连接服务器，见[代理链](./groups.md#代理链)。订阅正文自带的链式字段（Clash 的 `dialer-proxy`、sing-box 的 `detour` 等）不被采用，带这类字段的节点会被跳过，而不是改为直连。 | 无 |
 
 未设置的选项先取 `assets.subscription` 的默认值（出口取 `assets.route`），再取内置默认值。见 [Assets 配置参考](./assets.md)。
 
