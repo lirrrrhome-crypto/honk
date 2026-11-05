@@ -159,6 +159,12 @@ pub fn expand_chains(
                     (members.iter().any(|tag| tag == &derived))
                         .then(|| "a relay cannot contain itself".to_owned())
                 })
+                .or_else(|| {
+                    // `name('<group>/relay')` would also admit that node.
+                    nodes.iter().any(|node| node.name == derived).then(|| {
+                        format!("a node is already named `{derived}`")
+                    })
+                })
         };
         group.policy = GroupPolicy::Selector;
         group.nodes.clear();
@@ -439,5 +445,21 @@ mod tests {
         let exit = nodes.iter().find(|n| n.name == "exit").unwrap();
         assert_eq!(chain(exit).hops, ["front"]);
         assert_eq!(exit.subscription_id, Some(sub.id));
+    }
+
+    #[test]
+    fn relay_name_taken_by_a_node_disables_the_relay() {
+        let mut nodes = vec![socks("a", 1), socks("b", 2), socks("r/relay", 3)];
+        let mut groups = vec![Group {
+            name: "r".to_owned(),
+            relay: vec!["a".to_owned(), "b".to_owned()],
+            ..Group::default()
+        }];
+        let diagnostics = expand_chains(&mut nodes, &mut groups, &[]);
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("already named")),
+            "{diagnostics:?}"
+        );
+        assert!(!nodes.iter().any(is_relay_node), "no derived node beside the user's");
     }
 }
