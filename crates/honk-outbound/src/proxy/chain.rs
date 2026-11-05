@@ -44,6 +44,13 @@ pub const MAX_CHAIN_LEAVES: usize = 16;
 pub trait ChainResolver: Send + Sync {
     /// A node by name, or a group's current TCP selection.
     fn resolve(&self, tag: &str) -> Option<Node>;
+
+    /// Like [`Self::resolve`], but for checks that are not traffic (UDP
+    /// capability, reachability probes): a group must not count it as use,
+    /// advance a round-robin cursor or wake an idle URL test.
+    fn peek(&self, tag: &str) -> Option<Node> {
+        self.resolve(tag)
+    }
 }
 
 static RESOLVER: RwLock<Option<Arc<dyn ChainResolver>>> = RwLock::new(None);
@@ -101,21 +108,46 @@ impl ChainResolver for GroupManagerResolver {
             .or_else(|| manager.select_node(tag))
             .cloned()
     }
+
+    fn peek(&self, tag: &str) -> Option<Node> {
+        let manager = self.manager();
+        if let Some(node) = manager.node_by_name(tag) {
+            return Some(node.clone());
+        }
+        manager
+            .peek_selection_plan_for_domain(
+                tag,
+                crate::alive::ProbeDomain::Tcp,
+                crate::alive::IpVersion::V4,
+            )
+            .nodes
+            .first()
+            .map(|node| (*node).clone())
+    }
 }
 
-fn resolve(tag: &str) -> anyhow::Result<Node> {
+/// Whether a resolution is real traffic or only an inspection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    Dial,
+    Peek,
+}
+
+fn resolve(tag: &str, mode: Resolution) -> anyhow::Result<Node> {
     // Written once at startup; the guard never outlives this statement.
     let resolver = RESOLVER
         .read()
         .clone()
         .ok_or_else(|| anyhow::anyhow!("proxy chain resolver is not installed"))?;
-    resolver
-        .resolve(tag)
-        .ok_or_else(|| anyhow::anyhow!("proxy chain hop `{tag}` resolves to no node"))
+    match mode {
+        Resolution::Dial => resolver.resolve(tag),
+        Resolution::Peek => resolver.peek(tag),
+    }
+    .ok_or_else(|| anyhow::anyhow!("proxy chain hop `{tag}` resolves to no node"))
 }
 
 /// Flatten `node` into concrete leaves, appending them to `out`.
-fn flatten(node: Node, out: &mut Vec<Node>, depth: usize) -> anyhow::Result<()> {
+fn flatten(node: Node, out: &mut Vec<Node>, depth: usize, mode: Resolution) -> anyhow::Result<()> {
     anyhow::ensure!(
         depth <= MAX_CHAIN_LEAVES,
         "proxy chain nests too deeply (a hop probably reaches itself)"
@@ -126,12 +158,17 @@ fn flatten(node: Node, out: &mut Vec<Node>, depth: usize) -> anyhow::Result<()> 
         }
         return Ok(());
     };
-    flatten_config(config, out, depth)
+    flatten_config(config, out, depth, mode)
 }
 
-fn flatten_config(config: ChainConfig, out: &mut Vec<Node>, depth: usize) -> anyhow::Result<()> {
+fn flatten_config(
+    config: ChainConfig,
+    out: &mut Vec<Node>,
+    depth: usize,
+    mode: Resolution,
+) -> anyhow::Result<()> {
     for hop in &config.hops {
-        flatten(resolve(hop)?, out, depth + 1)?;
+        flatten(resolve(hop, mode)?, out, depth + 1, mode)?;
         anyhow::ensure!(
             out.len() <= MAX_CHAIN_LEAVES,
             "proxy chain exceeds {MAX_CHAIN_LEAVES} hops"
@@ -139,9 +176,9 @@ fn flatten_config(config: ChainConfig, out: &mut Vec<Node>, depth: usize) -> any
     }
     let exit = match config.exit {
         ChainExit::Node(node) => *node,
-        ChainExit::Tag(tag) => resolve(&tag)?,
+        ChainExit::Tag(tag) => resolve(&tag, mode)?,
     };
-    flatten(exit, out, depth + 1)?;
+    flatten(exit, out, depth + 1, mode)?;
     anyhow::ensure!(
         out.len() <= MAX_CHAIN_LEAVES,
         "proxy chain exceeds {MAX_CHAIN_LEAVES} hops"
@@ -149,10 +186,20 @@ fn flatten_config(config: ChainConfig, out: &mut Vec<Node>, depth: usize) -> any
     Ok(())
 }
 
-/// The leaves `node` dials through, first hop first, exit last.
+/// The leaves `node` dials through, first hop first, exit last. This is a
+/// dial: hop groups count it as use.
 pub fn leaves(node: &Node) -> anyhow::Result<Vec<Node>> {
+    leaves_with(node, Resolution::Dial)
+}
+
+/// [`leaves`] for inspection only: hop groups keep their state untouched.
+pub fn peek_leaves(node: &Node) -> anyhow::Result<Vec<Node>> {
+    leaves_with(node, Resolution::Peek)
+}
+
+fn leaves_with(node: &Node, mode: Resolution) -> anyhow::Result<Vec<Node>> {
     let mut out = Vec::new();
-    flatten(node.clone(), &mut out, 0)?;
+    flatten(node.clone(), &mut out, 0, mode)?;
     anyhow::ensure!(!out.is_empty(), "proxy chain has no proxy hop");
     for leaf in &out[1..] {
         honk_config::chain::check_exit_protocol(leaf).map_err(|reason| {
@@ -226,7 +273,7 @@ pub fn udp_path_supported(leaves: &[Node], port: u16) -> Result<(), String> {
 /// Descriptor predicate: whether UDP can traverse the chain's current leaves.
 /// Resolved live, so a relay whose exit is a group follows that group's pick.
 pub fn chain_supports_udp(node: &Node) -> bool {
-    leaves(node).is_ok_and(|leaves| udp_path_supported(&leaves, 0).is_ok())
+    peek_leaves(node).is_ok_and(|leaves| udp_path_supported(&leaves, 0).is_ok())
 }
 
 /// The address a leaf's server is reached at, as a proxy target: an IP
@@ -623,7 +670,7 @@ impl PacketOutbound for ChainHandler {
 impl ProbeableOutbound for ChainHandler {
     /// Reachability of the first hop; the full path is covered by URL tests.
     async fn test_connectivity(&self, node: &Node) -> bool {
-        let Ok(leaves) = leaves(node) else {
+        let Ok(leaves) = peek_leaves(node) else {
             return false;
         };
         match self.base.find(leaves[0].protocol()) {
@@ -1601,5 +1648,31 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("SOCKS5 exit `exit` needs UDP"), "{error:#}");
         assert!(log.lock().is_empty(), "nothing may be dialed for a refused chain");
+    }
+
+    /// Capability checks run inside every UDP selection; they must leave a
+    /// round-robin hop group's cursor where real dials put it.
+    #[test]
+    fn capability_checks_do_not_advance_a_hop_group() {
+        let a = socks("a", 1);
+        let b = socks("b", 2);
+        let group = honk_config::group::Group {
+            name: "lb".to_owned(),
+            policy: honk_config::group::GroupPolicy::LoadBalance,
+            nodes: vec![a.id, b.id],
+            ..Default::default()
+        };
+        let shared = crate::group::GroupManager::new(
+            std::slice::from_ref(&group),
+            &[a.clone(), b.clone()],
+        )
+        .into_shared();
+        let resolver = GroupManagerResolver::new(shared);
+        let first = resolver.resolve("lb").unwrap().name;
+        for _ in 0..5 {
+            resolver.peek("lb").unwrap();
+        }
+        let second = resolver.resolve("lb").unwrap().name;
+        assert_ne!(first, second, "peeks must not consume round-robin turns");
     }
 }
