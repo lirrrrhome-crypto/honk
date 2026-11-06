@@ -1,0 +1,35 @@
+# Chain examples: virtual nodes read left to right, `in -> ... -> out`.
+# See doc/en/reference/nodes.md#chains and groups.md#group-exit.
+
+node {
+    front: 'socks5://127.0.0.1:1080'
+    gw1: 'socks5://192.0.2.10:1080'
+    gw2: 'socks5://192.0.2.11:1080'
+    land: 'trojan://secret@exit.example:443?sni=exit.example#land'
+
+    # A chain node: enter through front, leave through land.
+    via_front: chain {
+        front -> land
+    }
+
+    # Arrow sugar: `landing` is a chain whose out is this link.
+    landing: 'socks5://198.51.100.7:1080' -> front
+}
+
+group {
+    # Every member leaves through land: served as `gw1 -> land`, `gw2 -> land`.
+    ingress {
+        filter: name(keyword: 'gw')
+        policy: min_moving_avg
+        exit: land
+    }
+    proxy {
+        filter: group('ingress')
+        filter: name('via_front', 'landing')
+        policy: select
+    }
+}
+
+routing {
+    fallback: proxy
+}

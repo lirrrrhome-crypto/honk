@@ -672,6 +672,35 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。目标 TLS 记录的缓冲�
 
 对于写成 `a -> b` 的链，只解析 `a`。自动名称只来自解码后的 `#fragment`、VMess `ps` 或 `{scheme}-{host}`；解析器绝不以原始 URI 或用户信息作为回退，因此生成名称不会泄漏凭据。显式标签、片段与 `ps` 值仍由用户控制。
 
+## 链
+
+链是从左到右读的虚拟节点 `in -> … -> out`：流量进入第一个成员，由它连接下一个成员的服务器，依次类推，最后一个成员连接目标。成员是节点名或组名，在建立连接时解析，组成员继续执行自身策略。
+
+```dae
+node {
+    front: 'socks5://127.0.0.1:1080'
+    land: 'trojan://secret@exit.example:443?sni=exit.example'
+
+    # 链节点；`->` 之后可换行继续写成员。
+    via_front: chain {
+        front -> land
+    }
+
+    # 箭头糖：`landing` 是一条以该链接为出口的链，这个链接在链之外没有自己的名字。
+    landing: 'vless://…@land.example:443?security=reality&…' -> front
+}
+```
+
+- 一条链有 2 到 8 个成员（跳点加出口），嵌套链展开后计数。成员不能为空、`direct`、`block` 或链自身；无效的 chain 块以 `invalid-chain` 警告跳过，绝不变成直连节点。能经由成员或包含它的组到达自身的链报告为 `chain-cycle`。
+- 第一个成员可以是任意支持 TCP 的协议，按普通节点拨号，协议有会话时复用当前会话。之后的每个成员直接在前一个成员返回的流上握手，中间没有回环 socket 或复制任务。后续成员必须完全运行在这一条流上：无插件的 Shadowsocks、Trojan、VMess、SOCKS5，以及非多路复用、非 XHTTP 的 VLESS。QUIC 协议、AnyTLS 和多路复用或 XHTTP 的 VLESS 放在后续位置时，在拨号前即被拒绝。
+- 后续成员的服务器名以域名形式交给前一个成员解析，honk 不在本地查询。
+- 放在后续位置时，VLESS Vision 照常填充但不会切换到 Direct（没有可 splice 的 socket），也没有 TCP 载体压力证据；REALITY 收到伪装证书时拨号直接失败而不重试，因为只有整条链才能重新连接该服务器。
+- SOCKS5 在数据开始前应答请求；Shadowsocks、Trojan、VMess 和 VLESS 不应答。后续成员失败时，错误会把它前面不确认请求的成员列为可能原因。
+- 链只承载 TCP。链不参与 UDP 选择，组内 UDP 使用其他成员、`final` 或失败，绝不绕过链。
+- 链节点的 ID 由名称、成员和出口派生；真实节点的 ID 不依赖它所在的链。
+
+与 mihomo 的对应：`dialer-proxy` 对应箭头糖，`type: relay` 对应链节点；但链是节点而非组策略，可作为任意组的成员。整组共用一个出口使用组的 `exit` 键（见[组](./groups.md#组出口)）。订阅不能定义链：带 `dialer-proxy` 的 Clash 代理会被跳过，而不是导入成直连服务器的节点。
+
 ## 相关文档
 
 - [订阅参考](./subscription.md)

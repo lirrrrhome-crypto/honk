@@ -3748,3 +3748,28 @@ group {
         assert_ne!(id(&a, "c"), id(&b, "c"));
     }
 }
+
+#[test]
+fn chain_example_config_parses_without_diagnostics() {
+    let mut diagnostics = Vec::new();
+    let config = crate::parser::parse_dae_config_with_detailed_diagnostics(
+        include_str!("../../../../chain.example.dae"),
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    for name in ["via_front", "landing", "gw1 -> land", "gw2 -> land"] {
+        assert!(
+            matches!(
+                config
+                    .nodes
+                    .iter()
+                    .find(|n| n.name == name)
+                    .unwrap()
+                    .outbound,
+                crate::node::OutboundConfig::Chain(_)
+            ),
+            "{name} is a chain"
+        );
+    }
+}
