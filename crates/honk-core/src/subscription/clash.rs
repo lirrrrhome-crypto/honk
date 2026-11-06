@@ -138,6 +138,19 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
         false,
         "proxy plugins are unsupported",
     )?;
+    // Importing it as a plain node would dial the server directly, dropping
+    // the intended upstream; chains belong to the node and group sections.
+    reject_active_unless(
+        mapping,
+        &[
+            "dialer-proxy",
+            "dialer_proxy",
+            "underlying-proxy",
+            "underlying_proxy",
+        ],
+        false,
+        "proxy chaining is unsupported in subscriptions",
+    )?;
     if !supports_tls(protocol)
         && has_active_for_key(
             mapping,

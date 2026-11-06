@@ -306,6 +306,37 @@ fn test_parse_subscription_keeps_valid_sibling_after_intrinsic_rejection() {
 }
 
 #[test]
+fn test_parse_subscription_skips_chained_clash_proxies() {
+    let clash = Subscription {
+        sub_type: SubscriptionType::Clash,
+        ..Default::default()
+    };
+    let nodes = parse_subscription_content(
+        &clash,
+        r#"proxies:
+  - name: chained
+    type: socks5
+    server: 10.0.0.2
+    port: 1080
+    dialer-proxy: front
+  - name: inactive
+    type: socks5
+    server: 10.0.0.3
+    port: 1080
+    dialer-proxy: ''
+  - name: plain
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+"#,
+    )
+    .unwrap();
+    // Never imported as a plain node that would dial its server directly.
+    let names: Vec<_> = nodes.iter().map(|node| node.name.as_str()).collect();
+    assert_eq!(names, ["inactive", "plain"]);
+}
+
+#[test]
 fn test_parse_subscription_skips_proxy_plugins() {
     let clash = Subscription {
         sub_type: SubscriptionType::Clash,
