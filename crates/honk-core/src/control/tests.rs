@@ -5429,3 +5429,112 @@ async fn nfqueue_stats_sampler_exit_completes_shutdown_without_double_join() {
 
 #[path = "tests/tcp_recovery.rs"]
 mod tcp_recovery;
+
+/// A control plane serves chain nodes through its own registry: members
+/// resolve against its group manager, and group-exit chains derived at
+/// config resolution are part of its runtime generation.
+#[tokio::test]
+async fn control_plane_dials_chain_and_group_exit_nodes() -> anyhow::Result<()> {
+    use std::net::Ipv4Addr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    type Log = Arc<parking_lot::Mutex<Vec<String>>>;
+    async fn socks_server(log: Log) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut head = [0u8; 2];
+                    client.read_exact(&mut head).await?;
+                    let mut methods = vec![0u8; head[1] as usize];
+                    client.read_exact(&mut methods).await?;
+                    client.write_all(&[5, 0]).await?;
+                    let mut request = [0u8; 4];
+                    client.read_exact(&mut request).await?;
+                    assert_eq!(request[3], 1, "tests use IPv4 targets");
+                    let mut raw = [0u8; 6];
+                    client.read_exact(&mut raw).await?;
+                    let target = std::net::SocketAddr::from((
+                        Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]),
+                        u16::from_be_bytes([raw[4], raw[5]]),
+                    ));
+                    log.lock().push(target.to_string());
+                    let mut upstream = TcpStream::connect(target).await?;
+                    client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                    Ok::<_, std::io::Error>(())
+                });
+            }
+        });
+        port
+    }
+
+    let front_log = Log::default();
+    let gw_log = Log::default();
+    let front = socks_server(Arc::clone(&front_log)).await;
+    let gw = socks_server(Arc::clone(&gw_log)).await;
+    let land = socks_server(Log::default()).await;
+    let echo = TcpListener::bind("127.0.0.1:0").await?;
+    let echo_addr = echo.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = echo.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut read, mut write) = stream.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+
+    let mut config = honk_config::parser::parse_dae_config(&format!(
+        "node {{\n front: 'socks5://127.0.0.1:{front}'\n gw: 'socks5://127.0.0.1:{gw}'\n land: 'socks5://127.0.0.1:{land}'\n via_front: chain {{ front -> land }}\n}}\n\
+         group {{\n ingress {{\n  filter: name('gw')\n  exit: land\n }}\n}}\nrouting {{\n fallback: ingress\n}}\n"
+    ))?;
+    config.ensure_builtin_nodes();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let registry = Arc::new(ProxyRegistry::default_resolver()?);
+    let plane = ControlPlane::new(
+        config.clone(),
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::clone(&registry),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    let id = |name: &str| {
+        config
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id
+    };
+    for (name, log, hop) in [
+        ("via_front", &front_log, front),
+        ("gw -> land", &gw_log, gw),
+    ] {
+        let generation = Arc::clone(&plane.runtime_registry().read());
+        let mut stream = registry
+            .dial_runtime(
+                generation,
+                id(name),
+                echo_addr,
+                None,
+                Duration::from_secs(3),
+            )
+            .await?;
+        stream.stream.write_all(name.as_bytes()).await?;
+        let mut reply = vec![0u8; name.len()];
+        stream.stream.read_exact(&mut reply).await?;
+        assert_eq!(reply, name.as_bytes());
+        assert_eq!(
+            *log.lock(),
+            [format!("127.0.0.1:{land}")],
+            "{name} entered at the member on port {hop} and reached land"
+        );
+    }
+    Ok(())
+}
