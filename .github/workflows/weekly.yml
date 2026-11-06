@@ -99,7 +99,7 @@ jobs:
           readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
 
   public-vless-loopback:
-    name: Public VLESS and shared-source loopback interop (4 cases)
+    name: Public VLESS, shared-source and chain loopback interop (5 cases)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -173,6 +173,12 @@ jobs:
           test -x "$HONK_SING_BOX_BIN"
           ci/run-exact-ignored-tests.sh --test shared_source_sing_box \
             sing_box_shared_source_eim_eif_and_domain_matrix
+      - name: Run the chain sing-box interop matrix
+        run: |
+          set -euo pipefail
+          test -x "$HONK_SING_BOX_BIN"
+          ci/run-exact-ignored-tests.sh --test chain_interop \
+            sing_box_chain_front_by_landing_matrix
       - name: Upload public loopback JUnit
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
