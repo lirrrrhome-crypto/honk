@@ -340,7 +340,7 @@ impl ShadowsocksHandler {
         &self,
         method: &str,
         password: &str,
-        server: TcpStream,
+        server: stream::SsCarrier,
         header: Vec<u8>,
         target: SocketAddr,
         target_domain: Option<&str>,
@@ -417,8 +417,15 @@ impl TcpOutbound for ShadowsocksHandler {
         let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
 
         let header = addr::encode_address(target, target_domain)?;
-        self.start_relay(method, password, server, header, target, target_domain)
-            .await
+        self.start_relay(
+            method,
+            password,
+            stream::SsCarrier::Tcp(server),
+            header,
+            target,
+            target_domain,
+        )
+        .await
     }
 
     async fn dial_with_tcp(
@@ -428,6 +435,40 @@ impl TcpOutbound for ShadowsocksHandler {
         target_domain: Option<&str>,
         server: TcpStream,
         _connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        self.relay_on(node, stream::SsCarrier::Tcp(server), target, target_domain)
+            .await
+    }
+
+    async fn dial_over(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        carrier: Box<dyn super::AsyncReadWrite>,
+        _connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::ensure!(
+            node.shadowsocks().unwrap().plugin.is_none(),
+            "Shadowsocks plugins cannot run over another proxy's stream"
+        );
+        self.relay_on(
+            node,
+            stream::SsCarrier::Chained(carrier),
+            target,
+            target_domain,
+        )
+        .await
+    }
+}
+
+impl ShadowsocksHandler {
+    async fn relay_on(
+        &self,
+        node: &Node,
+        server: stream::SsCarrier,
+        target: SocketAddr,
+        target_domain: Option<&str>,
     ) -> anyhow::Result<ProxyStream> {
         let config = node.shadowsocks().unwrap();
         let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");

@@ -137,6 +137,82 @@ pub(crate) enum MaybeTls {
     Plain(Box<ObservedTcp>),
 }
 
+/// TLS (or REALITY) on a stream the chain member in front of this node
+/// opened to its server. Nothing here dials: a REALITY mask-certificate
+/// retry would need a fresh connection to the server, which only the chain
+/// can provide, so it fails the dial instead.
+pub(crate) enum ChainedTls {
+    Tls(crate::tls::TlsStream<Box<dyn AsyncReadWrite>>),
+    Plain(Box<dyn AsyncReadWrite>),
+}
+
+pub(crate) async fn tls_over(
+    node: &Node,
+    carrier: Box<dyn AsyncReadWrite>,
+    connect_timeout: std::time::Duration,
+) -> anyhow::Result<ChainedTls> {
+    anyhow::ensure!(
+        !node.is_xhttp(),
+        "XHTTP cannot run over another proxy's stream"
+    );
+    let Some(tls) = node.tls() else {
+        return Ok(ChainedTls::Plain(carrier));
+    };
+    if !tls.alpn.is_empty()
+        || node
+            .transport()
+            .is_some_and(|transport| !transport.ws_headers.is_empty())
+    {
+        node.validate_protocol()?;
+    }
+    let handshake = async {
+        if let Some(reality) = crate::reality::parse_reality_config(node)? {
+            let chrome = crate::tls::chrome_mode();
+            let stream =
+                crate::reality::reality_connect_with_key_shares(carrier, &reality, chrome, true, None)
+                    .await
+                    .map_err(|error| {
+                        if error.is::<crate::reality::RealityMaskCertificate>() {
+                            error.context("REALITY server presented its mask certificate; a chained dial cannot retry")
+                        } else {
+                            error
+                        }
+                    })?;
+            return Ok(ChainedTls::Tls(stream));
+        }
+        if tls.enabled {
+            let connector = crate::tls::build_connector(node)?;
+            let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
+            return Ok(ChainedTls::Tls(
+                connector.connect(&server_name, carrier).await?,
+            ));
+        }
+        Ok::<_, anyhow::Error>(ChainedTls::Plain(carrier))
+    };
+    let stream = tokio::time::timeout(connect_timeout, handshake)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "chained TLS setup timeout")
+        })??;
+    crate::runtime::flow_observation::milestone(
+        crate::runtime::flow_observation::Milestone::TransportReady,
+    );
+    Ok(stream)
+}
+
+/// [`tls_over`] then the node's stream transport (WebSocket, gRPC, …).
+pub(crate) async fn wrap_transport_over(
+    node: &Node,
+    carrier: Box<dyn AsyncReadWrite>,
+    connect_timeout: std::time::Duration,
+) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+    let stream: Box<dyn AsyncReadWrite> = match tls_over(node, carrier, connect_timeout).await? {
+        ChainedTls::Tls(stream) => Box::new(stream),
+        ChainedTls::Plain(stream) => stream,
+    };
+    wrap_after_tls(node, stream).await
+}
+
 pub(crate) async fn maybe_tls_wrap_concrete(
     node: &Node,
     tcp: Option<TcpStream>,

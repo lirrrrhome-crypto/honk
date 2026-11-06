@@ -204,11 +204,9 @@ fn test_batched_decrypt_split_feeds() {
     assert_eq!(received, payload);
 }
 
-/// End-to-end TCP test: mock legacy-AEAD TCP server (salt + chunk
-/// codec), real `dial` through the inline `SsStream`, bulk data both
-/// ways (chunk boundaries crossed many times).
-#[tokio::test]
-async fn test_dial_tcp_legacy_end_to_end() {
+/// Mock legacy-AEAD TCP server (salt + chunk codec) that uppercases and
+/// echoes everything after the target header.
+async fn spawn_uppercase_echo_server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -277,8 +275,11 @@ async fn test_dial_tcp_legacy_end_to_end() {
             carry = rest;
         }
     });
+    server_addr
+}
 
-    let node = Node {
+fn uppercase_echo_node(server_addr: SocketAddr) -> Node {
+    Node {
         name: "test-ss-tcp".into(),
         address: server_addr.ip().to_string(),
         port: server_addr.port(),
@@ -290,14 +291,48 @@ async fn test_dial_tcp_legacy_end_to_end() {
             },
         ),
         ..Default::default()
-    };
+    }
+}
+
+/// End-to-end TCP test: mock legacy-AEAD TCP server (salt + chunk
+/// codec), real `dial` through the inline `SsStream`, bulk data both
+/// ways (chunk boundaries crossed many times).
+#[tokio::test]
+async fn test_dial_tcp_legacy_end_to_end() {
+    let node = uppercase_echo_node(spawn_uppercase_echo_server().await);
     let handler = ShadowsocksHandler::new();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-    let mut stream = handler
+    let stream = handler
         .dial(&node, target, None, std::time::Duration::from_secs(3))
         .await
         .unwrap();
+    bulk_uppercase_round_trip(stream).await;
+}
 
+/// A chain hands the member its predecessor's stream: the same codec runs
+/// on a boxed carrier with no socket of its own.
+#[tokio::test]
+async fn dial_over_runs_the_codec_on_a_supplied_stream() {
+    let server = spawn_uppercase_echo_server().await;
+    let node = uppercase_echo_node(server);
+    let carrier: Box<dyn crate::proxy::AsyncReadWrite> = Box::new(tokio::io::BufStream::new(
+        tokio::net::TcpStream::connect(server).await.unwrap(),
+    ));
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let stream = ShadowsocksHandler::new()
+        .dial_over(
+            &node,
+            target,
+            None,
+            carrier,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    bulk_uppercase_round_trip(stream).await;
+}
+
+async fn bulk_uppercase_round_trip(mut stream: ProxyStream) {
     // Bulk transfer both ways: ~1MB in 8 uneven writes.
     let payload: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
     let mut off = 0;

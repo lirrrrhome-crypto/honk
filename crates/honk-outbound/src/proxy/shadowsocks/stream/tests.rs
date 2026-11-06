@@ -203,7 +203,8 @@ async fn legacy_deferred_response_salt() {
         method: METHOD.to_string(),
     };
     // Emulate the handler's legacy dial tail through its production constructor.
-    let mut stream = SsStream::new_legacy(server, send_cipher, send_nonce, prologue);
+    let mut stream =
+        SsStream::new_legacy(SsCarrier::Tcp(server), send_cipher, send_nonce, prologue);
     // The payload goes out BEFORE the server salt exists anywhere.
     stream.write_all(b"ping").await.unwrap();
     let mut buf = [0u8; 4];

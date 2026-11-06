@@ -18,6 +18,110 @@ use super::{
     AeadCipher, CipherConf, RELAY_BATCH, decrypt_chunks_in_place, hkdf_sha1_derive,
     seal_chunks_into,
 };
+use crate::proxy::AsyncReadWrite;
+
+/// The connection under the codec: the node's own socket, or the stream of
+/// the chain member in front of it. Only a socket yields TCP pressure.
+#[derive(Debug)]
+pub(crate) enum SsCarrier {
+    Tcp(TcpStream),
+    Chained(Box<dyn AsyncReadWrite>),
+}
+
+impl SsCarrier {
+    fn split(self) -> (ReadHalf, WriteHalf, Option<TcpPressure>) {
+        match self {
+            Self::Tcp(tcp) => {
+                let pressure = TcpPressure::new(&tcp);
+                let (read, write) = tcp.into_split();
+                (ReadHalf::Tcp(read), WriteHalf::Tcp(write), Some(pressure))
+            }
+            Self::Chained(stream) => {
+                let (read, write) = tokio::io::split(stream);
+                (ReadHalf::Chained(read), WriteHalf::Chained(write), None)
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SsCarrier {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(tcp) => Pin::new(tcp).poll_write(cx, buf),
+            Self::Chained(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(tcp) => Pin::new(tcp).poll_flush(cx),
+            Self::Chained(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(tcp) => Pin::new(tcp).poll_shutdown(cx),
+            Self::Chained(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Read half of an [`SsCarrier`]; the socket arm stays statically dispatched.
+pub(crate) enum ReadHalf {
+    Tcp(OwnedReadHalf),
+    Chained(tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>),
+}
+
+impl AsyncRead for ReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(read) => Pin::new(read).poll_read(cx, buf),
+            Self::Chained(read) => Pin::new(read).poll_read(cx, buf),
+        }
+    }
+}
+
+/// Write half of an [`SsCarrier`].
+enum WriteHalf {
+    Tcp(OwnedWriteHalf),
+    Chained(tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>),
+}
+
+impl AsyncWrite for WriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(write) => Pin::new(write).poll_write(cx, buf),
+            Self::Chained(write) => Pin::new(write).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(write) => Pin::new(write).poll_flush(cx),
+            Self::Chained(write) => Pin::new(write).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(write) => Pin::new(write).poll_shutdown(cx),
+            Self::Chained(write) => Pin::new(write).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Send/recv batch buffers (64KB batch + chunk/tag overhead). Sized to keep
 /// a connection under ~300KB including the control-plane relay buffers —
@@ -31,7 +135,7 @@ const RECV_BUF_CAP: usize = RELAY_BATCH + 8192;
 /// payload chunk, so reading the response in `dial` deadlocks.
 type PrologueFuture = Pin<
     Box<
-        dyn std::future::Future<Output = io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)>>
+        dyn std::future::Future<Output = io::Result<(ReadHalf, AeadCipher, Vec<u8>, Vec<u8>)>>
             + Send,
     >,
 >;
@@ -39,12 +143,12 @@ type PrologueFuture = Pin<
 /// Stream state for one Shadowsocks TCP connection after the salt/header
 /// prologue (which `dial` completes before returning this type).
 pub(crate) struct SsStream {
-    write_half: OwnedWriteHalf,
-    pressure: TcpPressure,
+    write_half: WriteHalf,
+    pressure: Option<TcpPressure>,
     peer_authenticated: bool,
     /// Read half, parked inside the pending 2022 prologue future until the
     /// response header has been consumed.
-    read_half: Option<OwnedReadHalf>,
+    read_half: Option<ReadHalf>,
     send_cipher: AeadCipher,
     send_nonce: Vec<u8>,
     /// Sealed output waiting to be flushed (poll_write seals once, then
@@ -73,8 +177,7 @@ impl SsStream {
         recv_cipher: AeadCipher,
         recv_nonce: Vec<u8>,
     ) -> Self {
-        let pressure = TcpPressure::new(&inner);
-        let (read_half, write_half) = inner.into_split();
+        let (read_half, write_half, pressure) = SsCarrier::Tcp(inner).split();
         Self {
             write_half,
             pressure,
@@ -98,13 +201,12 @@ impl SsStream {
     /// 2022 constructor: the response prologue is deferred to the read
     /// path (see [`PrologueFuture`]).
     pub(crate) fn new_2022(
-        inner: TcpStream,
+        inner: SsCarrier,
         send_cipher: AeadCipher,
         send_nonce: Vec<u8>,
         prologue: Ss2022Prologue,
     ) -> Self {
-        let pressure = TcpPressure::new(&inner);
-        let (read_half, write_half) = inner.into_split();
+        let (read_half, write_half, pressure) = inner.split();
         let recv_prologue: PrologueFuture = Box::pin(prologue.run(read_half));
         Self {
             write_half,
@@ -129,13 +231,12 @@ impl SsStream {
     /// Legacy constructor: only the request side (salt + header chunk) is
     /// written in `dial`; the response salt is read from the read path.
     pub(crate) fn new_legacy(
-        inner: TcpStream,
+        inner: SsCarrier,
         send_cipher: AeadCipher,
         send_nonce: Vec<u8>,
         prologue: LegacyPrologue,
     ) -> Self {
-        let pressure = TcpPressure::new(&inner);
-        let (read_half, write_half) = inner.into_split();
+        let (read_half, write_half, pressure) = inner.split();
         let recv_prologue: PrologueFuture = Box::pin(prologue.run(read_half));
         Self {
             write_half,
@@ -159,6 +260,12 @@ impl SsStream {
 
     fn tag_len(&self) -> usize {
         16
+    }
+
+    fn observe_pressure(&mut self) {
+        if let (Some(pressure), WriteHalf::Tcp(write)) = (&mut self.pressure, &self.write_half) {
+            pressure.observe(write.as_ref());
+        }
     }
 
     /// Preload decrypted plaintext (the prologue's first response chunk) so
@@ -199,7 +306,7 @@ impl AsyncRead for SsStream {
                     this.prefill_plaintext(&first_payload);
                     if !first_payload.is_empty() {
                         this.peer_authenticated = true;
-                        this.pressure.observe(this.write_half.as_ref());
+                        this.observe_pressure();
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -247,7 +354,7 @@ impl AsyncRead for SsStream {
             }
             if out_len > 0 {
                 this.peer_authenticated = true;
-                this.pressure.observe(this.write_half.as_ref());
+                this.observe_pressure();
                 out.advance(out_len);
                 return Poll::Ready(Ok(()));
             }
@@ -315,7 +422,7 @@ impl AsyncRead for SsStream {
             })?;
             if out_len > 0 {
                 this.peer_authenticated = true;
-                this.pressure.observe(this.write_half.as_ref());
+                this.observe_pressure();
             }
             this.plain_start = 0;
             this.plain_end = out_len;
@@ -414,7 +521,7 @@ impl SsStream {
             };
             self.send_off += n;
             if self.peer_authenticated {
-                self.pressure.observe(self.write_half.as_ref());
+                self.observe_pressure();
             }
         }
         self.send_buf.clear();
@@ -434,8 +541,8 @@ pub(crate) struct LegacyPrologue {
 impl LegacyPrologue {
     async fn run(
         self,
-        mut read_half: OwnedReadHalf,
-    ) -> io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
+        mut read_half: ReadHalf,
+    ) -> io::Result<(ReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
         let mut recv_salt = vec![0u8; self.conf.salt_len];
         read_half.read_exact(&mut recv_salt).await?;
         let mut recv_subkey = vec![0u8; self.conf.key_len];
@@ -457,8 +564,8 @@ pub(crate) struct Ss2022Prologue {
 impl Ss2022Prologue {
     async fn run(
         self,
-        mut read_half: OwnedReadHalf,
-    ) -> io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
+        mut read_half: ReadHalf,
+    ) -> io::Result<(ReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
         use super::aead2022::{NONCE_LEN, TAG_LEN, unix_timestamp};
         use super::increment_nonce;
         use anyhow::anyhow;
@@ -519,7 +626,7 @@ impl Ss2022Prologue {
 
 /// Flush helper for the legacy prologue path (one-shot sealed write).
 pub(crate) async fn write_all_sealed(
-    inner: &mut TcpStream,
+    inner: &mut (impl AsyncWrite + Unpin),
     cipher: &AeadCipher,
     nonce: &mut [u8],
     payload: &[u8],

@@ -43,6 +43,26 @@ pub trait TcpOutbound: Send + Sync {
             .await
     }
 
+    /// Dial over `carrier`, a stream the chain member in front of this node
+    /// already opened to this node's server. Only protocols that run
+    /// entirely on that one stream implement it; the default refuses rather
+    /// than opening a connection of its own around the chain.
+    async fn dial_over(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        carrier: Box<dyn super::AsyncReadWrite>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let _ = (target, target_domain, connect_timeout);
+        drop(carrier);
+        anyhow::bail!(
+            "{} cannot be dialed over another proxy's stream",
+            node.protocol().as_str()
+        )
+    }
+
     /// Dial through an explicitly captured runtime generation. Stateless
     /// handlers delegate to [`Self::dial`]; session-owning handlers override
     /// this to avoid consulting the mutable current-generation registry.
