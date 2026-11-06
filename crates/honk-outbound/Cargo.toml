@@ -96,6 +96,10 @@ name = "group_selection"
 harness = false
 
 [[bench]]
+name = "chain"
+harness = false
+
+[[bench]]
 name = "vless_vision"
 harness = false
 required-features = ["rprx"]
