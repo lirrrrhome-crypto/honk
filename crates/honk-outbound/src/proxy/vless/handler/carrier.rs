@@ -95,6 +95,60 @@ impl VLessHandler {
         })
     }
 
+    /// A VLESS request over `carrier`, the stream the chain member in front
+    /// opened to this node's server. Vision runs with padding but never
+    /// switches to Direct: the carrier is not a socket the relay could splice.
+    pub(super) async fn dial_over_carrier(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        carrier: Box<dyn AsyncReadWrite>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let vless = node.vless().unwrap();
+        anyhow::ensure!(
+            vless.tcp_path() == honk_config::node::VlessTcpPath::Direct,
+            "multiplexed VLESS cannot run over another proxy's stream"
+        );
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+        let header = Self::build_request_header(
+            &uuid,
+            CMD_TCP,
+            Some(target),
+            target_domain,
+            vless.wire_flow(),
+        )?;
+        let vision = vless.is_vision().then_some(uuid);
+        let encryption = self.encryption_config(node)?;
+        let stream: Box<dyn AsyncReadWrite> =
+            match crate::proxy::transport::tls_over(node, carrier, connect_timeout).await? {
+                crate::proxy::transport::ChainedTls::Tls(tls) => {
+                    if vision.is_some()
+                        && encryption.is_none()
+                        && tls.ssl().version2() != Some(boring::ssl::SslVersion::TLS1_3)
+                    {
+                        anyhow::bail!("VLESS Vision requires negotiated TLS 1.3");
+                    }
+                    Box::new(tls)
+                }
+                crate::proxy::transport::ChainedTls::Plain(plain) => {
+                    anyhow::ensure!(
+                        vision.is_none() || encryption.is_some(),
+                        "unencrypted VLESS Vision requires TLS or REALITY"
+                    );
+                    plain
+                }
+            };
+        let stream = crate::proxy::transport::wrap_after_tls(node, stream).await?;
+        let stream = start_boxed(encryption, stream, &header, vision).await?;
+        Ok(ProxyStream {
+            stream,
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
     pub(super) async fn prepare_retained_carrier(
         &self,
         runtime: &Arc<crate::runtime::NodeRuntime>,

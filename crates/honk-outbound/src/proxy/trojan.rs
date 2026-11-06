@@ -220,6 +220,26 @@ impl TcpOutbound for TrojanHandler {
         .await
     }
 
+    async fn dial_over(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        carrier: Box<dyn AsyncReadWrite>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
+        let header = Self::build_request_header(password, target, target_domain)?;
+        let mut stream =
+            super::transport::wrap_transport_over(node, carrier, connect_timeout).await?;
+        super::transport::write_request(&mut stream, &header).await?;
+        Ok(ProxyStream {
+            stream,
+            target_addr: target,
+            target_domain: target_domain.map(|s| s.to_string()),
+        })
+    }
+
     async fn dial_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,

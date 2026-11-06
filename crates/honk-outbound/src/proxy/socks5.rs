@@ -59,8 +59,8 @@ impl Socks5Handler {
     }
 
     /// Perform full SOCKS5 handshake.
-    async fn handshake(
-        stream: &mut TcpStream,
+    async fn handshake<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        stream: &mut S,
         target: SocketAddr,
         target_domain: Option<&str>,
         username: Option<&str>,
@@ -655,13 +655,35 @@ impl TcpOutbound for Socks5Handler {
         node: &Node,
         target: SocketAddr,
         target_domain: Option<&str>,
-        mut stream: TcpStream,
+        stream: TcpStream,
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let config = node.socks5().unwrap();
         crate::runtime::flow_observation::milestone(
             crate::runtime::flow_observation::Milestone::TransportReady,
         );
+        Self::connect_on(node, stream, target, target_domain).await
+    }
+
+    async fn dial_over(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        carrier: Box<dyn super::AsyncReadWrite>,
+        _connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        Self::connect_on(node, carrier, target, target_domain).await
+    }
+}
+
+impl Socks5Handler {
+    async fn connect_on<S: super::AsyncReadWrite + 'static>(
+        node: &Node,
+        mut stream: S,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> anyhow::Result<ProxyStream> {
+        let config = node.socks5().unwrap();
         Self::handshake(
             &mut stream,
             target,

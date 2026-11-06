@@ -498,6 +498,19 @@ impl TcpOutbound for VmessHandler {
         Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
     }
 
+    async fn dial_over(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        carrier: Box<dyn super::AsyncReadWrite>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let uuid = uuid(node)?;
+        let stream = super::transport::wrap_transport_over(node, carrier, connect_timeout).await?;
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+    }
+
     async fn dial_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,

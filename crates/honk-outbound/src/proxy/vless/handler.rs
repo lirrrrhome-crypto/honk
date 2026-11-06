@@ -496,6 +496,18 @@ impl VLessHandler {
 
 #[async_trait]
 impl TcpOutbound for VLessHandler {
+    async fn dial_over(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        carrier: Box<dyn crate::proxy::AsyncReadWrite>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        self.dial_over_carrier(node, target, target_domain, carrier, connect_timeout)
+            .await
+    }
+
     async fn dial(
         &self,
         node: &Node,
