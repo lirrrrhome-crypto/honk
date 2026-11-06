@@ -101,16 +101,33 @@ impl ProtocolEntry {
 
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
+    chain: Option<Arc<super::chain::ChainHandler>>,
 }
 
 impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            chain: None,
         }
     }
 
+    /// Every built-in protocol, chains included.
     pub fn default_resolver() -> anyhow::Result<Self> {
+        let mut registry = Self::base_resolver()?;
+        let chain = Arc::new(super::chain::ChainHandler::new(Self::base_resolver()?));
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Chain, chain.clone()).with_probeable(chain.clone()),
+        );
+        registry.chain = Some(chain);
+        for entry in &registry.entries {
+            entry.validate_consistency();
+        }
+        Ok(registry)
+    }
+
+    /// The ordinary protocols: what a chain dials its members with.
+    fn base_resolver() -> anyhow::Result<Self> {
         let mut registry = Self::new();
 
         let socks5 = Arc::new(Socks5Handler::new());
@@ -198,6 +215,12 @@ impl ProxyRegistry {
             entry.validate_consistency();
         }
         Ok(registry)
+    }
+
+    /// This registry's chain handler, for installing what members resolve
+    /// against.
+    pub fn chain(&self) -> Option<&super::chain::ChainHandler> {
+        self.chain.as_deref()
     }
 
     pub fn register(&mut self, entry: ProtocolEntry) {
