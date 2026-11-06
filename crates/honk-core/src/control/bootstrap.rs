@@ -118,6 +118,13 @@ impl ControlPlane {
         // they currently select, and the tag keeps the result. The cell
         // keeps working across reloads (the manager inside is swapped).
         let group_manager = group_manager.into_shared();
+        // Chains resolve members through the live manager (reloads swap the
+        // manager inside this cell), without ever waiting on it.
+        if let Some(chain) = proxy_registry.chain() {
+            chain.install_resolver(Arc::new(
+                honk_outbound::proxy::chain::GroupManagerResolver::new(group_manager.clone()),
+            ));
+        }
         {
             let group_manager = group_manager.clone();
             let probe_interval = Duration::from_secs(config.global.check_interval_secs);
@@ -147,6 +154,9 @@ impl ControlPlane {
             .bind_transport_quality(&runtime_registry);
         runtime_registry.activate_background_dial_admission();
         let runtime_registry = runtime_registry.into_shared();
+        if let Some(chain) = proxy_registry.chain() {
+            chain.install_runtime_registry(runtime_registry.clone());
+        }
         info!(
             nofile = resource_budget.effective_nofile,
             fixed = resource_budget.fixed_reserve,
