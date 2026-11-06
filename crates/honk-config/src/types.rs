@@ -18,6 +18,9 @@ pub enum NodeProtocol {
     Direct,
     /// Built-in reject outbound; reserved, not a configurable protocol.
     Block,
+    /// Virtual node that dials through other nodes (`name: chain { a -> b }`,
+    /// `'link' -> hop`, or a group `exit`); never produced by a share link.
+    Chain,
 }
 
 impl NodeProtocol {
@@ -34,6 +37,7 @@ impl NodeProtocol {
             NodeProtocol::AnyTLS => "anytls",
             NodeProtocol::Direct => "direct",
             NodeProtocol::Block => "block",
+            NodeProtocol::Chain => "chain",
         }
     }
 }

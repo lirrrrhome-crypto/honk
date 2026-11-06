@@ -256,6 +256,62 @@ pub enum OutboundConfig {
     AnyTls(AnyTlsConfig),
     Direct,
     Block,
+    Chain(ChainConfig),
+}
+
+/// Where a chain leaves: a node or group tag resolved at dial time, or the
+/// concrete node written with arrow sugar (`land: 'link' -> front`), which
+/// has no name of its own outside the chain.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChainOut {
+    Tag(String),
+    Node(Box<crate::node::Node>),
+}
+
+/// The member a group `exit` chain was materialized from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitMember {
+    Node(uuid::Uuid),
+    Group(String),
+}
+
+/// Marks a chain derived from `group { exit: … }`, so re-resolution can put
+/// the original member back before deriving again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupExitSource {
+    pub group: String,
+    pub member: ExitMember,
+}
+
+/// A virtual node read left to right: traffic enters `hops[0]`, which reaches
+/// `hops[1]`'s server, and so on; the last hop reaches `out`'s server and
+/// `out` reaches the destination. Hops and a tag `out` are node or group tags
+/// resolved at dial time, so a group keeps applying its own policy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainConfig {
+    pub hops: Vec<String>,
+    pub out: ChainOut,
+    pub group_exit: Option<GroupExitSource>,
+}
+
+impl ChainConfig {
+    /// Every tag the chain names: hops, then a tag `out`.
+    pub fn tags(&self) -> impl Iterator<Item = &str> {
+        self.hops.iter().map(String::as_str).chain(match &self.out {
+            ChainOut::Tag(tag) => Some(tag.as_str()),
+            ChainOut::Node(_) => None,
+        })
+    }
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self {
+            hops: Vec::new(),
+            out: ChainOut::Tag(String::new()),
+            group_exit: None,
+        }
+    }
 }
 
 impl Default for OutboundConfig {
@@ -278,6 +334,7 @@ impl OutboundConfig {
             NodeProtocol::AnyTLS => Self::AnyTls(AnyTlsConfig::default()),
             NodeProtocol::Direct => Self::Direct,
             NodeProtocol::Block => Self::Block,
+            NodeProtocol::Chain => Self::Chain(ChainConfig::default()),
         }
     }
 
@@ -294,6 +351,7 @@ impl OutboundConfig {
             Self::AnyTls(_) => NodeProtocol::AnyTLS,
             Self::Direct => NodeProtocol::Direct,
             Self::Block => NodeProtocol::Block,
+            Self::Chain(_) => NodeProtocol::Chain,
         }
     }
 
@@ -306,7 +364,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&config.quic.tls),
             Self::Juicity(config) => Some(&config.quic.tls),
             Self::AnyTls(config) => Some(&config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain(_) => None,
         }
     }
 
@@ -319,7 +381,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&mut config.quic.tls),
             Self::Juicity(config) => Some(&mut config.quic.tls),
             Self::AnyTls(config) => Some(&mut config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain(_) => None,
         }
     }
 
@@ -392,7 +458,7 @@ impl OutboundConfig {
                 config.password.as_deref().unwrap_or(""),
             ]),
             Self::AnyTls(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
-            Self::Direct | Self::Block => String::new(),
+            Self::Direct | Self::Block | Self::Chain(_) => String::new(),
         }
     }
 

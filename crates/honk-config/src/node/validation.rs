@@ -107,6 +107,10 @@ impl Node {
         if self.name.is_empty() {
             return Err(invalid(Some("name"), "node name must not be empty"));
         }
+        if let OutboundConfig::Chain(chain) = &self.outbound {
+            return chain_admission(&self.name, chain)
+                .map_err(|message| invalid(Some("chain"), message));
+        }
         if self.host().trim().is_empty()
             || self.port == 0
             || (self.host.is_empty() && self.address.matches(':').count() > 1)
@@ -311,4 +315,35 @@ pub fn validate_node_collection(nodes: &[Node]) -> Result<(), DetailedConfigErro
         }
     }
     Ok(())
+}
+
+/// Longest accepted chain: hops plus out.
+pub const MAX_CHAIN_LEN: usize = 8;
+
+fn chain_admission(name: &str, chain: &crate::node::ChainConfig) -> Result<(), &'static str> {
+    if chain.hops.is_empty() {
+        return Err("a chain needs at least one hop before its out");
+    }
+    if chain.hops.len() + 1 > MAX_CHAIN_LEN {
+        return Err("a chain has at most 8 members, hops and out together");
+    }
+    for tag in chain.tags() {
+        match tag {
+            "" => return Err("chain members must not be empty"),
+            "block" => return Err("a chain cannot pass through block"),
+            "direct" => return Err("a chain member must be a proxy node or group, not direct"),
+            _ if tag == name => return Err("a chain cannot contain itself"),
+            _ => {}
+        }
+    }
+    match &chain.out {
+        crate::node::ChainOut::Node(node) => {
+            if matches!(node.outbound, OutboundConfig::Chain(_)) {
+                return Err("an inline chain out must be a concrete node");
+            }
+            node.validate_inner()
+                .map_err(|_| "the chain's inline out node is invalid")
+        }
+        crate::node::ChainOut::Tag(_) => Ok(()),
+    }
 }

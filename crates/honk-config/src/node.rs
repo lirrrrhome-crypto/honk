@@ -10,7 +10,7 @@ mod wire;
 mod xhttp;
 
 pub use protocol::*;
-pub use validation::validate_node_collection;
+pub use validation::{MAX_CHAIN_LEN, validate_node_collection};
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
@@ -321,7 +321,20 @@ impl Node {
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
     /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
+    ///
+    /// A chain node is named by its configuration, so its ID derives from
+    /// its name, hops and out (the out node's own ID for arrow sugar). No
+    /// real node's ID depends on any chain it appears in.
     pub fn derive_id(&self) -> uuid::Uuid {
+        if let OutboundConfig::Chain(chain) = &self.outbound {
+            let out = match &chain.out {
+                ChainOut::Tag(tag) => format!("tag:{tag}"),
+                ChainOut::Node(node) => format!("node:{}", node.id),
+            };
+            let material = serde_json::to_vec(&("chain", &self.name, &chain.hops, out))
+                .expect("chain identity is JSON serializable");
+            return uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, &material);
+        }
         let material = self.identity_material();
         let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
         if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
@@ -404,6 +417,11 @@ pub struct Group {
     #[serde(skip)]
     pub own: OwnOptions,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Node or group every member leaves through: each member `m` is served
+    /// as a derived chain `m -> exit`, so selection, health and Score measure
+    /// the whole path. See [`crate::chain`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
 }
 
 impl Default for Group {
@@ -425,6 +443,7 @@ impl Default for Group {
             interrupt_connections: false,
             own: OwnOptions::default(),
             created_at: chrono::Utc::now(),
+            exit: None,
         }
     }
 }
@@ -494,6 +513,8 @@ impl<'de> Deserialize<'de> for Group {
             interrupt_connections: Option<bool>,
             #[serde(default = "chrono::Utc::now")]
             created_at: chrono::DateTime<chrono::Utc>,
+            #[serde(default)]
+            exit: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
         Ok(Group {
@@ -516,6 +537,7 @@ impl<'de> Deserialize<'de> for Group {
                 interrupt_connections: wire.interrupt_connections.is_some(),
             },
             created_at: wire.created_at,
+            exit: wire.exit,
         })
     }
 }

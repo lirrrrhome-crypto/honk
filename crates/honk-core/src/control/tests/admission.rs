@@ -160,7 +160,7 @@ async fn c20_public_merge_rebuilds_filters_and_prunes_removed_direct_ids() {
     });
     honk_config::parser::resolve_group_filters(
         &mut config.groups,
-        &config.nodes,
+        &mut config.nodes,
         &config.subscriptions,
     );
     let cp = control_plane(config);
@@ -304,7 +304,7 @@ async fn c20_startup_post_prepare_rejects_stale_node_identity() {
         .expect("post-prepare fixture");
     honk_config::parser::resolve_group_filters(
         &mut config.groups,
-        &config.nodes,
+        &mut config.nodes,
         &config.subscriptions,
     );
 

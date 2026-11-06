@@ -1034,7 +1034,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Filter-backed membership is rebuilt from the current node provenance.
     honk_config::parser::resolve_group_filters(
         &mut config.groups,
-        &config.nodes,
+        &mut config.nodes,
         &config.subscriptions,
     );
     config

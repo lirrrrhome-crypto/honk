@@ -589,7 +589,7 @@ group {
     }
 }
 "#;
-        let config = parse_dae_config(input).unwrap();
+        let mut config = parse_dae_config(input).unwrap();
         let group = |name: &str| {
             config
                 .groups
@@ -617,7 +617,7 @@ group {
             serde_json::from_str(r#"{"name":"p","filters":["group('hk')"]}"#).unwrap();
         crate::parser::resolve_group_filters(
             std::slice::from_mut(&mut structured),
-            &config.nodes,
+            &mut config.nodes,
             &config.subscriptions,
         );
         assert_eq!(
@@ -686,7 +686,7 @@ group {
             .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1082#new").unwrap());
         crate::parser::resolve_group_filters(
             &mut config.groups,
-            &config.nodes,
+            &mut config.nodes,
             &config.subscriptions,
         );
 
@@ -1014,7 +1014,7 @@ group {
         config.nodes[1].subscription_id = Some(config.subscriptions[1].id);
         crate::parser::resolve_group_filters(
             &mut config.groups,
-            &config.nodes,
+            &mut config.nodes,
             &config.subscriptions,
         );
         assert_eq!(
@@ -1542,7 +1542,11 @@ group {
     config
         .nodes
         .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1081#new").unwrap());
-    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    crate::parser::resolve_group_filters(
+        &mut config.groups,
+        &mut config.nodes,
+        &config.subscriptions,
+    );
     assert!(
         config.groups[0].nodes.is_empty(),
         "unterminated group filter must remain empty after adding a node"
@@ -1567,7 +1571,11 @@ group {
     config
         .nodes
         .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1081#new").unwrap());
-    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    crate::parser::resolve_group_filters(
+        &mut config.groups,
+        &mut config.nodes,
+        &config.subscriptions,
+    );
     assert_eq!(config.groups[0].groups, ["hk#suffix"]);
     assert!(config.groups[0].nodes.is_empty());
 }
@@ -1682,7 +1690,11 @@ group {
             _ => None,
         };
     }
-    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    crate::parser::resolve_group_filters(
+        &mut config.groups,
+        &mut config.nodes,
+        &config.subscriptions,
+    );
 
     let names = |tag: &str| {
         let group = config
@@ -1722,7 +1734,11 @@ group {
         .find(|node| node.name == "free-node")
         .unwrap()
         .subscription_id = Some(paid);
-    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    crate::parser::resolve_group_filters(
+        &mut config.groups,
+        &mut config.nodes,
+        &config.subscriptions,
+    );
     let paid_group = config
         .groups
         .iter()
@@ -2825,7 +2841,11 @@ fn quoted_conjunction_filter_matches_literal_on_reresolution() {
     let replacement = crate::node::Node::from_share_link("socks5://127.0.0.1:1082#a&&b").unwrap();
     let replacement_id = replacement.id;
     config.nodes.push(replacement);
-    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    crate::parser::resolve_group_filters(
+        &mut config.groups,
+        &mut config.nodes,
+        &config.subscriptions,
+    );
     assert_eq!(config.groups[0].nodes, [replacement_id]);
 }
 
@@ -2877,7 +2897,11 @@ group {
 "#;
     let mut config = parse_dae_config(input).unwrap();
     config.ensure_builtin_nodes();
-    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    crate::parser::resolve_group_filters(
+        &mut config.groups,
+        &mut config.nodes,
+        &config.subscriptions,
+    );
     let names = |tag: &str| {
         let group = config.groups.iter().find(|g| g.name == tag).unwrap();
         let mut names: Vec<&str> = group
@@ -3383,5 +3407,303 @@ mod assets_block {
             assert!(d.message.contains(old_key), "{d:?}");
             assert_eq!(d.line, Some(3), "{d:?}");
         }
+    }
+}
+
+mod chains {
+    use super::*;
+    use crate::node::{ChainOut, ExitMember, OutboundConfig};
+
+    fn chain(config: &crate::config::Config, name: &str) -> crate::node::ChainConfig {
+        match &config
+            .nodes
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap()
+            .outbound
+        {
+            OutboundConfig::Chain(chain) => chain.clone(),
+            other => panic!("{name} is {other:?}, not a chain"),
+        }
+    }
+
+    fn members(config: &crate::config::Config, group: &str) -> Vec<String> {
+        let group = config.groups.iter().find(|g| g.name == group).unwrap();
+        let mut names: Vec<String> = group
+            .nodes
+            .iter()
+            .map(|id| {
+                config
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == *id)
+                    .unwrap()
+                    .name
+                    .clone()
+            })
+            .chain(group.groups.iter().cloned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn chain_block_reads_left_to_right() {
+        let config = parse_dae_config(
+            r#"
+node {
+    front: 'socks5://127.0.0.1:1080'
+    land: 'socks5://10.0.0.2:1080'
+    via_front: chain {
+        front -> 'land'
+    }
+    long: chain {
+        front ->
+        via_front -> land
+    }
+}
+"#,
+        )
+        .unwrap();
+        let via = chain(&config, "via_front");
+        assert_eq!(via.hops, ["front"]);
+        assert_eq!(via.out, ChainOut::Tag("land".into()));
+        let long = chain(&config, "long");
+        assert_eq!(long.hops, ["front", "via_front"]);
+        assert_eq!(long.out, ChainOut::Tag("land".into()));
+    }
+
+    #[test]
+    fn invalid_chain_blocks_are_skipped_not_made_direct() {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            r#"
+node {
+    land: 'socks5://10.0.0.2:1080'
+    lonely: chain { land }
+    blocked: chain { block -> land }
+    direct_hop: chain { direct -> land }
+    selfish: chain { selfish -> land }
+    too_long: chain { a -> b -> c -> d -> e -> f -> g -> h -> land }
+}
+"#,
+            &mut diagnostics,
+        )
+        .unwrap();
+        for name in ["lonely", "blocked", "direct_hop", "selfish", "too_long"] {
+            assert!(
+                config.nodes.iter().all(|n| n.name != name),
+                "{name} must be skipped"
+            );
+        }
+        let names: Vec<_> = config.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["land"]);
+        assert_eq!(diagnostics.len(), 5, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn arrow_sugar_keeps_the_concrete_node_inline() {
+        let config = parse_dae_config(
+            r#"
+node {
+    front: 'socks5://127.0.0.1:1080'
+    land: 'socks5://10.0.0.2:1080' -> front
+    bare: socks5://10.0.0.3:1080 -> 'front'
+    hashed: 'socks5://10.0.0.4:1080#a->b'
+}
+"#,
+        )
+        .unwrap();
+        let land = chain(&config, "land");
+        assert_eq!(land.hops, ["front"]);
+        let ChainOut::Node(inner) = &land.out else {
+            panic!("arrow sugar keeps its node inline");
+        };
+        assert_eq!(inner.port, 1080);
+        assert_eq!(inner.host(), "10.0.0.2");
+        assert_eq!(chain(&config, "bare").hops, ["front"]);
+        assert!(matches!(
+            config
+                .nodes
+                .iter()
+                .find(|n| n.name == "hashed")
+                .unwrap()
+                .outbound,
+            OutboundConfig::Socks5(_)
+        ));
+        // The concrete node has no name of its own outside the chain.
+        assert_eq!(config.nodes.iter().filter(|n| n.name == "land").count(), 1);
+    }
+
+    const EXIT_CONFIG: &str = r#"
+node {
+    gw1: 'socks5://10.0.0.1:1080'
+    gw2: 'socks5://10.0.0.2:1080'
+    land: 'socks5://10.0.0.9:1080'
+}
+group {
+    inner {
+        filter: name('gw2')
+    }
+    ingress {
+        filter: name('gw1')
+        filter: group('inner')
+        policy: min_moving_avg
+        exit: land
+    }
+    proxy {
+        filter: group('ingress')
+        policy: select
+    }
+    everything {
+        policy: select
+    }
+}
+"#;
+
+    #[test]
+    fn group_exit_serves_every_member_through_the_exit() {
+        let config = parse_dae_config(EXIT_CONFIG).unwrap();
+        assert_eq!(
+            members(&config, "ingress"),
+            ["gw1 -> land", "inner -> land"]
+        );
+        let via_node = chain(&config, "gw1 -> land");
+        assert_eq!(via_node.hops, ["gw1"]);
+        assert_eq!(via_node.out, ChainOut::Tag("land".into()));
+        let gw1 = config.nodes.iter().find(|n| n.name == "gw1").unwrap().id;
+        assert_eq!(
+            via_node.group_exit.unwrap().member,
+            ExitMember::Node(gw1),
+            "derived chains remember their member"
+        );
+        // A nested subgroup is entered as a hop and keeps its own policy.
+        assert_eq!(chain(&config, "inner -> land").hops, ["inner"]);
+        // The outer group selects among the exit group, which no longer
+        // offers its members unchained.
+        assert_eq!(members(&config, "proxy"), ["ingress"]);
+        // Derived chains stay out of unfiltered groups.
+        assert!(
+            members(&config, "everything")
+                .iter()
+                .all(|name| !name.contains(" -> ")),
+            "{:?}",
+            members(&config, "everything")
+        );
+    }
+
+    #[test]
+    fn group_exit_derivation_is_idempotent() {
+        let mut config = parse_dae_config(EXIT_CONFIG).unwrap();
+        let nodes = config.nodes.clone();
+        let groups = config.groups.clone();
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &mut config.nodes,
+            &config.subscriptions,
+        );
+        assert_eq!(config.nodes, nodes);
+        assert_eq!(config.groups, groups);
+
+        // And through the JSON store.
+        let json = config.to_json_string().unwrap();
+        let mut back = crate::config::Config::from_json_str(&json).unwrap();
+        crate::parser::resolve_group_filters(
+            &mut back.groups,
+            &mut back.nodes,
+            &back.subscriptions,
+        );
+        assert_eq!(back.nodes.len(), nodes.len());
+        assert_eq!(members(&back, "ingress"), ["gw1 -> land", "inner -> land"]);
+    }
+
+    #[test]
+    fn group_exit_follows_membership_changes() {
+        let mut config = parse_dae_config(EXIT_CONFIG).unwrap();
+        // gw1 disappears (e.g. a subscription refresh dropped it).
+        config.nodes.retain(|n| n.name != "gw1");
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &mut config.nodes,
+            &config.subscriptions,
+        );
+        assert_eq!(members(&config, "ingress"), ["inner -> land"]);
+        assert!(config.nodes.iter().all(|n| n.name != "gw1 -> land"));
+    }
+
+    #[test]
+    fn unusable_exit_empties_the_group_instead_of_skipping_it() {
+        let mut diagnostics = Vec::new();
+        let config = crate::parser::parse_dae_config_with_detailed_diagnostics(
+            &EXIT_CONFIG.replace("exit: land", "exit: direct"),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(members(&config, "ingress").is_empty());
+        let issue = diagnostics
+            .iter()
+            .find(|d| d.code == "invalid-group-exit")
+            .expect("diagnosed");
+        assert_eq!(
+            issue.setting,
+            crate::diagnostic::SettingPath::new("groups")
+                .index(2)
+                .field("exit")
+        );
+    }
+
+    #[test]
+    fn selector_default_follows_its_member_into_the_exit_chain() {
+        let config = parse_dae_config(&EXIT_CONFIG.replace(
+            "policy: min_moving_avg",
+            "policy: select\n        default: gw1",
+        ))
+        .unwrap();
+        let ingress = config.groups.iter().find(|g| g.name == "ingress").unwrap();
+        assert_eq!(ingress.default.as_deref(), Some("gw1 -> land"));
+        let mut again = config.clone();
+        crate::parser::resolve_group_filters(
+            &mut again.groups,
+            &mut again.nodes,
+            &again.subscriptions,
+        );
+        assert_eq!(again.groups, config.groups);
+    }
+
+    #[test]
+    fn chain_through_a_group_that_holds_it_is_reported() {
+        let mut diagnostics = Vec::new();
+        crate::parser::parse_dae_config_with_detailed_diagnostics(
+            r#"
+node {
+    gw: 'socks5://10.0.0.1:1080'
+    land: 'socks5://10.0.0.9:1080' -> proxy
+}
+group {
+    proxy {
+        policy: select
+    }
+}
+"#,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(
+            diagnostics.iter().any(|d| d.code == "chain-cycle"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn chain_ids_depend_on_the_chain_not_on_real_nodes() {
+        let a = parse_dae_config("node {\n x: 'socks5://10.0.0.1:1080'\n c: chain { x -> x2 }\n}")
+            .unwrap();
+        let b = parse_dae_config("node {\n x: 'socks5://10.0.0.1:1080'\n c: chain { x -> x3 }\n}")
+            .unwrap();
+        let id = |config: &crate::config::Config, name: &str| {
+            config.nodes.iter().find(|n| n.name == name).unwrap().id
+        };
+        assert_eq!(id(&a, "x"), id(&b, "x"), "a real node's ID ignores chains");
+        assert_ne!(id(&a, "c"), id(&b, "c"));
     }
 }

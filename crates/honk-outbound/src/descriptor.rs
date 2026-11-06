@@ -209,6 +209,17 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
+    // A chain opens its own first connection, so nothing may pre-dial,
+    // pool or warm a socket to any member's server on its behalf.
+    ProtocolDescriptor {
+        protocol: NodeProtocol::Chain,
+        supports_udp: never,
+        pool_ready_streams: never,
+        pool_bare_tcp: never,
+        supports_warm: no_warm,
+        generation_runtime: GenerationRuntime::None,
+        share_link_schemes: &[],
+    },
 ];
 
 /// Target policy only; absent UDP capability is handled separately by callers.
@@ -242,6 +253,7 @@ mod tests {
             NodeProtocol::AnyTLS,
             NodeProtocol::Direct,
             NodeProtocol::Block,
+            NodeProtocol::Chain,
         ] {
             assert_eq!(descriptor(protocol).protocol, protocol);
         }

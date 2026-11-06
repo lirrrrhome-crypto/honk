@@ -701,7 +701,7 @@ fn parse_documents(
 
     resolve_group_filters_inner(
         &mut config.groups,
-        &config.nodes,
+        &mut config.nodes,
         &config.subscriptions,
         Some(diagnostics),
     );
@@ -718,7 +718,15 @@ fn parse_documents(
 ///
 /// `group('tag')` entries are not node filters — the dae parser routes them
 /// into `Group.groups` at parse time.
-pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node], subscriptions: &[Subscription]) {
+///
+/// Groups with an `exit` are served by derived `member -> exit` chains,
+/// added to `nodes` here (see [`crate::chain`]); re-resolution replaces them,
+/// so callers pass the node list every resolution reads from.
+pub fn resolve_group_filters(
+    groups: &mut [Group],
+    nodes: &mut Vec<Node>,
+    subscriptions: &[Subscription],
+) {
     // Runtime re-resolution: the filters were reported when the config was parsed.
     resolve_group_filters_inner(groups, nodes, subscriptions, None);
 }

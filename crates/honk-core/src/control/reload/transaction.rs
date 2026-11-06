@@ -63,7 +63,7 @@ pub(crate) fn rebase_subscription_nodes(
     candidate.nodes = static_nodes;
     honk_config::parser::resolve_group_filters(
         &mut candidate.groups,
-        &candidate.nodes,
+        &mut candidate.nodes,
         &candidate.subscriptions,
     );
     retained_providers

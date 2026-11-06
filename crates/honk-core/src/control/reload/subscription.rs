@@ -29,7 +29,7 @@ pub(in crate::control) fn config_with_subscription_nodes(
     }
     honk_config::parser::resolve_group_filters(
         &mut config.groups,
-        &config.nodes,
+        &mut config.nodes,
         &config.subscriptions,
     );
     config

@@ -1280,7 +1280,7 @@ fn subscription_merge_replaces_only_that_subscription() {
     // filter-less group swallows every node.
     honk_config::parser::resolve_group_filters(
         &mut current.groups,
-        &current.nodes,
+        &mut current.nodes,
         &current.subscriptions,
     );
     assert_eq!(current.groups[0].nodes.len(), 4);
@@ -4316,6 +4316,7 @@ fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) 
         interrupt_connections: false,
         own: Default::default(),
         created_at: chrono::Utc::now(),
+        exit: None,
     }
 }
 

@@ -181,6 +181,18 @@ struct FlatNode {
     #[serde(default)]
     anytls_idle_session_timeout: Option<u64>,
     #[serde(default)]
+    chain_hops: Vec<String>,
+    #[serde(default)]
+    chain_out: Option<String>,
+    #[serde(default)]
+    chain_out_node: Option<Box<Node>>,
+    #[serde(default)]
+    chain_exit_group: Option<String>,
+    #[serde(default)]
+    chain_exit_member_node: Option<uuid::Uuid>,
+    #[serde(default)]
+    chain_exit_member_group: Option<String>,
+    #[serde(default)]
     mark: Option<u32>,
     #[serde(default)]
     tags: Vec<String>,
@@ -681,6 +693,50 @@ impl FlatNode {
             }
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
+            NodeProtocol::Chain => {
+                let out = match (flat.chain_out.take(), flat.chain_out_node.take()) {
+                    (Some(tag), None) => super::ChainOut::Tag(tag),
+                    (None, Some(node)) => super::ChainOut::Node(node),
+                    _ => {
+                        return Err(semantic_error(
+                            source,
+                            setting.clone().field("chain_out"),
+                            "a chain needs exactly one of chain_out or chain_out_node",
+                        ));
+                    }
+                };
+                let member = match (
+                    flat.chain_exit_member_node.take(),
+                    flat.chain_exit_member_group.take(),
+                ) {
+                    (None, None) => None,
+                    (Some(id), None) => Some(super::ExitMember::Node(id)),
+                    (None, Some(group)) => Some(super::ExitMember::Group(group)),
+                    _ => {
+                        return Err(semantic_error(
+                            source,
+                            setting.clone().field("chain_exit_member_node"),
+                            "a group exit chain has one member",
+                        ));
+                    }
+                };
+                let group_exit = match (flat.chain_exit_group.take(), member) {
+                    (None, None) => None,
+                    (Some(group), Some(member)) => Some(super::GroupExitSource { group, member }),
+                    _ => {
+                        return Err(semantic_error(
+                            source,
+                            setting.clone().field("chain_exit_group"),
+                            "a group exit chain names both its group and member",
+                        ));
+                    }
+                };
+                OutboundConfig::Chain(super::ChainConfig {
+                    hops: std::mem::take(&mut flat.chain_hops),
+                    out,
+                    group_exit,
+                })
+            }
         };
         if !flat.tls_alpn.is_empty() {
             return Err(semantic_error(
@@ -779,6 +835,18 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_hops: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_out: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_out_node: Option<&'a Node>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_exit_group: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_exit_member_node: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_exit_member_group: Option<&'a str>,
     mark: Option<u32>,
     tags: &'a [String],
     subscription_id: Option<uuid::Uuid>,
@@ -911,6 +979,22 @@ impl<'a> WireOptions<'a> {
                 wire.set_tls(&config.tls);
             }
             OutboundConfig::Direct | OutboundConfig::Block => {}
+            OutboundConfig::Chain(config) => {
+                wire.chain_hops = Some(&config.hops);
+                match &config.out {
+                    super::ChainOut::Tag(tag) => wire.chain_out = Some(tag),
+                    super::ChainOut::Node(node) => wire.chain_out_node = Some(node),
+                }
+                if let Some(exit) = &config.group_exit {
+                    wire.chain_exit_group = Some(&exit.group);
+                    match &exit.member {
+                        super::ExitMember::Node(id) => wire.chain_exit_member_node = Some(*id),
+                        super::ExitMember::Group(group) => {
+                            wire.chain_exit_member_group = Some(group)
+                        }
+                    }
+                }
+            }
         }
         wire
     }
