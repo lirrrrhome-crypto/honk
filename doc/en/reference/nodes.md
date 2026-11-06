@@ -675,6 +675,36 @@ A static config offers real ECH and ECH rejection fails the handshake closed. Di
 
 For a chain written as `a -> b`, only `a` is parsed. Automatic names come only from a decoded `#fragment`, VMess `ps`, or `{scheme}-{host}`; the parser never uses the raw URI or userinfo as a fallback, so credentials do not leak into generated names. Explicit tags, fragments, and `ps` values remain user-controlled.
 
+## Chains
+
+A chain is a virtual node read left to right, `in -> … -> out`: traffic enters the first member, which reaches the next member's server, and so on; the last member reaches the destination. Members are node or group tags resolved when a connection is dialed, so a group member keeps applying its own policy.
+
+```dae
+node {
+    front: 'socks5://127.0.0.1:1080'
+    land: 'trojan://secret@exit.example:443?sni=exit.example'
+
+    # A chain node; members may continue on the next line after `->`.
+    via_front: chain {
+        front -> land
+    }
+
+    # Arrow sugar: `landing` is a chain whose out is this link, which has
+    # no name of its own outside the chain.
+    landing: 'vless://…@land.example:443?security=reality&…' -> front
+}
+```
+
+- A chain has 2 to 8 members (hops plus out), counted after nested chains are expanded. Members must not be empty, `direct`, `block` or the chain itself; an invalid chain block is skipped with an `invalid-chain` warning and never becomes a direct node. A chain that can reach itself through its members or a group that holds it is reported as `chain-cycle`.
+- The first member may be any TCP-capable protocol and is dialed like any node, reusing its live session where the protocol has one. Every later member performs its handshake directly on the stream the member before it returned, with no loopback socket or copy task in between. Later members must run entirely on that one stream: Shadowsocks without a plugin, Trojan, VMess, SOCKS5, and VLESS without multiplexing or XHTTP. QUIC protocols, AnyTLS and multiplexed or XHTTP VLESS are refused in a later position before anything is dialed.
+- A later member's server name travels as a domain to the member in front, which resolves it; honk does no local DNS for it.
+- In a later position, VLESS Vision pads as usual but never switches to Direct (there is no socket to splice), TCP carrier-pressure evidence is unavailable, and a REALITY mask-certificate answer fails the dial instead of retrying, because only the chain can open a new connection to that server.
+- SOCKS5 answers its request before data flows; Shadowsocks, Trojan, VMess and VLESS do not. When a later member fails, the error names the members in front that do not confirm their request as possible causes.
+- Chains carry TCP only. A chain takes no part in UDP selection, so a group's UDP uses its other members, its `final`, or fails; it never bypasses the chain.
+- A chain node's ID derives from its name, members and out; no real node's ID depends on a chain it appears in.
+
+Compared with mihomo: `dialer-proxy` corresponds to arrow sugar, and `type: relay` to a chain node, but a chain is a node, not a group policy, so it can be a member of any group. A group shares one exit with its `exit` key ([groups](./groups.md#group-exit)). Subscriptions cannot define chains: a Clash proxy carrying `dialer-proxy` is skipped instead of being imported as a node that would dial its server directly.
+
 ## Related docs
 
 - [Subscription reference](./subscription.md)

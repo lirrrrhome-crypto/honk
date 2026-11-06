@@ -226,6 +226,7 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `password` | `password` | Optional string; VLESS applies the precedence below. |
 | `cipher` | `encryption` | Optional string; VLESS applies the precedence below. |
 | `plugin`, `plugin-opts` | — | Unsupported. An entry with either non-empty value is skipped before node publication; mapping-valued options are rejected too. |
+| `dialer-proxy`, `dialer_proxy`, `underlying-proxy`, `underlying_proxy` | — | Unsupported. An entry with a non-empty value is skipped rather than imported as a node that would dial its server directly; define chains in the node and group sections ([chains](./nodes.md#chains)). |
 | `network` | `transport` or packet capability | Trojan/VMess/VLESS use a stream transport (`tcp`, `ws`, `grpc`, or `xhttp`); AnyTLS uses packet capability. |
 | `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
 | `servername`, `server-name`, `sni` | `sni` | Empty or whitespace-only names are absent; nonempty aliases must agree byte for byte. |

@@ -226,6 +226,7 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `password` | `password` | 可选 string；VLESS 使用下文优先级。 |
 | `cipher` | `encryption` | 可选加密算法；VLESS 的字段优先级见下文。 |
 | `plugin`, `plugin-opts` | — | 不支持；任一字段具有非空值时，条目会在发布节点前被跳过，映射类型的 options 也会被拒绝。 |
+| `dialer-proxy`、`dialer_proxy`、`underlying-proxy`、`underlying_proxy` | — | 不支持；具有非空值的条目会被跳过，而不是导入成直连服务器的节点。链在 node 与 group 段定义（见[链](./nodes.md#链)）。 |
 | `network` | `transport` 或数据包网络能力 | Trojan/VMess/VLESS 使用流传输（`tcp`、`ws`、`grpc`、`xhttp`）；AnyTLS 使用数据包网络能力。 |
 | `tls` | `tls` | 可选 bool。Trojan、AnyTLS、Hysteria2、TUIC 和 Juicity 默认启用 TLS，并拒绝显式关闭。 |
 | `servername`、`server-name`、`sni` | `sni` | 空值或纯空白名称视为未指定；非空别名必须逐字节一致。 |

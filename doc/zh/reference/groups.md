@@ -43,6 +43,7 @@ group {
 | `tolerance` | `tolerance` | `50` | 非负整数毫秒；dae URLTest 组未显式设置时继承 `global.check_tolerance`，显式值优先；运行时有效下限为 1 ms。 |
 | `idle_timeout` | `idle_timeout` | `null` | 非负整数秒，URLTest 不活跃后暂停探测的阈值；省略时健康层使用 1800 秒。 |
 | `interrupt_connections` | `interrupt_connections` | `false` | 选择变化时按捕获的组身份/路径与网络关闭精确旧 TCP/UDP owner，不再仅移除 tracker；共享 XUDP 只退役匹配 view。严格布尔值。 |
+| `exit` | `exit` | `null` | 每个成员都经由它离开的节点或组，见[组出口](#组出口)。 |
 | —（dae 中不可配置） | `id` | 随机 UUID | 字段缺失时生成的内部组标识。 |
 
 ## 策略
@@ -134,6 +135,30 @@ honk 会忽略无法解析的过滤器，并在诊断中注明其在组内节点
 嵌套选择深度上限为 8。组管理器构图时会删除每条构成环的边并记录警告；未知的嵌套 tag 不会贡献候选。每个嵌套组贡献其自身策略选出的单个叶节点，因此每次拨号最终都会解析到一个节点。
 
 面向 Clash 的组输出保留成员 tag：`all` 字段列出直接节点名和嵌套组 tag，而不展开嵌套组。面向叶节点的健康状态与连通性遍历会展开这些 tag 下的实际节点。
+
+## 组出口
+
+`exit: <节点或组>` 让组内每个成员都经由同一个出口离开。每个成员 `m` 以名为 `m -> <出口>` 的派生链节点提供服务，因此选择、健康检查、URL 测试和 Score 衡量的都是整条路径：
+
+```dae
+group {
+    ingress {
+        filter: name(keyword: 'gw')
+        policy: min_moving_avg
+        exit: land
+    }
+    proxy {
+        filter: group('ingress')
+        policy: select
+    }
+}
+```
+
+- 节点成员 `gw1` 变为 `gw1 -> land`；嵌套组成员 `inner` 变为 `inner -> land`，进入 `inner` 当前的选择。选择 `ingress` 的外层组因此是在整条链之间选择。
+- 派生链在每次组解析（包括每次订阅刷新之后）重建，未变化的保持原身份。无过滤器的组和过滤模式不会选中它们。
+- Selector 的 `default` 指向某个成员时，随该成员改为其派生名。
+- `exit` 为空、`direct`、`block` 或组自身时，组被清空（`invalid-group-exit`），流量按 `final` 处理或失败，而不是跳过出口。未知出口会报告（`unknown-group-exit`），在其存在之前拨号失败。派生名与已有节点名冲突的成员不提供服务（`group-exit-name-taken`）。
+- 链的长度与协议规则同[链](./nodes.md#链)。
 
 ## 相关文档
 

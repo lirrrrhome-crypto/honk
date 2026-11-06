@@ -43,6 +43,7 @@ group {
 | `tolerance` | `tolerance` | `50` | Nonnegative URLTest switch threshold in milliseconds. Without an explicit value, dae URLTest groups inherit `global.check_tolerance`; the runtime applies an effective minimum of 1 ms. |
 | `idle_timeout` | `idle_timeout` | `null` | Nonnegative URLTest probe-suspension threshold after inactivity, in seconds. With `null`, the health layer uses 1800 seconds. |
 | `interrupt_connections` | `interrupt_connections` | `false` | Close affected live userspace transports on selection changes, using captured group identities and network. This is transport retirement, not tracking removal; shared UDP carriers retain unaffected views. |
+| `exit` | `exit` | `null` | Node or group every member leaves through; see [Group exit](#group-exit). |
 | — (not in dae) | `id` | random UUID | Internal group identity generated when the field is absent. |
 
 ## Policies
@@ -136,6 +137,30 @@ A filter honk cannot parse is ignored and reported by its ordinal among the grou
 Nested selection is depth-capped at 8. When the group manager builds the graph, it removes each cycle-closing edge and logs a warning; an unknown nested tag contributes no candidate. Each nested group contributes the single leaf selected by its own policy, so every dial ultimately resolves to one node.
 
 Clash-facing group output preserves member tags: the `all` field lists direct node names and nested group tags rather than expanding nested groups. Leaf-facing health and connectivity traversal expands the real nodes below those tags.
+
+## Group exit
+
+`exit: <node or group>` makes every member leave through the same exit. Each member `m` is served as a derived chain node named `m -> <exit>`, so selection, health checks, URL tests and Score measure the whole path:
+
+```dae
+group {
+    ingress {
+        filter: name(keyword: 'gw')
+        policy: min_moving_avg
+        exit: land
+    }
+    proxy {
+        filter: group('ingress')
+        policy: select
+    }
+}
+```
+
+- A node member `gw1` becomes `gw1 -> land`; a nested group member `inner` becomes `inner -> land`, which enters `inner`'s current pick. An outer group selecting `ingress` therefore selects among whole chains.
+- Derived chains are rebuilt on every group resolution, including after each subscription refresh, and unchanged ones keep their identity. Unfiltered groups and filter patterns never pick them.
+- A Selector `default` naming a member follows it to its derived name.
+- An `exit` that is empty, `direct`, `block` or the group itself empties the group (`invalid-group-exit`), so its traffic follows `final` or fails rather than skipping the exit. An unknown exit is reported (`unknown-group-exit`) and dials fail until it exists. A member whose derived name is already a node name is not served (`group-exit-name-taken`).
+- Chain limits and protocol rules are those of [chains](./nodes.md#chains).
 
 ## Related docs
 
