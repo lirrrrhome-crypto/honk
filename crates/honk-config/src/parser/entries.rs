@@ -48,6 +48,15 @@ fn visit_node_segment<'d, 'a>(
 ) -> Result<(), super::ParseFailure> {
     diagnostics.at_section("node", Text::segment(segment));
     if let Some(header) = super::read::block_header(segment) {
+        // `name: chain { a -> b }` is a node, not a legacy wrapper.
+        if let Some((tag, kind)) = header.kv()
+            && kind.raw() == "chain"
+        {
+            *entry_index += 1;
+            diagnostics.entry_text(header, *entry_index);
+            parse_chain_block(segment, header, tag, diagnostics, nodes, on_entry);
+            return Ok(());
+        }
         header.notice(
             diagnostics,
             Severity::Warning,
@@ -114,6 +123,7 @@ fn parse_node_entry(
         (None, value)
     };
 
+    let (uri, hop) = split_chain_arrow(uri);
     let Some((uri, end)) = complete_quoted_value(uri, diagnostics) else {
         return Ok(());
     };
@@ -122,6 +132,16 @@ fn parse_node_entry(
             if let Some(tag) = tag.filter(|tag| !tag.raw().is_empty()) {
                 node.name = tag.raw().to_owned();
             }
+            let node = match hop {
+                // Arrow sugar: the virtual node takes the entry's name and
+                // keeps the concrete node inline as its out.
+                Some(hop) => chain_node(
+                    node.name.clone(),
+                    vec![hop],
+                    crate::node::ChainOut::Node(Box::new(node)),
+                ),
+                None => node,
+            };
             on_entry(&node, text.source.span(text.span.start, end));
             nodes.push(node);
         }
@@ -148,6 +168,111 @@ fn parse_node_entry(
         }
     }
     Ok(())
+}
+
+fn chain_node(name: String, hops: Vec<String>, out: crate::node::ChainOut) -> Node {
+    let mut node = Node {
+        name,
+        outbound: crate::node::OutboundConfig::Chain(crate::node::ChainConfig {
+            hops,
+            out,
+            group_exit: None,
+        }),
+        ..Node::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+/// `name: chain { a -> b -> out }`: members in traffic order, separated by
+/// `->`, possibly across lines. An invalid block is skipped with a warning,
+/// never turned into a direct node.
+fn parse_chain_block<'d, 'a>(
+    segment: &Segment<'d, 'a>,
+    header: Text<'d, 'a>,
+    tag: Text<'d, 'a>,
+    diagnostics: &mut ParserDiagnostics<'_>,
+    nodes: &mut Vec<Node>,
+    on_entry: &mut impl FnMut(&Node, Span),
+) {
+    let name = tag.unquote().raw().to_owned();
+    let mut members = Vec::new();
+    for child in segment.body().into_iter().flatten() {
+        let text = Text::segment(&child).trim();
+        if text.raw().is_empty() {
+            continue;
+        }
+        if super::read::block_header(&child).is_some() {
+            text.notice(
+                diagnostics,
+                Severity::Warning,
+                "invalid-chain",
+                "a chain block holds only `->`-separated members; chain skipped",
+            );
+            return;
+        }
+        for member in text.split("->") {
+            members.push(member.trim().unquote().raw().to_owned());
+        }
+    }
+    // A line ending in `->` continues on the next line.
+    members.retain(|member| !member.is_empty());
+    let Some((out, hops)) = members.split_last() else {
+        header.notice(
+            diagnostics,
+            Severity::Warning,
+            "invalid-chain",
+            "a chain block needs `hop -> out`; chain skipped",
+        );
+        return;
+    };
+    if name.is_empty() {
+        header.notice(
+            diagnostics,
+            Severity::Warning,
+            "invalid-chain",
+            "a chain block needs a name; chain skipped",
+        );
+        return;
+    }
+    let node = chain_node(name, hops.to_vec(), crate::node::ChainOut::Tag(out.clone()));
+    if node.validate().is_err() {
+        header.notice(
+            diagnostics,
+            Severity::Warning,
+            "invalid-chain",
+            "chain members are invalid (empty, block, direct, itself, or more than 8); chain skipped",
+        );
+        return;
+    }
+    on_entry(&node, Text::segment(segment).span);
+    nodes.push(node);
+}
+
+/// Split a trailing `-> hop` (arrow sugar) off a node entry value. The arrow
+/// must stand outside quotes and follow whitespace or a closing quote, so a
+/// `->` inside a quoted link or a bare link's fragment stays link data.
+fn split_chain_arrow<'d, 'a>(value: Text<'d, 'a>) -> (Text<'d, 'a>, Option<String>) {
+    let value = value.trim();
+    let raw = value.raw();
+    let Some(arrow) = value
+        .delimiter_positions("->")
+        .map(|position| position - value.span.start)
+        .filter(|&offset| {
+            raw[..offset]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace() || c == '\'' || c == '"')
+        })
+        .last()
+    else {
+        return (value, None);
+    };
+    let hop = value.sub(arrow + 2, raw.len()).trim().unquote();
+    if hop.raw().is_empty() || hop.raw().chars().any(char::is_whitespace) {
+        return (value, None);
+    }
+    (value.sub(0, arrow).trim(), Some(hop.raw().to_owned()))
 }
 
 fn complete_quoted_value<'d, 'a>(

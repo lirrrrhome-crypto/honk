@@ -449,7 +449,7 @@ async fn test_merge_subscription_nodes_full_pipeline() {
     // nodes), exactly like run() does before ControlPlane::new.
     honk_config::parser::resolve_group_filters(
         &mut config.groups,
-        &config.nodes,
+        &mut config.nodes,
         &config.subscriptions,
     );
     // A routing rule targeting the group, so the merge pipeline has a

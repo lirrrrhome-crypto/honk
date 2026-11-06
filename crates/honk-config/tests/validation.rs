@@ -139,7 +139,7 @@ mod empty_subgroups {
             restored.nodes[0].subscription_id = Some(restored.subscriptions[0].id);
             resolve_group_filters(
                 &mut restored.groups,
-                &restored.nodes,
+                &mut restored.nodes,
                 &restored.subscriptions,
             );
             assert!(restored.groups[..3].iter().all(|g| g.nodes.is_empty()));
@@ -148,7 +148,7 @@ mod empty_subgroups {
             restored.nodes[0].subscription_id = None;
             resolve_group_filters(
                 &mut restored.groups,
-                &restored.nodes,
+                &mut restored.nodes,
                 &restored.subscriptions,
             );
             assert!(restored.groups[..4].iter().all(|g| g.nodes.is_empty()));

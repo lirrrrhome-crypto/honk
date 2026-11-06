@@ -80,6 +80,7 @@ pub(super) fn parse_group_section(
                     "tolerance",
                     "idle_timeout",
                     "interrupt_connections",
+                    "exit",
                 ]
                 .contains(&key.raw())
                 {
@@ -111,6 +112,9 @@ pub(super) fn parse_group_section(
             }
             if let Some(value) = fields.get("default").copied() {
                 group.default = Some(value.raw().to_owned());
+            }
+            if let Some(value) = fields.get("exit").copied() {
+                group.exit = Some(value.raw().trim().to_owned());
             }
             if let Some(value) = fields.get("check_url").copied() {
                 group.check_url = Some(value.raw().to_owned());
@@ -292,6 +296,22 @@ fn parse_group_policy(
 /// node predicates here.
 pub(super) fn resolve_group_filters_inner(
     groups: &mut [Group],
+    nodes: &mut Vec<Node>,
+    subscriptions: &[Subscription],
+    mut diagnostics: Option<&mut ParserDiagnostics<'_>>,
+) {
+    crate::chain::restore_group_exit_members(groups, nodes);
+    resolve_filters(groups, nodes, subscriptions, diagnostics.as_deref_mut());
+    for issue in crate::chain::derive_group_exits(nodes, groups) {
+        match diagnostics.as_deref_mut() {
+            Some(sink) => sink.chain_issue(&issue),
+            None => tracing::warn!(code = issue.code, name = %issue.name, "{}", issue.message),
+        }
+    }
+}
+
+fn resolve_filters(
+    groups: &mut [Group],
     nodes: &[Node],
     subscriptions: &[Subscription],
     mut diagnostics: Option<&mut ParserDiagnostics<'_>>,
@@ -365,7 +385,7 @@ fn is_builtin(node: &Node) -> bool {
     matches!(
         node.outbound,
         crate::node::OutboundConfig::Direct | crate::node::OutboundConfig::Block
-    )
+    ) || crate::chain::is_group_exit_node(node)
 }
 
 struct GroupFilterTerm {

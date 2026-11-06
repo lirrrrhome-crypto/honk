@@ -207,6 +207,35 @@ impl<'a> ParserDiagnostics<'a> {
         }
     }
 
+    /// A typed chain issue at its group (`groups[i].exit`) or node
+    /// (`nodes[i].chain`), with its fixed message and no echoed value.
+    pub fn chain_issue(&mut self, issue: &crate::chain::ChainIssue) {
+        let (setting, location) = match issue.subject {
+            crate::chain::ChainSubject::Group(index) => (
+                SettingPath::new("groups").index(index + 1).field("exit"),
+                self.groups
+                    .get(index)
+                    .map(|group| group.location.clone())
+                    .unwrap_or_else(|| self.current.clone()),
+            ),
+            crate::chain::ChainSubject::Node(index) => (
+                SettingPath::new("nodes").index(index + 1).field("chain"),
+                self.current.clone(),
+            ),
+        };
+        let mut diagnostic = DetailedDiagnostic::warning(
+            issue.code,
+            location.source,
+            setting,
+            SafeValue::Empty,
+            issue.message,
+        );
+        diagnostic.line = location.line;
+        diagnostic.span = location.span;
+        diagnostic.byte_column = location.byte_column;
+        self.output.push(diagnostic);
+    }
+
     pub fn push(&mut self, legacy: ConfigDiagnostic) {
         let ttl = legacy.setting.starts_with("dns.fixed_domain_ttl.");
         let mut location = legacy
