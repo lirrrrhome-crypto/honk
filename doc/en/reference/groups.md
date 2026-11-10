@@ -157,7 +157,7 @@ group {
 ```
 
 - A node member `gw1` becomes `gw1 -> land`; a nested group member `inner` becomes `inner -> land`, which enters `inner`'s current pick. An outer group selecting `ingress` therefore selects among whole chains.
-- Derived chains are rebuilt on every group resolution, including after each subscription refresh, and unchanged ones keep their identity. Unfiltered groups and filter patterns never pick them.
+- Derived chains are rebuilt on every group resolution, including after each subscription refresh, and unchanged ones keep their identity. No other group's filter picks them, not even by literal name.
 - A Selector `default` naming a member follows it to its derived name.
 - An `exit` that is empty, `direct`, `block` or the group itself empties the group (`invalid-group-exit`), so its traffic follows `final` or fails rather than skipping the exit. An unknown exit is reported (`unknown-group-exit`) and dials fail until it exists. A member whose derived name is already a node name is not served (`group-exit-name-taken`).
 - Chain limits and protocol rules are those of [chains](./nodes.md#chains).
