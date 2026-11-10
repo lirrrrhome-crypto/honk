@@ -160,6 +160,7 @@ group {
 - Derived chains are rebuilt on every group resolution, including after each subscription refresh, and unchanged ones keep their identity. No other group's filter picks them, not even by literal name.
 - A Selector `default` naming a member follows it to its derived name.
 - An `exit` that is empty, `direct`, `block` or the group itself empties the group (`invalid-group-exit`), so its traffic follows `final` or fails rather than skipping the exit. An unknown exit is reported (`unknown-group-exit`) and dials fail until it exists. A member whose derived name is already a node name is not served (`group-exit-name-taken`).
+- `final` is not a member, so it does not go through the exit: when no derived chain is usable the group's traffic follows `final` as written. `final: direct` on an exit group therefore leaves directly; use `final: block`, or name a chain node, when traffic must never leave without the exit.
 - Chain limits and protocol rules are those of [chains](./nodes.md#chains).
 
 ## Related docs
