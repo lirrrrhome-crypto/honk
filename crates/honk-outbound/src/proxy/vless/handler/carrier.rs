@@ -121,14 +121,25 @@ impl VLessHandler {
         )?;
         let vision = vless.is_vision().then_some(uuid);
         let encryption = self.encryption_config(node)?;
+        let raw_transport = matches!(vless.transport.transport.as_str(), "" | "tcp");
         let stream: Box<dyn AsyncReadWrite> =
             match crate::proxy::transport::tls_over(node, carrier, connect_timeout).await? {
                 crate::proxy::transport::ChainedTls::Tls(tls) => {
-                    if vision.is_some()
-                        && encryption.is_none()
-                        && tls.ssl().version2() != Some(boring::ssl::SslVersion::TLS1_3)
-                    {
-                        anyhow::bail!("VLESS Vision requires negotiated TLS 1.3");
+                    if vision.is_some() && encryption.is_none() {
+                        anyhow::ensure!(
+                            tls.ssl().version2() == Some(boring::ssl::SslVersion::TLS1_3),
+                            "VLESS Vision requires negotiated TLS 1.3"
+                        );
+                        // Keep the concrete TLS type: the server switches to
+                        // Direct on inner TLS and then speaks beneath this
+                        // layer, straight on the chain's stream.
+                        if raw_transport {
+                            return Ok(ProxyStream {
+                                stream: start(tls, &header, vision).await?,
+                                target_addr: target,
+                                target_domain: target_domain.map(str::to_string),
+                            });
+                        }
                     }
                     Box::new(tls)
                 }

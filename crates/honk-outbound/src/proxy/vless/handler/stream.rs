@@ -71,7 +71,10 @@ impl DirectIo for ObservedTcp {
     }
 }
 
-impl DirectIo for tokio_boring::SslStream<ObservedTcp> {
+/// Direct bypasses this TLS layer and uses the stream beneath it: the
+/// node's socket, or the chain member in front of it. The peer cannot tell
+/// the two apart and switches either way.
+impl<S: AsyncRead + AsyncWrite + Unpin> DirectIo for tokio_boring::SslStream<S> {
     const DIRECT_WRITE: bool = true;
 
     fn poll_direct_read(

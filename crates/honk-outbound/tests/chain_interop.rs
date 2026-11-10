@@ -403,3 +403,113 @@ async fn sing_box_chain_front_by_landing_matrix() {
         failures.join("\n")
     );
 }
+
+/// Real inner TLS 1.3 through a Vision landing in a later position: the
+/// server sees ordinary TLS and may switch either direction to Direct, so
+/// the chained client must survive raw bytes beneath its own TLS layer.
+#[cfg(feature = "rprx")]
+#[tokio::test]
+#[ignore = "needs sing-box (HONK_SING_BOX_BIN)"]
+async fn sing_box_chain_vision_landing_carries_inner_tls() {
+    use boring::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode, SslVersion};
+
+    let directory = std::env::temp_dir().join(format!(
+        "honk-chain-vision-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = cert.self_signed(&key).unwrap();
+    let (cert_path, key_path) = (directory.join("cert.pem"), directory.join("key.pem"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor.set_certificate_chain_file(&cert_path).unwrap();
+    acceptor
+        .set_private_key_file(&key_path, boring::ssl::SslFiletype::PEM)
+        .unwrap();
+    acceptor
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let acceptor = Arc::new(acceptor.build());
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = Arc::clone(&acceptor);
+            tokio::spawn(async move {
+                let Ok(tls) = tokio_boring::accept(&acceptor, tcp).await else {
+                    return;
+                };
+                let (mut reader, mut writer) = tokio::io::split(tls);
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+
+    let protos = protos(
+        &cert_path.display().to_string(),
+        &key_path.display().to_string(),
+    );
+    let _server = start_sing_box(&directory, &protos).await;
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    registry
+        .chain()
+        .unwrap()
+        .install_resolver(Arc::new(MapResolver(
+            protos
+                .iter()
+                .map(|proto| (proto.name.to_owned(), proto.node.clone()))
+                .collect(),
+        )));
+    let chain = Node {
+        name: "vision-chain".into(),
+        outbound: OutboundConfig::Chain(ChainConfig {
+            hops: vec!["socks5".into()],
+            out: ChainOut::Tag("vless-tls-vision".into()),
+            group_exit: None,
+        }),
+        ..Default::default()
+    };
+    let stream = registry
+        .dial(&chain, target, None, SETUP_TIMEOUT)
+        .await
+        .unwrap();
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_verify(SslVerifyMode::NONE);
+    let config = connector.build().configure().unwrap();
+    let mut tls = tokio::time::timeout(
+        SETUP_TIMEOUT,
+        tokio_boring::connect(config, "localhost", stream.stream),
+    )
+    .await
+    .expect("inner TLS handshake within 5s")
+    .expect("inner TLS handshake");
+    let payload: Vec<u8> = (0..1024 * 1024u32).map(|i| (i * 13 + 5) as u8).collect();
+    let (mut reader, mut writer) = tokio::io::split(&mut tls);
+    let sent = payload.clone();
+    let write = async move {
+        writer.write_all(&sent).await.unwrap();
+        writer.flush().await.unwrap();
+    };
+    let read = async {
+        let mut reply = vec![0u8; payload.len()];
+        reader.read_exact(&mut reply).await.map(|_| reply)
+    };
+    let (_, reply) =
+        tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(write, read) })
+            .await
+            .expect("1 MiB inner-TLS echo within 15s");
+    assert!(
+        reply.expect("inner TLS read") == payload,
+        "inner TLS payload differs"
+    );
+}
