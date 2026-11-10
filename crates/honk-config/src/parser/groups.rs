@@ -368,6 +368,12 @@ fn resolve_filters(
         group.nodes.clear();
 
         for node in nodes {
+            // Derived exit chains belong to their group alone and do not
+            // exist yet on a first resolution; admitting one by its literal
+            // name would make membership depend on resolution order.
+            if crate::chain::is_group_exit_node(node) {
+                continue;
+            }
             let admitted = parsed_filters.iter().any(|filter| {
                 (!is_builtin(node) || filter.iter().any(|term| term.names_literally(&node.name)))
                     && filter
