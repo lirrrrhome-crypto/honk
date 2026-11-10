@@ -64,29 +64,57 @@ impl GroupManagerResolver {
     }
 }
 
+/// What a member tag names. An operator's own declarations win over a
+/// subscription's display names: a provider must not be able to redirect a
+/// chain by naming one of its nodes like the operator's group. A group
+/// that currently selects nothing fails the dial; it never falls through
+/// to a same-named provider node.
+enum Tagged<'a> {
+    Node(&'a Node),
+    Group,
+    Unknown,
+}
+
+fn classify<'a>(manager: &'a crate::group::GroupManager, tag: &str) -> Tagged<'a> {
+    if let Some(own) = manager
+        .nodes_named(tag)
+        .find(|node| node.subscription_id.is_none())
+    {
+        return Tagged::Node(own);
+    }
+    if manager.get_group_policy(tag).is_some() {
+        return Tagged::Group;
+    }
+    manager
+        .node_by_name(tag)
+        .map_or(Tagged::Unknown, Tagged::Node)
+}
+
 impl ChainResolver for GroupManagerResolver {
     fn resolve(&self, tag: &str) -> Option<Node> {
         let manager = self.manager();
-        manager
-            .node_by_name(tag)
-            .or_else(|| manager.select_node(tag))
-            .cloned()
+        match classify(&manager, tag) {
+            Tagged::Node(node) => Some(node.clone()),
+            Tagged::Group => manager.select_node(tag).cloned(),
+            Tagged::Unknown => None,
+        }
     }
 
     fn peek(&self, tag: &str) -> Option<Node> {
         let manager = self.manager();
-        if let Some(node) = manager.node_by_name(tag) {
-            return Some(node.clone());
+        match classify(&manager, tag) {
+            Tagged::Node(node) => Some(node.clone()),
+            Tagged::Group => manager
+                .peek_selection_plan_for_domain(
+                    tag,
+                    crate::alive::ProbeDomain::Tcp,
+                    crate::alive::IpVersion::V4,
+                )
+                .nodes
+                .first()
+                .map(|node| (*node).clone()),
+            Tagged::Unknown => None,
         }
-        manager
-            .peek_selection_plan_for_domain(
-                tag,
-                crate::alive::ProbeDomain::Tcp,
-                crate::alive::IpVersion::V4,
-            )
-            .nodes
-            .first()
-            .map(|node| (*node).clone())
     }
 }
 

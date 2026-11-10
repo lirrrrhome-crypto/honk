@@ -237,7 +237,12 @@ pub fn chain_cycles(nodes: &[Node], groups: &[Group]) -> Vec<ChainIssue> {
             if !seen.insert(tag.clone()) {
                 continue;
             }
-            if let Some(group) = group_by_name.get(tag.as_str()) {
+            // Same precedence as dialing: the operator's node, then a
+            // group, then a provider node.
+            let own_node = nodes
+                .iter()
+                .any(|node| node.name == tag && node.subscription_id.is_none());
+            if let Some(group) = group_by_name.get(tag.as_str()).filter(|_| !own_node) {
                 for id in &group.nodes {
                     if *id == start.id {
                         cyclic = Some(tag.clone());

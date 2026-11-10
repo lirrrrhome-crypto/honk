@@ -550,10 +550,18 @@ impl GroupManager {
     /// First declared node with this display name; finals and API lookups agree
     /// with config order. Sub-group tags and unknown names yield `None`.
     pub fn node_by_name(&self, name: &str) -> Option<&Node> {
+        self.nodes_named(name).next()
+    }
+
+    /// Every node with this display name, in config order.
+    pub fn nodes_named<'a, 'n>(
+        &'a self,
+        name: &'n str,
+    ) -> impl Iterator<Item = &'a Node> + use<'a, 'n> {
         self.node_order
             .iter()
             .filter_map(|id| self.nodes.get(id))
-            .find(|node| node.name == name)
+            .filter(move |node| node.name == name)
     }
 
     /// Wrap this manager into a [`SharedGroupManager`] cell (see the type's
