@@ -432,3 +432,48 @@ fn resolver_never_waits_on_the_manager_cell() {
     );
     writer.join().unwrap();
 }
+
+/// A subscription may name a node anything, including the operator's group
+/// tag; the chain must keep entering the operator's group.
+#[test]
+fn a_provider_node_cannot_shadow_an_operator_group_or_node() {
+    let own = socks("own", 1);
+    let mut imposter = socks("front", 2);
+    imposter.subscription_id = Some(uuid::Uuid::new_v4());
+    let mut provider_first = socks("land", 3);
+    provider_first.subscription_id = imposter.subscription_id;
+    let land = socks("land", 4);
+    let front = honk_config::group::Group {
+        name: "front".to_owned(),
+        nodes: vec![own.id],
+        ..Default::default()
+    };
+    let empty = honk_config::group::Group {
+        name: "empty".to_owned(),
+        filters: vec!["name('nothing')".to_owned()],
+        ..Default::default()
+    };
+    let mut shadow_empty = socks("empty", 5);
+    shadow_empty.subscription_id = imposter.subscription_id;
+    let shared = crate::group::GroupManager::new(
+        &[front, empty],
+        &[imposter, provider_first, land, own, shadow_empty],
+    )
+    .into_shared();
+    let resolver = GroupManagerResolver::new(shared);
+    for resolve in [
+        GroupManagerResolver::resolve as fn(&GroupManagerResolver, &str) -> Option<Node>,
+        GroupManagerResolver::peek,
+    ] {
+        assert_eq!(resolve(&resolver, "front").unwrap().name, "own");
+        assert_eq!(
+            resolve(&resolver, "land").unwrap().port,
+            4,
+            "the operator's node"
+        );
+        assert!(
+            resolve(&resolver, "empty").is_none(),
+            "an empty group fails closed"
+        );
+    }
+}
