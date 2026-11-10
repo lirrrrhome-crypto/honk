@@ -3632,6 +3632,25 @@ group {
     }
 
     #[test]
+    fn a_literal_filter_cannot_borrow_another_groups_exit_chain() {
+        let mut config = parse_dae_config(&EXIT_CONFIG.replace(
+            "everything {",
+            "borrower {\n        filter: name('gw1 -> land')",
+        ))
+        .unwrap();
+        assert!(members(&config, "borrower").is_empty());
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &mut config.nodes,
+            &config.subscriptions,
+        );
+        assert!(
+            members(&config, "borrower").is_empty(),
+            "same on re-resolution"
+        );
+    }
+
+    #[test]
     fn unusable_exit_empties_the_group_instead_of_skipping_it() {
         let mut diagnostics = Vec::new();
         let config = crate::parser::parse_dae_config_with_detailed_diagnostics(
