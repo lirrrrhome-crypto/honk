@@ -158,6 +158,7 @@ group {
 - 派生链在每次组解析（包括每次订阅刷新之后）重建，未变化的保持原身份。其他组的过滤器不会选中它们，按字面名称也不行。
 - Selector 的 `default` 指向某个成员时，随该成员改为其派生名。
 - `exit` 为空、`direct`、`block` 或组自身时，组被清空（`invalid-group-exit`），流量按 `final` 处理或失败，而不是跳过出口。未知出口会报告（`unknown-group-exit`），在其存在之前拨号失败。派生名与已有节点名冲突的成员不提供服务（`group-exit-name-taken`）。
+- `final` 不是成员，因此不经过出口：没有可用的派生链时，组的流量按 `final` 原样处理。带出口的组写 `final: direct` 就会直连；如果流量绝不能绕过出口，请使用 `final: block`，或把 `final` 指向一个链节点。
 - 链的长度与协议规则同[链](./nodes.md#链)。
 
 ## 相关文档
