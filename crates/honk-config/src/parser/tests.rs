@@ -3849,3 +3849,29 @@ group {
         "re-resolution is stable"
     );
 }
+
+#[test]
+fn chain_nodes_survive_the_structured_store() {
+    let config = parse_dae_config(
+        r#"
+node {
+    front: 'socks5://127.0.0.1:1080'
+    land: 'trojan://secret@exit.example:443?sni=exit.example' -> front
+    block_chain: chain { front -> land }
+}
+"#,
+    )
+    .unwrap();
+    for text in [
+        config.to_json_string().unwrap(),
+        toml::to_string(&config).unwrap(),
+    ] {
+        let back = if text.trim_start().starts_with('{') {
+            crate::config::Config::from_json_str(&text).unwrap()
+        } else {
+            toml::from_str::<crate::config::Config>(&text).unwrap()
+        };
+        assert_eq!(back.nodes, config.nodes);
+        back.validate().unwrap();
+    }
+}
