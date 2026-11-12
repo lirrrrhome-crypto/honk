@@ -3792,3 +3792,60 @@ fn chain_example_config_parses_without_diagnostics() {
         );
     }
 }
+
+#[test]
+fn two_exit_groups_sharing_a_member_share_one_derived_chain() {
+    let mut config = parse_dae_config(
+        r#"
+node {
+    gw1: 'socks5://10.0.0.1:1080'
+    gw2: 'socks5://10.0.0.2:1080'
+    land: 'socks5://10.0.0.9:1080'
+}
+group {
+    first {
+        filter: name('gw1', 'gw2')
+        exit: land
+    }
+    second {
+        filter: name('gw1')
+        exit: land
+    }
+}
+"#,
+    )
+    .unwrap();
+    config.ensure_builtin_nodes();
+    let derived: Vec<_> = config
+        .nodes
+        .iter()
+        .filter(|node| node.name == "gw1 -> land")
+        .collect();
+    assert_eq!(derived.len(), 1, "one shared chain, not one per group");
+    config.validate().expect("no duplicate node IDs");
+    let id = derived[0].id;
+    for group in ["first", "second"] {
+        let group = config.groups.iter().find(|g| g.name == group).unwrap();
+        assert!(group.nodes.contains(&id));
+    }
+    // Appending the builtins moved the derived chains once; from here on
+    // every resolution must reproduce the same nodes and members.
+    for _ in 0..2 {
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &mut config.nodes,
+            &config.subscriptions,
+        );
+    }
+    let before = (config.nodes.clone(), config.groups.clone());
+    crate::parser::resolve_group_filters(
+        &mut config.groups,
+        &mut config.nodes,
+        &config.subscriptions,
+    );
+    assert_eq!(
+        (config.nodes, config.groups),
+        before,
+        "re-resolution is stable"
+    );
+}

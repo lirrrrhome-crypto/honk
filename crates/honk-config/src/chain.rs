@@ -69,7 +69,9 @@ pub(crate) fn restore_group_exit_members(groups: &mut [Group], nodes: &[Node]) {
         let mut restored = Vec::with_capacity(group.nodes.len());
         for id in std::mem::take(&mut group.nodes) {
             match sources.get(&id) {
-                Some(source) if source.group == group.name => match &source.member {
+                // Groups with the same member and exit share one derived
+                // chain, so the source's group need not be this one.
+                Some(source) => match &source.member {
                     ExitMember::Node(member) => restored.push(*member),
                     ExitMember::Group(member) => {
                         if !group.groups.contains(member) {
@@ -77,7 +79,7 @@ pub(crate) fn restore_group_exit_members(groups: &mut [Group], nodes: &[Node]) {
                         }
                     }
                 },
-                _ => restored.push(id),
+                None => restored.push(id),
             }
         }
         restored.dedup();
@@ -113,7 +115,8 @@ pub(crate) fn derive_group_exits(nodes: &mut Vec<Node>, groups: &mut [Group]) ->
     let taken: HashSet<String> = nodes.iter().map(|node| node.name.clone()).collect();
     let group_names: HashSet<String> = groups.iter().map(|group| group.name.clone()).collect();
 
-    let mut derived = Vec::new();
+    let mut derived: Vec<Node> = Vec::new();
+    let mut derived_ids: HashSet<uuid::Uuid> = HashSet::new();
     for (index, group) in groups.iter_mut().enumerate() {
         let Some(exit) = group.exit.clone() else {
             continue;
@@ -184,13 +187,17 @@ pub(crate) fn derive_group_exits(nodes: &mut Vec<Node>, groups: &mut [Group]) ->
                 ..Node::default()
             };
             node.id = node.derive_id();
-            let node = match previous.remove(&node.id) {
-                Some(kept) if kept.outbound == node.outbound => kept,
-                _ => node,
-            };
             if !served.contains(&node.id) {
                 served.push(node.id);
-                derived.push(node);
+            }
+            // The ID covers name, member tag and exit: another group that
+            // derived the same chain shares it, or the node set would hold
+            // duplicate IDs and be refused.
+            if derived_ids.insert(node.id) {
+                derived.push(match previous.remove(&node.id) {
+                    Some(kept) if same_chain(&kept, &node) => kept,
+                    _ => node,
+                });
             }
         }
         if let Some(default) = &group.default
@@ -204,6 +211,20 @@ pub(crate) fn derive_group_exits(nodes: &mut Vec<Node>, groups: &mut [Group]) ->
     nodes.extend(derived);
     diagnostics.extend(chain_cycles(nodes, groups));
     diagnostics
+}
+
+/// Whether a previously derived node is still the chain derivation would
+/// produce; which group first derived it is not part of that.
+fn same_chain(kept: &Node, fresh: &Node) -> bool {
+    match (&kept.outbound, &fresh.outbound) {
+        (OutboundConfig::Chain(kept), OutboundConfig::Chain(fresh)) => {
+            kept.hops == fresh.hops
+                && kept.out == fresh.out
+                && kept.group_exit.as_ref().map(|source| &source.member)
+                    == fresh.group_exit.as_ref().map(|source| &source.member)
+        }
+        _ => false,
+    }
 }
 
 /// Report chains that can reach themselves: through their own members,
